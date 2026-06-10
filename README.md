@@ -16,8 +16,9 @@ When you run `wtclaude <name>`, it:
    `.claude/worktrees/<name>`.
 
 2. Writes a temporary SBPL (Sandbox Policy Language) file that allows
-   file writes only within the worktree and the repo's `.git`
-   directory.
+   file writes within the worktree, the repo's `.git` directory, and
+   common package manager cache directories (Cargo, npm, pip, etc.) so
+   that dependency fetching works without leaving the sandbox.
 
 3. Registers a `PreToolUse` hook (itself, via `wtclaude hook`) that
    intercepts every tool call Claude attempts:
@@ -66,7 +67,7 @@ The binary must be on your `PATH`. The optional config file
 ## Usage
 
 ```
-wtclaude [--mode MODE] [--test-sbpl-breakage hide|missing] \
+wtclaude [--mode MODE] [--resume SESSION_ID] [--test-sbpl-breakage hide|missing] \
          WORKTREE_NAME [INITIAL_PROMPT]
 ```
 
@@ -140,10 +141,37 @@ modes:
 Two layers of enforcement work together:
 
 **OS layer** — `sandbox-exec` enforces the SBPL policy on every Bash
-command. Writes outside the worktree and `.git` directories fail with
-`Operation not permitted` at the kernel level. A `PostToolUseFailure`
-hook injects context into Claude's next message so it understands
-why the write failed.
+command. Writes outside the allowed paths fail with `Operation not
+permitted` at the kernel level. A `PostToolUseFailure` hook injects
+context into Claude's next message so it understands why the write
+failed.
+
+The following paths are writable in addition to the worktree and
+`.git`:
+
+| Tool | Path |
+|------|------|
+| Cargo | `~/.cargo` |
+| npm | `~/.npm` |
+| pnpm | `~/.pnpm-store`, `~/.local/share/pnpm` |
+| Yarn | `~/.yarn`, `~/.cache/yarn` |
+| pip | `~/.cache/pip` |
+| uv | `~/.cache/uv` |
+| Poetry | `~/.cache/pypoetry` |
+| RubyGems | `~/.gem` |
+| Bundler | `~/.bundle` |
+| Maven | `~/.m2` |
+| Gradle | `~/.gradle` |
+| Go modules | `~/go/pkg/mod` |
+| Composer | `~/.composer` |
+| NuGet | `~/.nuget` |
+| Conan | `~/.conan2` |
+| Docker | `~/.docker` |
+
+| Temp files | `/tmp`, `$TMPDIR` |
+
+Package manager *installers* (e.g. Homebrew) are not allowlisted;
+only caching directories are included.
 
 **Hook layer** — The `PreToolUse` hook inspects `Write`, `Edit`, and
 `NotebookEdit` tool calls before Claude executes them. Any path
