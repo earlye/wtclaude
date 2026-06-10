@@ -21,6 +21,7 @@ pub struct Args {
     pub mode: Option<String>,
     pub name: String,
     pub prompt: Option<String>,
+    pub resume: Option<String>,
     pub test_sbpl_breakage: Option<SbplBreakage>,
 }
 
@@ -29,12 +30,16 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
     let mut mode = None;
     let mut name = None;
     let mut prompt_parts: Vec<String> = Vec::new();
+    let mut resume = None;
     let mut test_sbpl_breakage = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--mode" => {
                 mode = Some(iter.next().context("--mode requires a value")?);
+            }
+            "--resume" => {
+                resume = Some(iter.next().context("--resume requires a session id")?);
             }
             "--test-sbpl-breakage" => {
                 let val = iter
@@ -72,6 +77,7 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
         mode,
         name,
         prompt,
+        resume,
         test_sbpl_breakage,
     })
 }
@@ -101,6 +107,9 @@ pub fn run(args: Args) -> Result<i32> {
     cmd.arg("--worktree").arg(&args.name);
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
+    }
+    if let Some(session_id) = args.resume {
+        cmd.arg("--resume").arg(session_id);
     }
     cmd.arg("--settings").arg(&_settings.0);
     cmd.env("WTCLAUDE_SANDBOX", &worktree_path);
@@ -187,11 +196,57 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
         .canonicalize()
         .unwrap_or_else(|_| git_dir.to_path_buf());
     let _ = worktree_name; // git_dir covers worktrees/<name> as a subpath
-    let policy = format!(
-        "(version 1)\n(allow default)\n(deny file-write* (subpath \"/\"))\n(allow file-write* (literal \"/dev/null\"))\n(allow file-write* (subpath \"{}\"))\n(allow file-write* (subpath \"{}\"))\n",
-        canonical.to_string_lossy(),
-        git_dir_canonical.to_string_lossy(),
-    );
+
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+
+    // Package manager cache/data dirs — caching only, not installers (no homebrew etc.)
+    let pkg_cache_dirs = [
+        ".cargo",
+        ".npm",
+        ".pnpm-store",
+        ".local/share/pnpm",
+        ".yarn",
+        ".cache/yarn",
+        ".cache/pip",
+        ".cache/uv",
+        ".cache/pypoetry",
+        ".gem",
+        ".bundle",
+        ".m2",
+        ".gradle",
+        "go/pkg/mod",
+        ".composer",
+        ".nuget",
+        ".conan2",
+        ".docker",
+    ];
+
+    let mut lines = vec![
+        "(version 1)".to_string(),
+        "(allow default)".to_string(),
+        "(deny file-write* (subpath \"/\"))".to_string(),
+        "(allow file-write* (literal \"/dev/null\"))".to_string(),
+        format!(
+            "(allow file-write* (subpath \"{}\"))",
+            canonical.to_string_lossy()
+        ),
+        format!(
+            "(allow file-write* (subpath \"{}\"))",
+            git_dir_canonical.to_string_lossy()
+        ),
+        "(allow file-write* (subpath \"/tmp\"))".to_string(),
+        format!("(allow file-write* (subpath \"{}\"))", tmpdir),
+    ];
+
+    for dir in &pkg_cache_dirs {
+        lines.push(format!(
+            "(allow file-write* (subpath \"{}/{}\"))",
+            home, dir
+        ));
+    }
+
+    let policy = lines.join("\n") + "\n";
     let path = PathBuf::from(format!("/tmp/wtclaude-sbpl-{}.sb", std::process::id()));
     std::fs::write(&path, policy).context("writing sbpl policy")?;
     Ok(TempFile(path))

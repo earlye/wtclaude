@@ -40,7 +40,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "usage: wtclaude [--mode MODE] [--test-sbpl-breakage hide|missing] WORKTREE_NAME [INITIAL_PROMPT]"
+        "usage: wtclaude [--mode MODE] [--resume SESSION_ID] [--test-sbpl-breakage hide|missing] WORKTREE_NAME [INITIAL_PROMPT]"
     );
     eprintln!("       wtclaude hook  (invoked internally as a PreToolUse hook)");
 }
