@@ -1,0 +1,6 @@
+default-mode: safe
+modes:
+  dangerous:
+    claude-flags: [ "--dangerously-skip-permissions" ]
+  safe:
+    claude-flags: []
