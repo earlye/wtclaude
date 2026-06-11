@@ -20,6 +20,7 @@ pub enum SbplBreakage {
 pub struct Args {
     pub mode: Option<String>,
     pub name: String,
+    pub no_pull: bool,
     pub prompt: Option<String>,
     pub resume: Option<String>,
     pub test_sbpl_breakage: Option<SbplBreakage>,
@@ -29,6 +30,7 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
     let mut iter = raw.into_iter().peekable();
     let mut mode = None;
     let mut name = None;
+    let mut no_pull = false;
     let mut prompt_parts: Vec<String> = Vec::new();
     let mut resume = None;
     let mut test_sbpl_breakage = None;
@@ -37,6 +39,9 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
         match arg.as_str() {
             "--mode" => {
                 mode = Some(iter.next().context("--mode requires a value")?);
+            }
+            "--no-pull" => {
+                no_pull = true;
             }
             "--resume" => {
                 resume = Some(iter.next().context("--resume requires a session id")?);
@@ -76,6 +81,7 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
     Ok(Args {
         mode,
         name,
+        no_pull,
         prompt,
         resume,
         test_sbpl_breakage,
@@ -96,7 +102,10 @@ pub fn run(args: Args) -> Result<i32> {
         .join("worktrees")
         .join(sanitize_name(&args.name));
 
-    rename_tmux_window(&args.name);
+    if !args.no_pull {
+        git_pull(&repo_root)?;
+    }
+    let _window_name = TmuxWindowName::rename(&args.name);
     update_trust(&repo_root)?;
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
@@ -154,12 +163,82 @@ fn repo_root() -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-fn rename_tmux_window(name: &str) {
-    if std::env::var("TMUX").is_err() {
-        return;
+fn git_pull(repo_root: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .args(["remote"])
+        .current_dir(repo_root)
+        .output()
+        .context("running git remote")?;
+    if String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+        return Ok(());
     }
-    if let Err(e) = Command::new("tmux").args(["rename-window", name]).status() {
-        eprintln!("wtclaude: warning: tmux rename-window: {e}");
+    let status = Command::new("git")
+        .args(["pull"])
+        .current_dir(repo_root)
+        .status()
+        .context("running git pull")?;
+    if !status.success() {
+        bail!("git pull failed");
+    }
+    Ok(())
+}
+
+enum TmuxRestore {
+    AutoRename,
+    Name(String),
+}
+
+struct TmuxWindowName(Option<TmuxRestore>);
+
+impl TmuxWindowName {
+    fn rename(name: &str) -> Self {
+        if std::env::var("TMUX").is_err() {
+            return Self(None);
+        }
+        let auto_rename = Command::new("tmux")
+            .args(["show-window-options", "-v", "automatic-rename"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim() != "off")
+            .unwrap_or(true);
+        let restore = if auto_rename {
+            TmuxRestore::AutoRename
+        } else {
+            let old = Command::new("tmux")
+                .args(["display-message", "-p", "#W"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            TmuxRestore::Name(old)
+        };
+        if let Err(e) = Command::new("tmux").args(["rename-window", name]).status() {
+            eprintln!("wtclaude: warning: tmux rename-window: {e}");
+        }
+        Self(Some(restore))
+    }
+}
+
+impl Drop for TmuxWindowName {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(TmuxRestore::AutoRename) => {
+                if let Err(e) = Command::new("tmux")
+                    .args(["set-window-option", "automatic-rename", "on"])
+                    .status()
+                {
+                    eprintln!("wtclaude: warning: tmux set automatic-rename on: {e}");
+                }
+            }
+            Some(TmuxRestore::Name(name)) => {
+                if let Err(e) = Command::new("tmux").args(["rename-window", name]).status() {
+                    eprintln!("wtclaude: warning: tmux rename-window (restore): {e}");
+                }
+            }
+            None => {}
+        }
     }
 }
 
@@ -203,6 +282,7 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
     // Package manager cache/data dirs — caching only, not installers (no homebrew etc.)
     let pkg_cache_dirs = [
         ".cargo",
+        ".rustup",
         ".npm",
         ".pnpm-store",
         ".local/share/pnpm",
