@@ -168,7 +168,7 @@ fn sanitize_name(name: &str) -> String {
     name.replace('/', "+")
 }
 
-fn repo_root() -> Result<PathBuf> {
+pub(crate) fn repo_root() -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
