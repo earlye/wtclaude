@@ -63,6 +63,18 @@ cp target/release/wtclaude /usr/local/bin/
 The binary must be on your `PATH`. The optional config file
 (`wtclaude.yml`) is looked up next to the binary at runtime.
 
+### Zsh completion
+
+Add one line to `~/.zshrc`:
+
+```zsh
+eval "$(wtclaude --completions zsh)"
+```
+
+Once loaded, `wtclaude --resume <TAB>` lists recent sessions (showing
+worktree and date). After selecting a session ID, pressing `<TAB>` on the
+next word auto-fills the matching worktree name.
+
 
 ## Usage
 
