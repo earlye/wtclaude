@@ -108,12 +108,29 @@ pub fn run(args: Args) -> Result<i32> {
     let _window_name = TmuxWindowName::rename(&args.name);
     update_trust(&repo_root)?;
 
+    ensure_worktree(&worktree_path, &args.name, &repo_root)?;
+
+    let canonical = worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.clone());
+
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let _sbpl_policy = write_sbpl_policy(&worktree_path, &repo_root, &sanitize_name(&args.name))?;
+    let _sbpl_policy = write_sbpl_policy(&canonical, &repo_root, &sanitize_name(&args.name))?;
+
+    let sandbox_notice = format!(
+        "You are running in a git worktree sandbox for branch '{}'. \
+         You may only write files under: {}.\n\n",
+        args.name,
+        canonical.display()
+    );
+    let prompt = match args.prompt {
+        Some(p) => format!("{}{}", sandbox_notice, p),
+        None => sandbox_notice,
+    };
 
     let mut cmd = Command::new("claude");
-    cmd.arg("--worktree").arg(&args.name);
+    cmd.current_dir(&canonical);
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
     }
@@ -121,7 +138,7 @@ pub fn run(args: Args) -> Result<i32> {
         cmd.arg("--resume").arg(session_id);
     }
     cmd.arg("--settings").arg(&_settings.0);
-    cmd.env("WTCLAUDE_SANDBOX", &worktree_path);
+    cmd.env("WTCLAUDE_SANDBOX", &canonical);
     match args.test_sbpl_breakage {
         None => {
             cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
@@ -134,12 +151,16 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
-    if let Some(prompt) = args.prompt {
-        cmd.arg(prompt);
-    }
+    cmd.arg(prompt);
 
     let status = cmd.status().context("launching claude")?;
-    Ok(status.code().unwrap_or(1))
+    let exit_code = status.code().unwrap_or(1);
+
+    if let Err(e) = post_exit_menu(&args.name, &worktree_path, &repo_root) {
+        eprintln!("wtclaude: warning: post-exit menu: {e}");
+    }
+
+    Ok(exit_code)
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -179,6 +200,171 @@ fn git_pull(repo_root: &Path) -> Result<()> {
         .context("running git pull")?;
     if !status.success() {
         bail!("git pull failed");
+    }
+    Ok(())
+}
+
+fn ensure_worktree(worktree_path: &Path, name: &str, repo_root: &Path) -> Result<()> {
+    if worktree_path.exists() {
+        if is_registered_worktree(worktree_path, repo_root)? {
+            return Ok(());
+        }
+        bail!(
+            "directory {} exists but is not a registered git worktree; remove it manually",
+            worktree_path.display()
+        );
+    }
+
+    // Try creating a new branch + worktree
+    let out = Command::new("git")
+        .args(["worktree", "add", "-b", name])
+        .arg(worktree_path)
+        .current_dir(repo_root)
+        .output()
+        .context("git worktree add")?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    // Branch already exists — check it out into the worktree
+    let out = Command::new("git")
+        .args(["worktree", "add"])
+        .arg(worktree_path)
+        .arg(name)
+        .current_dir(repo_root)
+        .output()
+        .context("git worktree add (existing branch)")?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    let msg = String::from_utf8_lossy(&out.stderr);
+    bail!("git worktree add failed: {}", msg.trim())
+}
+
+fn is_registered_worktree(path: &Path, repo_root: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .context("git worktree list")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    for line in text.lines() {
+        if let Some(wt_path) = line.strip_prefix("worktree ") {
+            let wt_canonical = PathBuf::from(wt_path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(wt_path));
+            if wt_canonical == canonical {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn post_exit_menu(name: &str, worktree_path: &Path, repo_root: &Path) -> Result<()> {
+    use crossterm::{
+        cursor,
+        event::{self, Event, KeyCode, KeyModifiers},
+        execute,
+        style::Stylize,
+        terminal::{self, ClearType},
+    };
+    use std::io::{self, Write};
+
+    let labels = [
+        format!("keep worktree {name}"),
+        format!("remove worktree {name}"),
+    ];
+    let n = labels.len();
+    let mut sel = 0usize;
+
+    if terminal::enable_raw_mode().is_err() {
+        return Ok(());
+    }
+
+    struct RawGuard;
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+    let _guard = RawGuard;
+
+    let mut stdout = io::stdout();
+
+    let draw = |stdout: &mut io::Stdout, sel: usize| -> io::Result<()> {
+        for (i, label) in labels.iter().enumerate() {
+            execute!(
+                stdout,
+                terminal::Clear(ClearType::CurrentLine),
+                cursor::MoveToColumn(0),
+            )?;
+            if i == sel {
+                write!(stdout, "{}", format!("> {label}").reverse())?;
+            } else {
+                write!(stdout, "  {label}")?;
+            }
+            if i + 1 < labels.len() {
+                write!(stdout, "\r\n")?;
+            }
+        }
+        stdout.flush()
+    };
+
+    write!(stdout, "\r\n")?;
+    draw(&mut stdout, sel)?;
+
+    loop {
+        match event::read()? {
+            Event::Key(key) => match (key.code, key.modifiers) {
+                (KeyCode::Up, _) => {
+                    if sel > 0 {
+                        sel -= 1;
+                        execute!(stdout, cursor::MoveUp((n - 1) as u16))?;
+                        draw(&mut stdout, sel)?;
+                    }
+                }
+                (KeyCode::Down, _) => {
+                    if sel < n - 1 {
+                        sel += 1;
+                        execute!(stdout, cursor::MoveUp((n - 1) as u16))?;
+                        draw(&mut stdout, sel)?;
+                    }
+                }
+                (KeyCode::Enter, _) => break,
+                (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                    sel = 0;
+                    break;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    write!(stdout, "\r\n")?;
+    stdout.flush()?;
+    drop(_guard);
+
+    if sel == 1 {
+        remove_worktree(worktree_path, repo_root)?;
+    }
+    Ok(())
+}
+
+fn remove_worktree(worktree_path: &Path, repo_root: &Path) -> Result<()> {
+    let status = Command::new("git")
+        .args(["worktree", "remove"])
+        .arg(worktree_path)
+        .current_dir(repo_root)
+        .status()
+        .context("git worktree remove")?;
+    if !status.success() {
+        bail!("git worktree remove failed");
     }
     Ok(())
 }
