@@ -23,6 +23,7 @@ pub struct Args {
     pub no_pull: bool,
     pub prompt: Option<String>,
     pub resume: Option<String>,
+    pub show_policy: bool,
     pub test_sbpl_breakage: Option<SbplBreakage>,
 }
 
@@ -33,6 +34,7 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
     let mut no_pull = false;
     let mut prompt_parts: Vec<String> = Vec::new();
     let mut resume = None;
+    let mut show_policy = false;
     let mut test_sbpl_breakage = None;
 
     while let Some(arg) = iter.next() {
@@ -42,6 +44,9 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
             }
             "--no-pull" => {
                 no_pull = true;
+            }
+            "--show-policy" => {
+                show_policy = true;
             }
             "--resume" => {
                 resume = Some(iter.next().context("--resume requires a session id")?);
@@ -84,6 +89,7 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
         no_pull,
         prompt,
         resume,
+        show_policy,
         test_sbpl_breakage,
     })
 }
@@ -118,16 +124,21 @@ pub fn run(args: Args) -> Result<i32> {
     let _settings = write_hook_settings(&binary_path)?;
     let _sbpl_policy = write_sbpl_policy(&canonical, &repo_root, &sanitize_name(&args.name))?;
 
+    if args.show_policy {
+        let policy = std::fs::read_to_string(&_sbpl_policy.0).context("reading sbpl policy")?;
+        println!("{}", policy);
+        print!("Press Enter to continue...");
+        use std::io::{self, BufRead, Write};
+        io::stdout().flush()?;
+        let _ = io::stdin().lock().lines().next();
+    }
+
     let sandbox_notice = format!(
         "You are running in a git worktree sandbox for branch '{}'. \
-         You may only write files under: {}.\n\n",
+         You may only write files under: {}.",
         args.name,
         canonical.display()
     );
-    let prompt = match args.prompt {
-        Some(p) => format!("{}{}", sandbox_notice, p),
-        None => sandbox_notice,
-    };
 
     let mut cmd = Command::new("claude");
     cmd.current_dir(&canonical);
@@ -138,6 +149,7 @@ pub fn run(args: Args) -> Result<i32> {
         cmd.arg("--resume").arg(session_id);
     }
     cmd.arg("--settings").arg(&_settings.0);
+    cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     cmd.env("WTCLAUDE_SANDBOX", &canonical);
     match args.test_sbpl_breakage {
         None => {
@@ -151,7 +163,9 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
-    cmd.arg(prompt);
+    if let Some(p) = args.prompt {
+        cmd.arg(p);
+    }
 
     let status = cmd.status().context("launching claude")?;
     let exit_code = status.code().unwrap_or(1);
@@ -452,14 +466,11 @@ fn update_trust(repo_root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn resolve(p: PathBuf) -> PathBuf {
+    p.canonicalize().unwrap_or(p)
+}
+
 fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> Result<TempFile> {
-    let canonical = sandbox
-        .canonicalize()
-        .unwrap_or_else(|_| sandbox.to_path_buf());
-    let git_dir = repo_root.join(".git");
-    let git_dir_canonical = git_dir
-        .canonicalize()
-        .unwrap_or_else(|_| git_dir.to_path_buf());
     let _ = worktree_name; // git_dir covers worktrees/<name> as a subpath
 
     let home = std::env::var("HOME").context("HOME not set")?;
@@ -486,29 +497,40 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
         ".nuget",
         ".conan2",
         ".docker",
+        "Library/Caches/cargo-xwin",
     ];
+
+    let raw: Vec<PathBuf> = [
+        sandbox.to_path_buf(),
+        repo_root.join(".git"),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/var/folders"),
+        PathBuf::from("/private/var/folders"),
+        PathBuf::from(&tmpdir),
+    ]
+    .into_iter()
+    .chain(pkg_cache_dirs.iter().map(|d| PathBuf::from(&home).join(d)))
+    .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let allow_paths: Vec<PathBuf> = raw
+        .into_iter()
+        .map(resolve)
+        .filter(|p| seen.insert(p.clone()))
+        .collect();
 
     let mut lines = vec![
         "(version 1)".to_string(),
         "(allow default)".to_string(),
         "(deny file-write* (subpath \"/\"))".to_string(),
         "(allow file-write* (literal \"/dev/null\"))".to_string(),
-        format!(
-            "(allow file-write* (subpath \"{}\"))",
-            canonical.to_string_lossy()
-        ),
-        format!(
-            "(allow file-write* (subpath \"{}\"))",
-            git_dir_canonical.to_string_lossy()
-        ),
-        "(allow file-write* (subpath \"/tmp\"))".to_string(),
-        format!("(allow file-write* (subpath \"{}\"))", tmpdir),
     ];
 
-    for dir in &pkg_cache_dirs {
+    for p in &allow_paths {
         lines.push(format!(
-            "(allow file-write* (subpath \"{}/{}\"))",
-            home, dir
+            "(allow file-write* (subpath \"{}\"))",
+            p.to_string_lossy()
         ));
     }
 
