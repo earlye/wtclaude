@@ -107,7 +107,7 @@ arguments — they are joined with spaces.
 
 | Flag | Description |
 |------|-------------|
-| `--mode MODE` | Operation mode (see Modes). Defaults to `safe`. |
+| `--mode MODE` | Operation mode (see Modes). Overrides `WTCLAUDE_DEFAULT_MODE` and config. |
 | `--no-pull` | Skip `git pull` before launching. |
 | `--resume SESSION_ID` | Resume a previous Claude session by ID. |
 | `--show-policy` | Print the generated SBPL policy and pause before launching. |
@@ -140,6 +140,20 @@ modes are:
 |------|-------------|-------|
 | `safe` | _(none)_ | Default. Claude prompts for permission. |
 | `dangerous` | `--dangerously-skip-permissions` | Claude acts without prompts. |
+
+The mode is resolved in priority order:
+
+1. `--mode MODE` flag (highest priority)
+2. `WTCLAUDE_DEFAULT_MODE` environment variable
+3. `default-mode` in `wtclaude.yml`
+4. Built-in default (`safe`)
+
+Set `WTCLAUDE_DEFAULT_MODE` in your shell profile to change the default
+without editing config files:
+
+```sh
+export WTCLAUDE_DEFAULT_MODE=dangerous
+```
 
 
 ## Configuration

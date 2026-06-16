@@ -96,7 +96,9 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
 
 pub fn run(args: Args) -> Result<i32> {
     let config = config::load()?;
-    let mode = args.mode.unwrap_or_else(|| config.default_mode.clone());
+    let mode = args.mode
+        .or_else(|| std::env::var("WTCLAUDE_DEFAULT_MODE").ok())
+        .unwrap_or_else(|| config.default_mode.clone());
     let mode_config = config
         .modes
         .get(&mode)
