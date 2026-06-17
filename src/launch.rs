@@ -238,6 +238,14 @@ fn git_pull(repo_root: &Path) -> Result<()> {
         return Ok(());
     }
     let status = Command::new("git")
+        .args(["fetch"])
+        .current_dir(repo_root)
+        .status()
+        .context("running git fetch")?;
+    if !status.success() {
+        bail!("git fetch failed");
+    }
+    let status = Command::new("git")
         .args(["pull"])
         .current_dir(repo_root)
         .status()
@@ -259,19 +267,7 @@ fn ensure_worktree(worktree_path: &Path, name: &str, repo_root: &Path) -> Result
         );
     }
 
-    // Try creating a new branch + worktree
-    let out = Command::new("git")
-        .args(["worktree", "add", "-b", name])
-        .arg(worktree_path)
-        .current_dir(repo_root)
-        .output()
-        .context("git worktree add")?;
-
-    if out.status.success() {
-        return Ok(());
-    }
-
-    // Branch already exists — check it out into the worktree
+    // Branch already exists locally — check it out into the worktree
     let out = Command::new("git")
         .args(["worktree", "add"])
         .arg(worktree_path)
@@ -279,6 +275,32 @@ fn ensure_worktree(worktree_path: &Path, name: &str, repo_root: &Path) -> Result
         .current_dir(repo_root)
         .output()
         .context("git worktree add (existing branch)")?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    // Try creating a new branch tracking the remote
+    let remote_ref = format!("origin/{}", name);
+    let out = Command::new("git")
+        .args(["worktree", "add", "--track", "-b", name])
+        .arg(worktree_path)
+        .arg(&remote_ref)
+        .current_dir(repo_root)
+        .output()
+        .context("git worktree add (remote branch)")?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    // No remote — create a new local branch at HEAD
+    let out = Command::new("git")
+        .args(["worktree", "add", "-b", name])
+        .arg(worktree_path)
+        .current_dir(repo_root)
+        .output()
+        .context("git worktree add")?;
 
     if out.status.success() {
         return Ok(());
