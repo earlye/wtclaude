@@ -96,17 +96,19 @@ pub fn parse_args(raw: Vec<String>) -> Result<Args> {
 
 pub fn run(args: Args) -> Result<i32> {
     let config = config::load()?;
-    let mode = args.mode.unwrap_or_else(|| config.default_mode.clone());
+    let mode = args.mode
+        .or_else(|| std::env::var("WTCLAUDE_DEFAULT_MODE").ok())
+        .unwrap_or_else(|| config.default_mode.clone());
     let mode_config = config
         .modes
         .get(&mode)
         .with_context(|| format!("unknown mode: {}", mode))?;
 
     let repo_root = repo_root()?;
-    let worktree_path = repo_root
-        .join(".claude")
-        .join("worktrees")
-        .join(sanitize_name(&args.name));
+    let in_place = current_branch()
+        .ok()
+        .map(|b| b == args.name)
+        .unwrap_or(false);
 
     if !args.no_pull {
         git_pull(&repo_root)?;
@@ -114,11 +116,18 @@ pub fn run(args: Args) -> Result<i32> {
     let _window_name = TmuxWindowName::rename(&args.name);
     update_trust(&repo_root)?;
 
-    ensure_worktree(&worktree_path, &args.name, &repo_root)?;
-
-    let canonical = worktree_path
-        .canonicalize()
-        .unwrap_or_else(|_| worktree_path.clone());
+    let canonical = if in_place {
+        repo_root.canonicalize().unwrap_or_else(|_| repo_root.clone())
+    } else {
+        let worktree_path = repo_root
+            .join(".claude")
+            .join("worktrees")
+            .join(sanitize_name(&args.name));
+        ensure_worktree(&worktree_path, &args.name, &repo_root)?;
+        worktree_path
+            .canonicalize()
+            .unwrap_or_else(|_| worktree_path.clone())
+    };
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
@@ -170,8 +179,14 @@ pub fn run(args: Args) -> Result<i32> {
     let status = cmd.status().context("launching claude")?;
     let exit_code = status.code().unwrap_or(1);
 
-    if let Err(e) = post_exit_menu(&args.name, &worktree_path, &repo_root) {
-        eprintln!("wtclaude: warning: post-exit menu: {e}");
+    if !in_place {
+        let worktree_path = repo_root
+            .join(".claude")
+            .join("worktrees")
+            .join(sanitize_name(&args.name));
+        if let Err(e) = post_exit_menu(&args.name, &worktree_path, &repo_root) {
+            eprintln!("wtclaude: warning: post-exit menu: {e}");
+        }
     }
 
     Ok(exit_code)
@@ -180,6 +195,21 @@ pub fn run(args: Args) -> Result<i32> {
 fn sanitize_name(name: &str) -> String {
     // claude replaces '/' with '+' in worktree directory names
     name.replace('/', "+")
+}
+
+fn current_branch() -> Result<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .context("running git rev-parse")?;
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr);
+        bail!("git rev-parse failed: {}", msg.trim());
+    }
+    Ok(String::from_utf8(output.stdout)
+        .context("git output")?
+        .trim()
+        .to_string())
 }
 
 pub(crate) fn repo_root() -> Result<PathBuf> {
@@ -208,6 +238,14 @@ fn git_pull(repo_root: &Path) -> Result<()> {
         return Ok(());
     }
     let status = Command::new("git")
+        .args(["fetch"])
+        .current_dir(repo_root)
+        .status()
+        .context("running git fetch")?;
+    if !status.success() {
+        bail!("git fetch failed");
+    }
+    let status = Command::new("git")
         .args(["pull"])
         .current_dir(repo_root)
         .status()
@@ -229,19 +267,7 @@ fn ensure_worktree(worktree_path: &Path, name: &str, repo_root: &Path) -> Result
         );
     }
 
-    // Try creating a new branch + worktree
-    let out = Command::new("git")
-        .args(["worktree", "add", "-b", name])
-        .arg(worktree_path)
-        .current_dir(repo_root)
-        .output()
-        .context("git worktree add")?;
-
-    if out.status.success() {
-        return Ok(());
-    }
-
-    // Branch already exists — check it out into the worktree
+    // Branch already exists locally — check it out into the worktree
     let out = Command::new("git")
         .args(["worktree", "add"])
         .arg(worktree_path)
@@ -249,6 +275,32 @@ fn ensure_worktree(worktree_path: &Path, name: &str, repo_root: &Path) -> Result
         .current_dir(repo_root)
         .output()
         .context("git worktree add (existing branch)")?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    // Try creating a new branch tracking the remote
+    let remote_ref = format!("origin/{}", name);
+    let out = Command::new("git")
+        .args(["worktree", "add", "--track", "-b", name])
+        .arg(worktree_path)
+        .arg(&remote_ref)
+        .current_dir(repo_root)
+        .output()
+        .context("git worktree add (remote branch)")?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+
+    // No remote — create a new local branch at HEAD
+    let out = Command::new("git")
+        .args(["worktree", "add", "-b", name])
+        .arg(worktree_path)
+        .current_dir(repo_root)
+        .output()
+        .context("git worktree add")?;
 
     if out.status.success() {
         return Ok(());
@@ -500,6 +552,8 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
         "Library/Caches/cargo-xwin",
     ];
 
+    let user_config = config::load_user()?;
+
     let raw: Vec<PathBuf> = [
         sandbox.to_path_buf(),
         repo_root.join(".git"),
@@ -511,6 +565,10 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
     ]
     .into_iter()
     .chain(pkg_cache_dirs.iter().map(|d| PathBuf::from(&home).join(d)))
+    .chain(user_config.allowlist.iter().map(|p| {
+        let p = p.replace("~", &home);
+        PathBuf::from(p)
+    }))
     .collect();
 
     let mut seen = std::collections::HashSet::new();

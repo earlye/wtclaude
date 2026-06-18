@@ -15,12 +15,16 @@ When you run `wtclaude <name>`, it:
 1. Resolves the git repo root and computes the worktree path at
    `.claude/worktrees/<name>`.
 
-2. Writes a temporary SBPL (Sandbox Policy Language) file that allows
+2. Creates the git worktree (or reuses it if it already exists), by
+   running `git worktree add` directly — the worktree is managed by
+   `wtclaude`, not delegated to `claude`.
+
+3. Writes a temporary SBPL (Sandbox Policy Language) file that allows
    file writes within the worktree, the repo's `.git` directory, and
    common package manager cache directories (Cargo, npm, pip, etc.) so
    that dependency fetching works without leaving the sandbox.
 
-3. Registers a `PreToolUse` hook (itself, via `wtclaude hook`) that
+4. Registers a `PreToolUse` hook (itself, via `wtclaude hook`) that
    intercepts every tool call Claude attempts:
 
    - **Bash**: rewrites the command to run under `sandbox-exec`,
@@ -30,11 +34,18 @@ When you run `wtclaude <name>`, it:
      the worktree boundary and denies the call if it would write
      outside.
 
-4. Launches `claude --worktree <name>` with the hook settings and the
-   sandbox environment variables set.
+5. Sets `hasTrustDialogAccepted: true` for the repo in `~/.claude.json`
+   so Claude's trust dialog is bypassed automatically.
 
-5. If running inside tmux, renames the current window to `<name>` for
-   easy navigation.
+6. Launches `claude` with the hook settings, `--append-system-prompt`
+   (informing Claude of the sandbox boundary), and the working directory
+   set to the worktree.
+
+7. If running inside tmux, renames the current window to `<name>` for
+   easy navigation (and restores the original name on exit).
+
+8. When the Claude session exits, shows an interactive menu to keep or
+   remove the worktree.
 
 The SBPL policy file and the settings JSON are written to `/tmp` and
 deleted automatically when the session exits.
@@ -79,18 +90,28 @@ next word auto-fills the matching worktree name.
 ## Usage
 
 ```
-wtclaude [--mode MODE] [--resume SESSION_ID] [--test-sbpl-breakage hide|missing] \
+wtclaude [--mode MODE] [--no-pull] [--resume SESSION_ID] \
+         [--show-policy] [--test-sbpl-breakage hide|missing] \
          WORKTREE_NAME [INITIAL_PROMPT]
 ```
 
-`WORKTREE_NAME` is the name passed to `claude --worktree`. Claude Code
-creates the worktree at `.claude/worktrees/<name>` inside your repo.
-Slashes in the name are replaced with `+` to match Claude's own
-directory naming.
+`WORKTREE_NAME` is the name for the git worktree. `wtclaude` creates
+it at `.claude/worktrees/<name>` inside your repo. Slashes in the name
+are replaced with `+` to match Claude's own directory naming.
 
 `INITIAL_PROMPT` (optional) is passed as the opening prompt to Claude.
 If it contains spaces, quote it or pass it as multiple trailing
 arguments — they are joined with spaces.
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--mode MODE` | Operation mode (see Modes). Overrides `WTCLAUDE_DEFAULT_MODE` and config. |
+| `--no-pull` | Skip `git pull` before launching. |
+| `--resume SESSION_ID` | Resume a previous Claude session by ID. |
+| `--show-policy` | Print the generated SBPL policy and pause before launching. |
+| `--test-sbpl-breakage hide\|missing` | Inject a sandbox policy fault for testing (see below). |
 
 Examples:
 
@@ -103,6 +124,9 @@ wtclaude fix-login "Fix the broken login redirect"
 
 # Use the 'dangerous' mode (skips permission prompts)
 wtclaude --mode dangerous refactor-auth
+
+# Skip pulling before launch
+wtclaude --no-pull my-feature
 ```
 
 
@@ -116,6 +140,20 @@ modes are:
 |------|-------------|-------|
 | `safe` | _(none)_ | Default. Claude prompts for permission. |
 | `dangerous` | `--dangerously-skip-permissions` | Claude acts without prompts. |
+
+The mode is resolved in priority order:
+
+1. `--mode MODE` flag (highest priority)
+2. `WTCLAUDE_DEFAULT_MODE` environment variable
+3. `default-mode` in `wtclaude.yml`
+4. Built-in default (`safe`)
+
+Set `WTCLAUDE_DEFAULT_MODE` in your shell profile to change the default
+without editing config files:
+
+```sh
+export WTCLAUDE_DEFAULT_MODE=dangerous
+```
 
 
 ## Configuration
@@ -164,6 +202,7 @@ The following paths are writable in addition to the worktree and
 | Tool | Path |
 |------|------|
 | Cargo | `~/.cargo` |
+| Rust toolchain | `~/.rustup` |
 | npm | `~/.npm` |
 | pnpm | `~/.pnpm-store`, `~/.local/share/pnpm` |
 | Yarn | `~/.yarn`, `~/.cache/yarn` |
@@ -179,8 +218,9 @@ The following paths are writable in addition to the worktree and
 | NuGet | `~/.nuget` |
 | Conan | `~/.conan2` |
 | Docker | `~/.docker` |
+| cargo-xwin | `~/Library/Caches/cargo-xwin` |
 
-| Temp files | `/tmp`, `$TMPDIR` |
+| Temp files | `/tmp`, `/private/tmp`, `/var/folders`, `/private/var/folders`, `$TMPDIR` |
 
 Package manager *installers* (e.g. Homebrew) are not allowlisted;
 only caching directories are included.
@@ -189,6 +229,21 @@ only caching directories are included.
 `NotebookEdit` tool calls before Claude executes them. Any path
 outside the worktree is denied immediately with an explanation, before
 any filesystem access occurs.
+
+
+## Post-exit menu
+
+After the Claude session exits, `wtclaude` shows a brief interactive
+menu:
+
+```
+> keep worktree my-feature
+  remove worktree my-feature
+```
+
+Use the arrow keys to select and press Enter. Choosing **remove**
+runs `git worktree remove` on the worktree directory. Ctrl-C or
+selecting **keep** leaves the worktree in place.
 
 
 ## Testing sandbox breakage
@@ -203,6 +258,10 @@ The `--test-sbpl-breakage` flag is for development and testing:
 
 In both cases `wtclaude hook` will block all Bash execution and report
 the reason to Claude.
+
+The `--show-policy` flag prints the generated SBPL policy to stdout
+and pauses (waiting for Enter) before launching Claude. Useful for
+inspecting exactly what write paths are allowlisted.
 
 
 ## License
