@@ -430,7 +430,22 @@ fn remove_worktree(worktree_path: &Path, repo_root: &Path) -> Result<()> {
         .status()
         .context("git worktree remove")?;
     if !status.success() {
-        bail!("git worktree remove failed");
+        use std::io::{self, Write};
+        print!("git worktree remove failed. Force-remove? [y/N] ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if input.trim().eq_ignore_ascii_case("y") {
+            let force_status = Command::new("git")
+                .args(["worktree", "remove", "-f"])
+                .arg(worktree_path)
+                .current_dir(repo_root)
+                .status()
+                .context("git worktree remove -f")?;
+            if !force_status.success() {
+                bail!("git worktree remove -f failed");
+            }
+        }
     }
     Ok(())
 }
