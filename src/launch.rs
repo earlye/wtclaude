@@ -104,11 +104,23 @@ pub fn run(args: Args) -> Result<i32> {
         .get(&mode)
         .with_context(|| format!("unknown mode: {}", mode))?;
 
-    let repo_root = repo_root()?;
-    let in_place = current_branch()
-        .ok()
-        .map(|b| b == args.name)
-        .unwrap_or(false);
+    let repo_root = match repo_root() {
+        Ok(r) => r,
+        Err(_) => {
+            let cwd = std::env::current_dir().context("getting current directory")?;
+            if !offer_git_init(&cwd)? {
+                bail!("no git repository found; run 'git init' to initialize one");
+            }
+            cwd
+        }
+    };
+
+    let fresh = is_fresh_repo(&repo_root);
+    let in_place = fresh
+        || current_branch()
+            .ok()
+            .map(|b| b == args.name)
+            .unwrap_or(false);
 
     if !args.no_pull {
         git_pull(&repo_root)?;
@@ -195,6 +207,42 @@ pub fn run(args: Args) -> Result<i32> {
 fn sanitize_name(name: &str) -> String {
     // claude replaces '/' with '+' in worktree directory names
     name.replace('/', "+")
+}
+
+fn offer_git_init(dir: &Path) -> Result<bool> {
+    use std::io::{self, Write};
+    print!(
+        "No git repository found in {}. Run 'git init'? [Y/n] ",
+        dir.display()
+    );
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let answer = input.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
+        let status = Command::new("git")
+            .arg("init")
+            .current_dir(dir)
+            .status()
+            .context("running git init")?;
+        if !status.success() {
+            bail!("git init failed");
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn is_fresh_repo(repo_root: &Path) -> bool {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output();
+    match out {
+        Ok(o) => !o.status.success(),
+        Err(_) => true,
+    }
 }
 
 fn current_branch() -> Result<String> {
@@ -335,8 +383,8 @@ fn post_exit_menu(name: &str, worktree_path: &Path, repo_root: &Path) -> Result<
     use crossterm::{
         cursor,
         event::{self, Event, KeyCode, KeyModifiers},
-        execute,
-        style::Stylize,
+        queue,
+        style::{Print, Stylize},
         terminal::{self, ClearType},
     };
     use std::io::{self, Write};
@@ -363,21 +411,23 @@ fn post_exit_menu(name: &str, worktree_path: &Path, repo_root: &Path) -> Result<
     let mut stdout = io::stdout();
 
     let draw = |stdout: &mut io::Stdout, sel: usize| -> io::Result<()> {
+        queue!(stdout, cursor::Hide)?;
         for (i, label) in labels.iter().enumerate() {
-            execute!(
+            queue!(
                 stdout,
                 terminal::Clear(ClearType::CurrentLine),
                 cursor::MoveToColumn(0),
             )?;
             if i == sel {
-                write!(stdout, "{}", format!("> {label}").reverse())?;
+                queue!(stdout, Print(format!("> {label}").reverse()))?;
             } else {
-                write!(stdout, "  {label}")?;
+                queue!(stdout, Print(format!("  {label}")))?;
             }
             if i + 1 < labels.len() {
-                write!(stdout, "\r\n")?;
+                queue!(stdout, Print("\r\n"))?;
             }
         }
+        queue!(stdout, cursor::Show)?;
         stdout.flush()
     };
 
@@ -390,14 +440,14 @@ fn post_exit_menu(name: &str, worktree_path: &Path, repo_root: &Path) -> Result<
                 (KeyCode::Up, _) => {
                     if sel > 0 {
                         sel -= 1;
-                        execute!(stdout, cursor::MoveUp((n - 1) as u16))?;
+                        queue!(stdout, cursor::MoveUp((n - 1) as u16))?;
                         draw(&mut stdout, sel)?;
                     }
                 }
                 (KeyCode::Down, _) => {
                     if sel < n - 1 {
                         sel += 1;
-                        execute!(stdout, cursor::MoveUp((n - 1) as u16))?;
+                        queue!(stdout, cursor::MoveUp((n - 1) as u16))?;
                         draw(&mut stdout, sel)?;
                     }
                 }
