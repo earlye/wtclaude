@@ -648,6 +648,8 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
         "(allow default)".to_string(),
         "(deny file-write* (subpath \"/\"))".to_string(),
         "(allow file-write* (literal \"/dev/null\"))".to_string(),
+        // Keychain: allow writes so tools like saml2aws can store tokens
+        format!("(allow file-write* (subpath \"{}/Library/Keychains\"))", home),
     ];
 
     for p in &allow_paths {
