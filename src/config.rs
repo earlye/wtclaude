@@ -14,6 +14,8 @@ pub struct Config {
 pub struct UserConfig {
     #[serde(default)]
     pub allowlist: Vec<String>,
+    #[serde(default)]
+    pub socket_allowlist: Vec<String>,
 }
 
 #[derive(Deserialize)]

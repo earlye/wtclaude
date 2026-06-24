@@ -643,6 +643,12 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
         .filter(|p| seen.insert(p.clone()))
         .collect();
 
+    let socket_paths: Vec<PathBuf> = user_config
+        .socket_allowlist
+        .iter()
+        .map(|p| resolve(PathBuf::from(p.replace("~", &home))))
+        .collect();
+
     let mut lines = vec![
         "(version 1)".to_string(),
         "(allow default)".to_string(),
@@ -655,6 +661,13 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
             "(allow file-write* (subpath \"{}\"))",
             p.to_string_lossy()
         ));
+    }
+
+    for p in &socket_paths {
+        let s = p.to_string_lossy();
+        lines.push(format!("(allow file-write* (subpath \"{s}\"))"));
+        lines.push(format!("(allow network-outbound (subpath \"{s}\"))"));
+        lines.push(format!("(allow network-bind    (subpath \"{s}\"))"));
     }
 
     let policy = lines.join("\n") + "\n";
