@@ -656,6 +656,9 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
         "(allow file-write* (literal \"/dev/null\"))".to_string(),
         // Keychain: allow writes so tools like saml2aws can store tokens
         format!("(allow file-write* (subpath \"{}/Library/Keychains\"))", home),
+        // osascript / AppleEvents support
+        "(allow process-exec* (literal \"/usr/bin/osascript\"))".to_string(),
+        "(allow appleevent-send)".to_string(),
     ];
 
     for p in &allow_paths {
