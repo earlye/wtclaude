@@ -97,10 +97,12 @@ fn wrap_bash_in_sandbox(payload: &HookPayload) -> Result<Option<HookResponse>> {
         )));
     }
     if !std::path::Path::new(&sbpl_path).exists() {
-        return Ok(Some(deny_bash(&format!(
-            "Sandbox policy file missing: {}. Bash is blocked.",
-            sbpl_path
-        ))));
+        if let Err(e) = regenerate_sbpl_policy(&sbpl_path) {
+            return Ok(Some(deny_bash(&format!(
+                "Sandbox policy file missing and could not be regenerated ({}): {}. Bash is blocked.",
+                sbpl_path, e
+            ))));
+        }
     }
 
     let wrapped = format!(
@@ -117,6 +119,20 @@ fn wrap_bash_in_sandbox(payload: &HookPayload) -> Result<Option<HookResponse>> {
             updated_input: Some(serde_json::json!({ "command": wrapped })),
         },
     }))
+}
+
+fn regenerate_sbpl_policy(sbpl_path: &str) -> anyhow::Result<()> {
+    let sandbox = std::env::var("WTCLAUDE_SANDBOX")
+        .map_err(|_| anyhow::anyhow!("WTCLAUDE_SANDBOX not set"))?;
+    let repo_root = std::env::var("WTCLAUDE_REPO_ROOT")
+        .map_err(|_| anyhow::anyhow!("WTCLAUDE_REPO_ROOT not set"))?;
+    let policy = crate::launch::generate_sbpl_policy(
+        std::path::Path::new(&sandbox),
+        std::path::Path::new(&repo_root),
+    )?;
+    std::fs::write(sbpl_path, policy)
+        .map_err(|e| anyhow::anyhow!("writing regenerated policy: {e}"))?;
+    Ok(())
 }
 
 fn deny_bash(reason: &str) -> HookResponse {

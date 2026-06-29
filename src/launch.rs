@@ -172,6 +172,7 @@ pub fn run(args: Args) -> Result<i32> {
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     cmd.env("WTCLAUDE_SANDBOX", &canonical);
+    cmd.env("WTCLAUDE_REPO_ROOT", &repo_root);
     match args.test_sbpl_breakage {
         None => {
             cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
@@ -587,9 +588,7 @@ fn resolve(p: PathBuf) -> PathBuf {
     p.canonicalize().unwrap_or(p)
 }
 
-fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> Result<TempFile> {
-    let _ = worktree_name; // git_dir covers worktrees/<name> as a subpath
-
+pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<String> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
 
@@ -675,7 +674,11 @@ fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, worktree_name: &str) -> R
         lines.push(format!("(allow network-bind    (subpath \"{s}\"))"));
     }
 
-    let policy = lines.join("\n") + "\n";
+    Ok(lines.join("\n") + "\n")
+}
+
+fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, _worktree_name: &str) -> Result<TempFile> {
+    let policy = generate_sbpl_policy(sandbox, repo_root)?;
     let path = PathBuf::from(format!("/tmp/wtclaude-sbpl-{}.sb", std::process::id()));
     std::fs::write(&path, policy).context("writing sbpl policy")?;
     Ok(TempFile(path))
