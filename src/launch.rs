@@ -482,6 +482,20 @@ fn remove_worktree(worktree_path: &Path, repo_root: &Path) -> Result<()> {
         .context("git worktree remove")?;
     if !status.success() {
         use std::io::{self, Write};
+        if let Ok(out) = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(worktree_path)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<&str> = text.lines().collect();
+            for line in lines.iter().take(10) {
+                println!("{}", line);
+            }
+            if lines.len() > 10 {
+                println!("(… and {} more)", lines.len() - 10);
+            }
+        }
         print!("git worktree remove failed. Force-remove? [y/N] ");
         io::stdout().flush()?;
         let mut input = String::new();
