@@ -520,15 +520,29 @@ enum TmuxRestore {
     Name(String),
 }
 
-struct TmuxWindowName(Option<TmuxRestore>);
+struct TmuxWindowName(Option<TmuxWindowNameState>);
+
+struct TmuxWindowNameState {
+    restore: TmuxRestore,
+    pane: String,
+}
 
 impl TmuxWindowName {
     fn rename(name: &str) -> Self {
         if std::env::var("TMUX").is_err() {
             return Self(None);
         }
+        // Captured once, at the pane this process's tty belongs to. Unlike
+        // tmux's own "current window" (which follows whatever the user last
+        // selected, possibly in another pane), $TMUX_PANE is fixed for the
+        // lifetime of this process, so it still identifies the right window
+        // even if the user switches panes/windows while wtclaude is starting.
+        let pane = match std::env::var("TMUX_PANE") {
+            Ok(p) => p,
+            Err(_) => return Self(None),
+        };
         let auto_rename = Command::new("tmux")
-            .args(["show-window-options", "-v", "automatic-rename"])
+            .args(["show-window-options", "-t", &pane, "-v", "automatic-rename"])
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -538,7 +552,7 @@ impl TmuxWindowName {
             TmuxRestore::AutoRename
         } else {
             let old = Command::new("tmux")
-                .args(["display-message", "-p", "#W"])
+                .args(["display-message", "-t", &pane, "-p", "#W"])
                 .output()
                 .ok()
                 .and_then(|o| String::from_utf8(o.stdout).ok())
@@ -546,30 +560,36 @@ impl TmuxWindowName {
                 .unwrap_or_default();
             TmuxRestore::Name(old)
         };
-        if let Err(e) = Command::new("tmux").args(["rename-window", name]).status() {
+        if let Err(e) = Command::new("tmux")
+            .args(["rename-window", "-t", &pane, name])
+            .status()
+        {
             eprintln!("wtclaude: warning: tmux rename-window: {e}");
         }
-        Self(Some(restore))
+        Self(Some(TmuxWindowNameState { restore, pane }))
     }
 }
 
 impl Drop for TmuxWindowName {
     fn drop(&mut self) {
-        match &self.0 {
-            Some(TmuxRestore::AutoRename) => {
+        let Some(state) = &self.0 else { return };
+        match &state.restore {
+            TmuxRestore::AutoRename => {
                 if let Err(e) = Command::new("tmux")
-                    .args(["set-window-option", "automatic-rename", "on"])
+                    .args(["set-window-option", "-t", &state.pane, "automatic-rename", "on"])
                     .status()
                 {
                     eprintln!("wtclaude: warning: tmux set automatic-rename on: {e}");
                 }
             }
-            Some(TmuxRestore::Name(name)) => {
-                if let Err(e) = Command::new("tmux").args(["rename-window", name]).status() {
+            TmuxRestore::Name(name) => {
+                if let Err(e) = Command::new("tmux")
+                    .args(["rename-window", "-t", &state.pane, name])
+                    .status()
+                {
                     eprintln!("wtclaude: warning: tmux rename-window (restore): {e}");
                 }
             }
-            None => {}
         }
     }
 }
