@@ -156,7 +156,11 @@ pub fn run(args: Args) -> Result<i32> {
 
     let sandbox_notice = format!(
         "You are running in a git worktree sandbox for branch '{}'. \
-         You may only write files under: {}.",
+         You may only write files under: {}. \
+         Do not attempt to create new worktrees (e.g. via `git worktree add`, `wtclaude new`, \
+         or an EnterWorktree/spawn-agent-in-worktree tool) from within this sandbox: creating a \
+         worktree requires writing to the main repository's `.git` directory, which is outside \
+         this sandbox and will be rejected.",
         args.name,
         canonical.display()
     );
