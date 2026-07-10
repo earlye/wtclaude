@@ -72,9 +72,23 @@ The hypothesis above (both this issue's and the prior resolved issue's) turned o
 
 All four pass. The `'` → `'\''` single-quote escaping in `shell_single_quote()` (present, unchanged in substance, since the very first commit of this file) correctly survives quoted heredoc delimiters, command substitution, and a real `sandbox-exec` round-trip for the exact command shape that was reported as failing — both in this issue and the original 2026-07-01 report. There is no defect in the escaping algorithm.
 
-**Root cause of the actual live failure is therefore unresolved** — it is not `shell_single_quote()` or `wrap_bash_in_sandbox()`. A stale/pre-fix `wtclaude` binary was considered (plausible explanation for the recurrence, since the fix landed 2026-07-01 and this report also predates a rebuild) but the user ruled it out: a crash the night before this report caused a full relaunch of all agents, which would have picked up a current binary.
+A stale/pre-fix `wtclaude` binary was considered (plausible explanation for the recurrence, since the fix landed 2026-07-01 and this report also predates a rebuild) but the user ruled it out: a crash the night before this report caused a full relaunch of all agents, which would have picked up a current binary. Confirmed separately: the binary actually registered as the `PreToolUse` hook (`/Users/earlye/.cargo/bin/wtclaude`) was built from commit `5262174` (2026-07-07), which already includes PR #21 — not stale.
 
-Since no defect could be found or reproduced in the escaping/wrapping code after deliberate, repeated attempts — including through the real `sandbox-exec` path — this issue is closed with regression coverage added and no code change to the escaping logic itself. If this recurs, the priority is capturing enough diagnostic context to actually pin down the cause next time (see follow-up below) rather than re-guessing at the quoting algorithm again.
+### The actual root cause: this is a real bash 3.2 parsing bug, unrelated to wtclaude
+
+While self-reviewing this fix, the exact same failure reproduced live in this session on a fresh commit — using code already proven correct by the tests above. Forensics on that live failure:
+
+1. Captured the *exact* PreToolUse JSON payload and fed it through the real installed `wtclaude hook` binary, then ran its exact wrapped output — reproduced the identical error (`unexpected EOF while looking for matching` / `syntax error: unexpected end of file`).
+2. Verified phase-1 unwrapping (the outer `sh -c '<escaped>'` single-quote parsing) reconstructs the original command text **byte-for-byte** before any execution happens — confirmed via a `printf '%s'` probe, not just reasoning about it.
+3. Ran the **raw, unescaped original command** directly via a single `sh -c` — no wtclaude, no hook, no escaping involved at all — and it **failed identically**.
+4. Bisected to the minimal trigger: a heredoc body nested inside `$(...)` inside double quotes (`"$(cat <<'EOF' ... EOF)"`) fails whenever the heredoc body's single-quote characters have an odd "effective" toggle count — where a `\'` sequence gets absorbed by the shell's own quote-tracking as one non-toggling unit instead of two literal characters (heredoc body content is supposed to be completely opaque to quoting, but the parser's quote-balance prescan doesn't treat it that way).
+5. Reproduces identically on both `/bin/sh` and `/bin/bash` on this Mac — both report `GNU bash, version 3.2.57(1)-release`, Apple's ancient, GPLv3-frozen bash. Does **not** reproduce on `zsh`.
+
+This is a genuine bash 3.2 parsing bug for heredocs nested in command substitution inside double quotes, triggered by certain single-quote arrangements in the heredoc body — completely independent of wtclaude. The original 2026-07-01 report's commit message had exactly one apostrophe (`run()'s`, an odd count) — that's why it hit this. `shell_single_quote()` and `wrap_bash_in_sandbox()` were never the bug; both this issue's and the original resolved issue's hypotheses were wrong. Likely not wtclaude-specific either: if Claude Code's own Bash tool defaults to `/bin/bash` on macOS (same ancient 3.2.57), any session using the `git commit -m "$(cat <<'EOF' ... EOF)"` idiom — which Claude Code itself commonly generates — can hit this, sandboxed or not, whenever the message body's quote arrangement is unlucky.
+
+### What was actually done about it
+
+No code change to `shell_single_quote()`/`wrap_bash_in_sandbox()` — there was nothing to fix there, and the regression tests added above stay as valid coverage that the escaping is sound. Instead, `src/launch.rs`'s `sandbox_notice` (appended to every spawned session's system prompt via `--append-system-prompt`) now warns against the heredoc-in-`$()`-in-double-quotes pattern and recommends `git commit -F <tempfile>` instead, since this is the cheapest way to actually prevent agents from stepping on this landmine going forward.
 
 ### Follow-up (tracked separately, not implemented here)
 

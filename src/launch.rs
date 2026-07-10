@@ -160,7 +160,18 @@ pub fn run(args: Args) -> Result<i32> {
          Do not attempt to create new worktrees (e.g. via `git worktree add`, `wtclaude new`, \
          or an EnterWorktree/spawn-agent-in-worktree tool) from within this sandbox: creating a \
          worktree requires writing to the main repository's `.git` directory, which is outside \
-         this sandbox and will be rejected.",
+         this sandbox and will be rejected. \
+         Avoid heredocs (e.g. `cat <<'EOF' ... EOF`) nested inside a `$(...)` command \
+         substitution inside double quotes — the common `git commit -m \"$(cat <<'EOF' ... \
+         EOF)\"` idiom included. Apple's bash 3.2 (which backs both /bin/sh and /bin/bash on \
+         macOS, and is what this sandbox's `sh -c` wrapper runs) has a real parsing bug there: \
+         depending on the exact single-quote/backslash content of the heredoc body, it can \
+         miscount quote nesting and fail with 'unexpected EOF while looking for matching' or a \
+         syntax error, even though the same text is valid POSIX shell and works fine in zsh. \
+         This is unrelated to sandboxing and reproduces with no sandbox involved at all. Prefer \
+         writing multi-line content (like a commit message) to a temp file and using it \
+         directly, e.g. `git commit -F /tmp/msg.txt`, instead of the heredoc-in-command- \
+         substitution pattern.",
         args.name,
         canonical.display()
     );
