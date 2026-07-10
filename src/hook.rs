@@ -243,7 +243,46 @@ mod tests {
     }
 
     #[test]
+    fn shell_single_quote_literal_output_for_known_inputs() {
+        assert_eq!(shell_single_quote("plain"), "'plain'");
+        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_single_quote("''"), "''\\'''\\'''");
+    }
+
+    #[test]
+    fn shell_single_quote_reconstructs_adversarial_bodies_byte_for_byte() {
+        // shell_single_quote() is the only barrier between an arbitrary Bash
+        // command and a second `sh -c` re-parse inside sandbox-exec. Rather
+        // than executing adversarial-looking content directly (risky if a
+        // real escaping bug let something run), assert that the outer
+        // `sh -c '<escaped>'` reconstructs the original bytes exactly via
+        // `printf '%s'`. Exact byte-for-byte reconstruction is what
+        // guarantees the wrapped command behaves identically to running the
+        // original directly — i.e. nothing can "escape" the outer quoting.
+        let adversarial_bodies = [
+            "already just plain text",
+            "leading quote: 'text",
+            "trailing quote: text'",
+            "adjacent quotes: ''",
+            "looks like a breakout attempt: '; echo INJECTED; echo '",
+            "odd count: it's a 'test' of 'quoting",
+        ];
+
+        for original in adversarial_bodies {
+            let escaped = shell_single_quote(original);
+            let probe = format!("printf '%s' {escaped}");
+            let reconstructed = run_via_outer_shell(&probe);
+            assert_eq!(
+                reconstructed, original,
+                "failed to reconstruct: {original:?}"
+            );
+        }
+    }
+
+    #[test]
     fn shell_single_quote_survives_quoted_heredoc() {
+        // Minimal repro: a heredoc whose quoted delimiter and body both
+        // contain literal single quotes for shell_single_quote() to escape.
         let original = "cat <<'EOF'\nHello 'World'\nFrom Heredoc\nEOF";
         let escaped = shell_single_quote(original);
         let outer_cmd = format!("sh -c {escaped}");
@@ -255,6 +294,9 @@ mod tests {
 
     #[test]
     fn shell_single_quote_survives_real_world_commit_command() {
+        // Body copied verbatim from the original bug report. Keep the
+        // apostrophe in "run()'s" — it's the one embedded single quote that
+        // makes this test exercise shell_single_quote()'s escaping at all.
         let body = "Introduce App struct for introduce-app-struct\n\
 \n\
 Moves run()'s pty/reader/writer/emulator/cols/rows locals into an App\n\
@@ -276,11 +318,16 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n";
 
     #[test]
     fn shell_single_quote_survives_command_substitution_around_heredoc() {
-        // Mirrors the exact shape of the failing real-world command:
-        // git commit -m "$(cat <<'EOF' ... EOF)" — a double-quoted command
-        // substitution wrapping a heredoc with a single-quoted delimiter.
-        // Swap `git commit -m` for `printf '%s\n'` so this runs standalone
-        // without needing a git repo/staged changes.
+        // Structural shape matches the real failing command — a double-quoted
+        // command substitution wrapping a heredoc with a single-quoted
+        // delimiter: git commit -m "$(cat <<'EOF' ... EOF)". The body
+        // intentionally omits the apostrophe (see
+        // shell_single_quote_survives_real_world_commit_command) that
+        // triggers the separate, unrelated bash 3.2 heredoc-in-$()-in-""
+        // parsing bug (see the issue file) — that bug is not fixable here,
+        // so this test isolates shell_single_quote()'s own correctness from
+        // it. Swap `git commit -m` for `printf '%s\n'` so this runs
+        // standalone without needing a git repo/staged changes.
         let body = "Introduce App struct for introduce-app-struct\n\
 \n\
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
@@ -294,7 +341,25 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         assert_eq!(stdout, format!("{body}\n"));
     }
 
+    // Cleans up the test-only SBPL policy file and WTCLAUDE_SBPL env var on
+    // drop, including on unwind from a failed assertion — otherwise a test
+    // failure would leak the temp file and leave WTCLAUDE_SBPL set for the
+    // rest of the process.
+    struct SbplPolicyGuard {
+        path: PathBuf,
+    }
+
+    impl Drop for SbplPolicyGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            unsafe {
+                std::env::remove_var("WTCLAUDE_SBPL");
+            }
+        }
+    }
+
     #[test]
+    #[ignore = "sandbox-exec cannot nest inside an already-sandboxed process; run from a terminal outside a wtclaude sandbox"]
     fn wrap_bash_in_sandbox_survives_real_sandbox_exec() {
         // Exercises the actual production path — wrap_bash_in_sandbox() building
         // "/usr/bin/sandbox-exec -f <policy> sh -c '<escaped>'" — instead of just
@@ -304,15 +369,14 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         // macOS refuses sandbox_apply from within an already-sandboxed process,
         // so this can't pass while running inside a wtclaude sandbox itself
         // (e.g. `cargo test` run by Claude Code in a wtclaude-managed session).
-        // Skip in that case; run this from a plain, unsandboxed terminal.
-        if std::env::var("WTCLAUDE_SANDBOX").is_ok() {
-            eprintln!(
-                "skipping wrap_bash_in_sandbox_survives_real_sandbox_exec: \
-                 WTCLAUDE_SANDBOX is set, so sandbox-exec would nest and always fail. \
-                 Run this test from a terminal outside a wtclaude sandbox."
-            );
-            return;
-        }
+        // #[ignore] keeps a plain `cargo test` green; if this is force-run via
+        // `--ignored` while still sandboxed, fail loudly rather than silently
+        // passing, so the misuse is obvious.
+        assert!(
+            std::env::var("WTCLAUDE_SANDBOX").is_err(),
+            "WTCLAUDE_SANDBOX is set: sandbox-exec would nest and always fail. \
+             Run this test from a terminal outside a wtclaude sandbox."
+        );
 
         // WTCLAUDE_SBPL is a process-global env var; this is the only test that
         // touches it today, so there's no cross-test race, but that'd need
@@ -323,6 +387,9 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         unsafe {
             std::env::set_var("WTCLAUDE_SBPL", &policy_path);
         }
+        let _guard = SbplPolicyGuard {
+            path: policy_path.clone(),
+        };
 
         let body = "Introduce App struct for introduce-app-struct\n\
 \n\
@@ -348,11 +415,6 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
             .to_string();
 
         let stdout = run_via_outer_shell(&wrapped);
-
-        let _ = std::fs::remove_file(&policy_path);
-        unsafe {
-            std::env::remove_var("WTCLAUDE_SBPL");
-        }
 
         assert_eq!(stdout, format!("{body}\n"));
     }

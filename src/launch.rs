@@ -170,7 +170,7 @@ pub fn run(args: Args) -> Result<i32> {
          syntax error, even though the same text is valid POSIX shell and works fine in zsh. \
          This is unrelated to sandboxing and reproduces with no sandbox involved at all. Prefer \
          writing multi-line content (like a commit message) to a temp file and using it \
-         directly, e.g. `git commit -F /tmp/msg.txt`, instead of the heredoc-in-command- \
+         directly, e.g. `git commit -F /tmp/msg.txt`, instead of the heredoc-in-command-\
          substitution pattern.",
         args.name,
         canonical.display()
