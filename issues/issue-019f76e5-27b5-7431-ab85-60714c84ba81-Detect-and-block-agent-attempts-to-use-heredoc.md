@@ -13,11 +13,20 @@ An agent has now hit this bug again despite the warning — relying on the syste
 - `src/hook.rs:138` — `deny_bash()`, existing helper for producing a `permissionDecision: deny` response with a reason string.
 - `src/launch.rs:157` — `sandbox_notice`, the existing system-prompt warning text this feature is meant to backstop.
 
-## Open questions
+## Decisions
 
-- Scope: block ALL heredoc syntax (`<<`/`<<-`) outright, or only the specific bug-triggering shape (heredoc nested inside `$(...)` inside double quotes)? The bug was only proven for the nested shape; a plain `cat > file <<'EOF' ... EOF` wasn't shown to be affected.
-- Detection method: naive substring/regex scan for `<<` vs. something nesting-aware. A naive scan risks false positives (e.g. `python -c "print(1<<2)"`, a bitshift in an embedded snippet) and could itself be fooled by quoting the same way the bash bug is.
-- Exact error message text and whether it should restate the workaround (`git commit -F <tempfile>`).
+- **Scope**: block *all* heredoc syntax, not just the specific nested-and-proven-buggy shape. Distinguishing safe from buggy shapes reliably would mean re-implementing bash's own quote-parsing (the same class of problem that caused the underlying bug), and the safe alternatives (temp file + `-F`, or the `Write` tool) are cheap.
+- **Detection heuristic**: match a heredoc opener (`<<` or `<<-`, optional quote, then an identifier) *and* confirm a later line consisting solely of that identifier (leading tabs allowed for `<<-`). Requiring both open and matching close makes a stray `<<` (e.g. a bitshift in an embedded snippet) statistically not worth guarding against — no shell quote-tracking needed.
+- **Placement**: first check inside `wrap_bash_in_sandbox()` (`src/hook.rs:83`), before the `sbpl_path` lookup, returning `deny_bash(...)` on a match. No new gating — it inherits the existing `WTCLAUDE_SANDBOX`/`Bash`-only gate from `run()` for free.
+- **Deny message**: "heredoc is blocked because of the bug warned about in the system prompt: heredocs (even non-nested ones) are blocked outright because reliably distinguishing safe from buggy shapes isn't possible without re-implementing shell quote-parsing. Use a temp file instead, e.g. `git commit -F /tmp/msg.txt`, or write multi-line content with the Write tool."
+- **`sandbox_notice` (`src/launch.rs:157`)**: leave unchanged — the deny message's reference to "the bug warned about in the system prompt" depends on the notice still describing it, and the notice still saves a wasted turn by steering the agent away before it hits the deny.
+
+## Next steps
+
+Implement in `src/hook.rs`:
+1. Add a `contains_heredoc(command: &str) -> bool` helper implementing the open+matching-close-line heuristic above.
+2. Call it at the top of `wrap_bash_in_sandbox()`; on a match, return `Ok(Some(deny_bash(HEREDOC_DENY_MESSAGE)))` before the `sbpl_path` checks.
+3. Add unit tests: real heredoc commands (plain, and the nested `$(cat <<'EOF' ... EOF)"` shape) are denied; commands with `<<` but no matching closer line (e.g. an inline bitshift) are allowed through.
 
 ## Grill Log
 
