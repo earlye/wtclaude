@@ -171,9 +171,11 @@ fn shell_single_quote(s: &str) -> String {
 }
 
 /// Detects heredoc syntax (`<<`/`<<-`) without tracking shell quoting: a
-/// stray `<<` (e.g. a bitshift in an embedded snippet) never has a
+/// stray `<<` (e.g. a bitshift in an embedded snippet) only rarely has a
 /// later line matching its "delimiter" exactly, so requiring both the
-/// opener and a matching closing line keeps false positives negligible.
+/// opener and a matching closing line keeps false positives rare, not
+/// impossible — e.g. a coincidental line consisting solely of a numeric
+/// operand (`"n=1<<2\n2"`) would still match.
 fn contains_heredoc(command: &str) -> bool {
     let bytes = command.as_bytes();
     let len = bytes.len();
@@ -217,13 +219,14 @@ fn contains_heredoc(command: &str) -> bool {
             continue;
         }
         let ident_end = j;
-        if let Some(q) = quote {
-            if bytes.get(j) == Some(&q) {
-                j += 1;
-            } else {
-                i = ident_end;
-                continue;
-            }
+        // A missing/mismatched closing quote (e.g. `<<'EOF` with no closing
+        // `'`) doesn't disqualify the match — detection doesn't depend on
+        // the shell's own quoting being well-formed, only on the opener and
+        // a later matching close line.
+        if let Some(q) = quote
+            && bytes.get(j) == Some(&q)
+        {
+            j += 1;
         }
         let delimiter = &command[ident_start..ident_end];
         if has_matching_close_line(&command[j..], delimiter, dash) {
@@ -460,6 +463,22 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         assert!(!contains_heredoc("cat <<< \"just a string\""));
         // `<<` with a delimiter but no line consisting solely of it.
         assert!(!contains_heredoc("cat <<EOF\nhello\nnot the delimiter"));
+    }
+
+    #[test]
+    fn contains_heredoc_detects_unterminated_quote_around_delimiter() {
+        // Missing closing quote right after the delimiter — still a real
+        // heredoc opener as far as detection is concerned.
+        assert!(contains_heredoc("cat <<'EOF\nhi\nEOF"));
+        assert!(contains_heredoc("cat <<\"EOF\nhi\nEOF"));
+    }
+
+    #[test]
+    fn contains_heredoc_requires_exact_close_line_for_plain_heredoc() {
+        // Only `<<-` allows the close line to be tab-indented; plain `<<`
+        // requires an exact match.
+        assert!(!contains_heredoc("cat <<EOF\n\tEOF"));
+        assert!(contains_heredoc("cat <<-EOF\n\tEOF"));
     }
 
     #[test]
