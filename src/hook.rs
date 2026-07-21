@@ -80,6 +80,12 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+const HEREDOC_DENY_MESSAGE: &str = "heredoc is blocked because of the bug warned about in the \
+     system prompt: heredocs (even non-nested ones) are blocked outright because reliably \
+     distinguishing safe from buggy shapes isn't possible without re-implementing shell \
+     quote-parsing. Use a temp file instead, e.g. `git commit -F /tmp/msg.txt`, or write \
+     multi-line content with the Write tool.";
+
 fn wrap_bash_in_sandbox(payload: &HookPayload) -> Result<Option<HookResponse>> {
     let command = match payload.tool_input.get("command").and_then(|v| v.as_str()) {
         Some(c) => c,
@@ -89,6 +95,10 @@ fn wrap_bash_in_sandbox(payload: &HookPayload) -> Result<Option<HookResponse>> {
             )));
         }
     };
+
+    if contains_heredoc(command) {
+        return Ok(Some(deny_bash(HEREDOC_DENY_MESSAGE)));
+    }
 
     let sbpl_path = std::env::var("WTCLAUDE_SBPL").unwrap_or_default();
     if sbpl_path.is_empty() {
@@ -158,6 +168,90 @@ fn shell_single_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Detects heredoc syntax (`<<`/`<<-`) without tracking shell quoting: a
+/// stray `<<` (e.g. a bitshift in an embedded snippet) only rarely has a
+/// later line matching its "delimiter" exactly, so requiring both the
+/// opener and a matching closing line keeps false positives rare, not
+/// impossible — e.g. a coincidental line consisting solely of a numeric
+/// operand (`"n=1<<2\n2"`) would still match.
+fn contains_heredoc(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i + 1 < len {
+        if bytes[i] != b'<' || bytes[i + 1] != b'<' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 2;
+        if j < len && bytes[j] == b'<' {
+            // `<<<` is a herestring, not a heredoc.
+            i = j + 1;
+            continue;
+        }
+        let dash = j < len && bytes[j] == b'-';
+        if dash {
+            j += 1;
+        }
+        while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        let quote = match bytes.get(j) {
+            Some(b'\'') | Some(b'"') => {
+                let q = bytes[j];
+                j += 1;
+                Some(q)
+            }
+            Some(b'\\') => {
+                j += 1;
+                None
+            }
+            _ => None,
+        };
+        let ident_start = j;
+        while j < len && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+            j += 1;
+        }
+        if j == ident_start {
+            i += 2;
+            continue;
+        }
+        let ident_end = j;
+        // A missing/mismatched closing quote (e.g. `<<'EOF` with no closing
+        // `'`) doesn't disqualify the match — detection doesn't depend on
+        // the shell's own quoting being well-formed, only on the opener and
+        // a later matching close line.
+        if let Some(q) = quote
+            && bytes.get(j) == Some(&q)
+        {
+            j += 1;
+        }
+        let delimiter = &command[ident_start..ident_end];
+        if has_matching_close_line(&command[j..], delimiter, dash) {
+            return true;
+        }
+        i = j;
+    }
+    false
+}
+
+/// `rest` is everything after a heredoc opener's delimiter, starting on the
+/// opener's own line. A real heredoc requires `delimiter` alone on one of
+/// the following lines (leading tabs allowed only for `<<-`).
+fn has_matching_close_line(rest: &str, delimiter: &str, dash: bool) -> bool {
+    let Some((_opener_line_tail, following_lines)) = rest.split_once('\n') else {
+        return false;
+    };
+    following_lines.lines().any(|line| {
+        let candidate = if dash {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        candidate == delimiter
+    })
 }
 
 fn extract_file_path(payload: &HookPayload) -> Option<String> {
@@ -341,6 +435,81 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         assert_eq!(stdout, format!("{body}\n"));
     }
 
+    #[test]
+    fn contains_heredoc_detects_plain_heredoc() {
+        assert!(contains_heredoc("cat <<EOF\nhello\nEOF"));
+        assert!(contains_heredoc("cat <<'EOF'\nhello\nEOF"));
+        assert!(contains_heredoc("cat <<\"EOF\"\nhello\nEOF"));
+        assert!(contains_heredoc("cat <<\\EOF\nhello\nEOF"));
+        assert!(contains_heredoc("cat <<-EOF\n\thello\n\tEOF"));
+    }
+
+    #[test]
+    fn contains_heredoc_detects_nested_command_substitution_shape() {
+        // The exact shape from the resolved bash-3.2 parsing bug report:
+        // git commit -m "$(cat <<'EOF' ... EOF)"
+        let body = "Introduce App struct for introduce-app-struct\n\
+\n\
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
+        let command = format!("git commit -m \"$(cat <<'EOF'\n{body}\nEOF\n)\"");
+        assert!(contains_heredoc(&command));
+    }
+
+    #[test]
+    fn contains_heredoc_ignores_bitshift_and_herestring() {
+        // No newline at all, so there's no possible matching close line.
+        assert!(!contains_heredoc("python -c \"print(1<<2)\""));
+        // Herestring (`<<<`), not a heredoc.
+        assert!(!contains_heredoc("cat <<< \"just a string\""));
+        // `<<` with a delimiter but no line consisting solely of it.
+        assert!(!contains_heredoc("cat <<EOF\nhello\nnot the delimiter"));
+    }
+
+    #[test]
+    fn contains_heredoc_detects_unterminated_quote_around_delimiter() {
+        // Missing closing quote right after the delimiter — still a real
+        // heredoc opener as far as detection is concerned.
+        assert!(contains_heredoc("cat <<'EOF\nhi\nEOF"));
+        assert!(contains_heredoc("cat <<\"EOF\nhi\nEOF"));
+    }
+
+    #[test]
+    fn contains_heredoc_requires_exact_close_line_for_plain_heredoc() {
+        // Only `<<-` allows the close line to be tab-indented; plain `<<`
+        // requires an exact match.
+        assert!(!contains_heredoc("cat <<EOF\n\tEOF"));
+        assert!(contains_heredoc("cat <<-EOF\n\tEOF"));
+    }
+
+    #[test]
+    fn wrap_bash_in_sandbox_denies_heredoc_before_touching_sbpl() {
+        // No WTCLAUDE_SBPL set up here on purpose: the heredoc check must
+        // reject the command before wrap_bash_in_sandbox() ever looks at the
+        // sandbox policy.
+        let payload = HookPayload {
+            tool_name: "Bash".to_string(),
+            cwd: String::new(),
+            tool_input: serde_json::json!({ "command": "cat <<'EOF'\nhi\nEOF" }),
+        };
+
+        let response = wrap_bash_in_sandbox(&payload)
+            .expect("wrap_bash_in_sandbox")
+            .expect("Some(response) denying the command");
+
+        assert_eq!(
+            response.hook_specific_output.permission_decision.as_deref(),
+            Some("deny")
+        );
+        assert_eq!(
+            response
+                .hook_specific_output
+                .permission_decision_reason
+                .as_deref(),
+            Some(HEREDOC_DENY_MESSAGE)
+        );
+        assert!(response.hook_specific_output.updated_input.is_none());
+    }
+
     // Cleans up the test-only SBPL policy file and WTCLAUDE_SBPL env var on
     // drop, including on unwind from a failed assertion — otherwise a test
     // failure would leak the temp file and leave WTCLAUDE_SBPL set for the
@@ -391,10 +560,14 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
             path: policy_path.clone(),
         };
 
+        // No heredoc here (contains_heredoc() now denies those before this
+        // point is ever reached) — nested command substitution inside double
+        // quotes is kept to still exercise the same quoting shape through the
+        // real sandbox-exec wrapping.
         let body = "Introduce App struct for introduce-app-struct\n\
 \n\
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
-        let original = format!("printf '%s\\n' \"$(cat <<'EOF'\n{body}\nEOF\n)\"");
+        let original = format!("printf '%s\\n' \"$(printf '%s' '{body}')\"");
 
         let payload = HookPayload {
             tool_name: "Bash".to_string(),
