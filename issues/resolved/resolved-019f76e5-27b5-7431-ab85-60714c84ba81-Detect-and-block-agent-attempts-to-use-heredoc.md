@@ -37,3 +37,11 @@ Implement in `src/hook.rs`:
 - Q: Where should the check live in `src/hook.rs`, and should it apply outside the existing sandbox gate? — A: First check inside `wrap_bash_in_sandbox()` (`src/hook.rs:83`), before the `sbpl_path` lookup, returning `deny_bash(...)` on a match. No new gating needed — it inherits the existing gate for free, since `run()` only calls `wrap_bash_in_sandbox` for `Bash` tool calls when `WTCLAUDE_SANDBOX` is set.
 - Q: Exact wording of the deny message? — A: "heredoc is blocked because of the bug warned about in the system prompt: heredocs (even non-nested ones) are blocked outright because reliably distinguishing safe from buggy shapes isn't possible without re-implementing shell quote-parsing. Use a temp file instead, e.g. `git commit -F /tmp/msg.txt`, or write multi-line content with the Write tool."
 - Q: Should `src/launch.rs`'s `sandbox_notice` be trimmed now that the hook enforces this? — A: Leave it unchanged. The deny message references "the bug warned about in the system prompt", which only makes sense if the notice still describes the bug; it also still helps by steering the agent away before it wastes a turn on a denied call.
+
+## Resolution
+
+Implemented as decided: `contains_heredoc()` and `has_matching_close_line()` added to `src/hook.rs`, called at the top of `wrap_bash_in_sandbox()` before the `sbpl_path` lookup. Detection matches a heredoc opener (`<<`/`<<-`, optionally quoted or backslash-escaped) plus a later line consisting solely of that delimiter (tabs tolerated only for `<<-`) — deliberately without tracking shell quoting, since a stray `<<` (e.g. a bitshift) essentially never has a coincidentally matching close line.
+
+Self-review (`review-1.md`) caught a real gap during implementation: an unterminated/mismatched closing quote around the delimiter (e.g. `<<'EOF` with no closing `'`) was causing a false negative — a real heredoc opener slipping past undetected. Fixed by no longer requiring the closing quote to match, since detection was never meant to depend on the shell's own quoting being well-formed anyway. A second review pass came back clean.
+
+`sandbox_notice` in `src/launch.rs` was left unchanged per the decision above. 11 new/existing tests pass in `src/hook.rs` (1 pre-existing test ignored, requires an unsandboxed terminal).
