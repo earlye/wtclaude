@@ -58,8 +58,12 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    let allowlist = crate::config::load_user()
+        .map(|c| c.allowlist)
+        .unwrap_or_default();
+
     if let Some(path_str) = extract_file_path(&payload)
-        && !is_within_sandbox(&path_str, &payload.cwd, &sandbox)
+        && !is_within_sandbox(&path_str, &payload.cwd, &sandbox, &allowlist)
     {
         let reason = format!(
             "SANDBOX VIOLATION: '{}' is outside the allowed worktree. \
@@ -269,7 +273,7 @@ fn extract_file_path(payload: &HookPayload) -> Option<String> {
     }
 }
 
-fn is_within_sandbox(file_path: &str, cwd: &str, sandbox: &str) -> bool {
+fn is_within_sandbox(file_path: &str, cwd: &str, sandbox: &str, allowlist: &[String]) -> bool {
     let path = if Path::new(file_path).is_absolute() {
         PathBuf::from(file_path)
     } else {
@@ -279,7 +283,22 @@ fn is_within_sandbox(file_path: &str, cwd: &str, sandbox: &str) -> bool {
     let normalized = normalize_path(&path, Path::new(cwd));
     let sandbox_normalized = normalize_path(Path::new(sandbox), Path::new("/"));
 
-    normalized.starts_with(&sandbox_normalized)
+    if normalized.starts_with(&sandbox_normalized) {
+        return true;
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    allowlist.iter().any(|entry| {
+        let expanded = entry.replace('~', &home);
+        if expanded.trim().is_empty() {
+            // An empty entry would normalize to "/" (normalize_path falls
+            // back to its relative-to base, "/", when given an empty,
+            // non-absolute path), matching every absolute path.
+            return false;
+        }
+        let allowed = normalize_path(Path::new(&expanded), Path::new("/"));
+        normalized.starts_with(&allowed)
+    })
 }
 
 // Lexical path normalization that doesn't require paths to exist.
@@ -309,6 +328,97 @@ fn normalize_path(path: &Path, relative_to: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn is_within_sandbox_allows_path_within_sandbox() {
+        assert!(is_within_sandbox(
+            "/tmp/wtclaude-test-sandbox/file.txt",
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_within_sandbox_denies_path_outside_sandbox_and_allowlist() {
+        assert!(!is_within_sandbox(
+            "/etc/passwd",
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &[]
+        ));
+    }
+
+    #[test]
+    fn is_within_sandbox_allows_path_within_allowlist_entry() {
+        let allowlist = vec!["/tmp/wtclaude-test-allowed".to_string()];
+        assert!(is_within_sandbox(
+            "/tmp/wtclaude-test-allowed/nested/file.txt",
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &allowlist
+        ));
+    }
+
+    #[test]
+    fn is_within_sandbox_denies_when_no_allowlist_entry_matches() {
+        let allowlist = vec![
+            "/tmp/wtclaude-test-allowed-one".to_string(),
+            "/tmp/wtclaude-test-allowed-two".to_string(),
+        ];
+        assert!(!is_within_sandbox(
+            "/etc/passwd",
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &allowlist
+        ));
+    }
+
+    #[test]
+    fn is_within_sandbox_treats_allowlist_entry_as_a_path_component_not_a_string_prefix() {
+        // A lexical string prefix match would wrongly let "/tmp/allow" permit
+        // "/tmp/allowed-other"; PathBuf::starts_with is component-wise, so it
+        // must not.
+        let allowlist = vec!["/tmp/wtclaude-test-allow".to_string()];
+        assert!(!is_within_sandbox(
+            "/tmp/wtclaude-test-allow-other/file.txt",
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &allowlist
+        ));
+    }
+
+    #[test]
+    fn is_within_sandbox_ignores_empty_allowlist_entries() {
+        // A blank line or trailing comma in wtclaude.yml's allowlist yields an
+        // empty string. normalize_path() on an empty, non-absolute path falls
+        // back to its relative-to base ("/"), which would match every
+        // absolute path if not filtered out explicitly.
+        let allowlist = vec!["".to_string()];
+        assert!(!is_within_sandbox(
+            "/etc/passwd",
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &allowlist
+        ));
+    }
+
+    #[test]
+    fn is_within_sandbox_expands_tilde_in_allowlist_entries() {
+        // Both sides of the comparison use a path that doesn't exist on disk,
+        // so normalize_path()'s canonicalize() fails for both and falls back
+        // to identical lexical joining — the check doesn't depend on the
+        // real $HOME's filesystem contents.
+        let home = std::env::var("HOME").expect("HOME must be set");
+        let allowlist = vec!["~/wtclaude-nonexistent-allowlist-test".to_string()];
+        let path = format!("{home}/wtclaude-nonexistent-allowlist-test/nested/file.md");
+        assert!(is_within_sandbox(
+            &path,
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &allowlist
+        ));
+    }
 
     // Runs `command` the way the sandbox wrapper's output is ultimately run: as
     // the text of an outer `sh -c`. This reproduces the double shell-parse from
