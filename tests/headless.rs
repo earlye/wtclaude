@@ -91,12 +91,17 @@ fn make_executable_script(path: &std::path::Path, contents: &str) {
 
 fn git_init_dir(label: &str) -> PathBuf {
     let dir = unique_temp_dir(label);
-    let status = Command::new("git")
+    let out = Command::new("git")
         .args(["init", "-q"])
         .current_dir(&dir)
-        .status()
+        .output()
         .expect("failed to spawn git init");
-    assert!(status.success(), "git init failed for {}", dir.display());
+    assert!(
+        out.status.success(),
+        "git init failed for {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     dir
 }
 
@@ -147,10 +152,7 @@ fn headless_subcommand_places_resume_and_print_flags_and_forwards_prompt() {
     let log_path = stub_dir.join("argv.log");
     make_executable_script(
         &stub_dir.join("claude"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 0\n",
-            log_path.display()
-        ),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGV_LOG_PATH\"\nexit 0\n",
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
@@ -158,10 +160,13 @@ fn headless_subcommand_places_resume_and_print_flags_and_forwards_prompt() {
         .current_dir(&repo)
         .env("HOME", &home)
         .env("PATH", stub_path_env(&stub_dir))
+        .env("ARGV_LOG_PATH", &log_path)
         .output()
         .expect("failed to spawn wtclaude");
 
-    let logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let logged = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        panic!("reading argv log at {}: {e}", log_path.display());
+    });
 
     std::fs::remove_dir_all(&repo).ok();
     std::fs::remove_dir_all(&home).ok();
