@@ -31,6 +31,23 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("headless") => {
+            let rest = args[1..].to_vec();
+            match launch::parse_headless_args(rest) {
+                Ok(parsed) => match launch::run_headless(parsed) {
+                    Ok(code) => std::process::exit(code),
+                    Err(e) => {
+                        eprintln!("error: {:#}", e);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("error: {:#}", e);
+                    print_usage();
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("session-worktree") => {
             let session_id = args.get(1).map(|s| s.as_str()).unwrap_or("");
             if session_id.is_empty() {
@@ -139,6 +156,12 @@ compdef _wtclaude wtclaude
 fn print_usage() {
     eprintln!(
         "usage: wtclaude [--mode MODE] [--resume SESSION_ID] [--test-sbpl-breakage hide|missing] WORKTREE_NAME [INITIAL_PROMPT]"
+    );
+    eprintln!(
+        "       wtclaude headless [--mode MODE] [--resume SESSION_ID] [--show-policy] [PROMPT]"
+    );
+    eprintln!(
+        "                     (sandboxed, non-interactive run against cwd; no worktree/branch created; reads PROMPT from stdin if omitted)"
     );
     eprintln!("       wtclaude --completions zsh   (print zsh completion script)");
     eprintln!("       wtclaude hook                (invoked internally as a PreToolUse hook)");
