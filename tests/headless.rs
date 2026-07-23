@@ -4,9 +4,9 @@ use std::process::Command;
 // These run the actual compiled `wtclaude` binary as a subprocess in a fresh
 // temp directory, rather than calling `run_headless` in-process, so the test
 // doesn't have to mutate this process's own working directory (which would
-// race against other tests running in parallel). Both bail before ever
-// touching `$HOME` or spawning `claude`, so neither needs a fake HOME or a
-// `claude` binary on PATH.
+// race against other tests running in parallel). The tests in this first
+// group all bail before ever touching `$HOME` or spawning `claude`, so none
+// of them need a fake HOME or a `claude` binary on PATH.
 
 fn unique_temp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -51,4 +51,140 @@ fn headless_subcommand_bails_on_unknown_mode() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn headless_subcommand_prints_usage_on_parse_error() {
+    let dir = unique_temp_dir("parse-error");
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["headless", "--mode"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to spawn wtclaude");
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--mode requires a value"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("usage: wtclaude"), "stderr: {stderr}");
+}
+
+// The following tests exercise the actual `claude` subprocess invocation
+// (command construction and exit-code/signal passthrough). They stand up a
+// minimal stub script named `claude` on PATH instead of the real binary —
+// not to fake AI behavior, just to observe/control the child process's argv
+// and exit condition. Each also points HOME at a fresh, `.claude.json`-less
+// scratch directory so `update_trust` is a no-op and never touches the
+// developer's real trust config.
+
+fn make_executable_script(path: &std::path::Path, contents: &str) {
+    std::fs::write(path, contents).expect("write stub script");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)
+        .expect("stat stub script")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).expect("chmod stub script");
+}
+
+fn git_init_dir(label: &str) -> PathBuf {
+    let dir = unique_temp_dir(label);
+    let status = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .status()
+        .expect("failed to spawn git init");
+    assert!(status.success(), "git init failed for {}", dir.display());
+    dir
+}
+
+fn stub_path_env(stub_dir: &std::path::Path) -> String {
+    format!(
+        "{}:{}",
+        stub_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+#[test]
+fn headless_subcommand_translates_signal_kill_to_exit_128_plus_signal() {
+    let repo = git_init_dir("signal-repo");
+    let home = unique_temp_dir("signal-home");
+    let stub_dir = unique_temp_dir("signal-stub");
+    make_executable_script(
+        &stub_dir.join("claude"),
+        "#!/bin/sh\nexec sh -c 'kill -9 $$'\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["headless", "hello"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("PATH", stub_path_env(&stub_dir))
+        .output()
+        .expect("failed to spawn wtclaude");
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&stub_dir).ok();
+
+    assert_eq!(
+        output.status.code(),
+        Some(137),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("signal 9"));
+}
+
+#[test]
+fn headless_subcommand_places_resume_and_print_flags_and_forwards_prompt() {
+    let repo = git_init_dir("argv-repo");
+    let home = unique_temp_dir("argv-home");
+    let stub_dir = unique_temp_dir("argv-stub");
+    let log_path = stub_dir.join("argv.log");
+    make_executable_script(
+        &stub_dir.join("claude"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 0\n",
+            log_path.display()
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["headless", "--resume", "sess-123", "hello there"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("PATH", stub_path_env(&stub_dir))
+        .output()
+        .expect("failed to spawn wtclaude");
+
+    let logged = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&stub_dir).ok();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let logged_args: Vec<&str> = logged.lines().collect();
+    let print_pos = logged_args
+        .iter()
+        .position(|a| *a == "--print")
+        .expect("--print should be present in claude's argv");
+    let resume_pos = logged_args
+        .iter()
+        .position(|a| *a == "--resume")
+        .expect("--resume should be present in claude's argv");
+    assert_eq!(logged_args.get(resume_pos + 1), Some(&"sess-123"));
+    assert!(
+        resume_pos < print_pos,
+        "expected --resume before --print, got {logged_args:?}"
+    );
+    assert_eq!(logged_args.last(), Some(&"hello there"));
 }

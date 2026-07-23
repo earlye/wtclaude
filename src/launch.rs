@@ -338,9 +338,16 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
         Some(code) => Ok(code),
         None => {
             use std::os::unix::process::ExitStatusExt;
-            let signal = status.signal().unwrap_or(0);
-            eprintln!("wtclaude: claude was terminated by signal {signal}");
-            Ok(128 + signal)
+            match status.signal() {
+                Some(signal) => {
+                    eprintln!("wtclaude: claude was terminated by signal {signal}");
+                    Ok(128 + signal)
+                }
+                None => {
+                    eprintln!("wtclaude: claude exited with an unrecognized status ({status:?})");
+                    Ok(1)
+                }
+            }
         }
     }
 }
