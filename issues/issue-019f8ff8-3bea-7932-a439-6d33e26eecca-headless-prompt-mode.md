@@ -7,37 +7,76 @@ wtclaude a prompt, it drives Claude to execute that prompt to completion
 (or failure), and then reports the result back to the caller
 non-interactively.
 
-Unlike wtclaude's current normal invocation, this mode does not
-necessarily need to create a git branch or worktree — but it does still
-need to sandbox the run. Today, sandboxing setup
-(`generate_sbpl_policy` / `write_sbpl_policy` / `write_hook_settings`)
-is wired up alongside worktree creation inside `launch::run`, so the
-sandbox and the worktree/branch machinery are currently coupled and
-will likely need to be pulled apart for this to work.
+Unlike wtclaude's current normal invocation, this mode does not create a
+git branch or worktree at all — but it does still sandbox the run.
+Design resolved via grill (see Grill Log for full reasoning):
+
+- **New subcommand**: `wtclaude headless <PROMPT...>`, alongside `hook`,
+  `sessions`, `worktrees`, etc. in `main.rs` — not a flag on the existing
+  worktree-launching invocation.
+- **No worktree, ever.** Sandbox target is the invoking **cwd**, not
+  `repo_root()` — this matters for monorepos where multiple headless
+  agents may run concurrently in different subdirectories and must not
+  be able to write into each other's areas. `repo_root()` (via `git
+  rev-parse --show-toplevel`) is still resolved separately, for `.git`
+  access and `update_trust` — just not as the sandbox boundary.
+- **Prompt input**: trailing positional args (joined by space, same
+  convention as today's `Args.prompt`), falling back to stdin when no
+  positional prompt is given (mirrors `claude -p`). `--resume
+  SESSION_ID` carries over unchanged.
+- **Output**: pure passthrough. Headless mode always appends `--print`
+  to the `claude` invocation, runs it via the same `Command::status()`
+  (inherited stdio) as today, and returns `claude`'s own exit code
+  as-is. wtclaude does not parse or wrap the result — a caller wanting
+  `--output-format json` etc. just passes it through.
+- **Interactive bits removed/bypassed**: `offer_git_init`'s stdin
+  prompt is replaced with a hard failure if `repo_root()` fails
+  (expected precondition: repo already exists, e.g. just cloned by
+  whatever launched wtclaude headless) — no prompting, since stdin may
+  carry the prompt itself. `--show-policy` keeps printing the policy but
+  drops the "press enter" pause. `post_exit_menu` is simply never called
+  (no worktree lifecycle to manage). `TmuxWindowName::rename` is not
+  called — tmux window naming is the caller's concern in this mode.
+- **Permission mode**: no special-casing. Headless mode accepts
+  `--mode` and falls back to the config's `default-mode` exactly like
+  the interactive path (currently `safe`). The sandbox is what bounds
+  the risk regardless of mode; a user who wants headless runs to
+  default to permissive can set their own `default-mode: dangerous` in
+  their user config — that's a per-user choice, not something wtclaude
+  should silently do for everyone.
 
 ## Relevant files
 
-- `src/main.rs:61` — CLI falls through to `launch::parse_args` /
-  `launch::run` for the default (non-subcommand) invocation; a
-  headless/`-p` mode would need a new entry point or flag here.
-- `src/launch.rs:20` (`struct Args`) and `src/launch.rs:30`
-  (`parse_args`) — current argument parsing; `WORKTREE_NAME` is a
-  required positional today.
-- `src/launch.rs:97` (`run`) — orchestrates worktree creation
-  (`ensure_worktree`, `src/launch.rs:323`) and sandbox policy
-  generation/hook wiring (`generate_sbpl_policy`, `src/launch.rs:640`;
-  `write_sbpl_policy`, `src/launch.rs:729`; `write_hook_settings`,
-  `src/launch.rs:736`) as one flow — these will need to be
-  decoupled so sandboxing can apply without a worktree/branch.
+- `src/main.rs:61` — flat subcommand dispatch (`hook`, `sessions`,
+  `worktrees`, `modes`, `session-worktree`); a `headless` subcommand
+  arm belongs here, separate from the `launch::parse_args`/`launch::run`
+  fallthrough.
+- `src/launch.rs:20` (`struct Args`) / `src/launch.rs:30`
+  (`parse_args`) — existing worktree-flow arg parsing; headless mode
+  needs its own `Args`-equivalent (prompt, resume, mode, show-policy)
+  without a required `WORKTREE_NAME` positional.
+- `src/launch.rs:97` (`run`) — for reference only; headless mode's
+  entry point reuses `generate_sbpl_policy` (`src/launch.rs:640`),
+  `write_sbpl_policy` (`src/launch.rs:729`), `write_hook_settings`
+  (`src/launch.rs:736`), `repo_root()` (`src/launch.rs:279`), and
+  `update_trust` (`src/launch.rs:612`) directly, without going through
+  `ensure_worktree`, `offer_git_init`, `post_exit_menu`, or
+  `TmuxWindowName`.
+- `src/config.rs` / `default_config.yml` — existing `--mode` /
+  `default-mode` mechanism, reused unchanged for permission handling.
 
 ## Next steps
 
-- Design how sandbox setup can run independent of worktree creation
-  (e.g. sandbox against the current working directory / repo root
-  directly).
-- Decide how the headless invocation is triggered (new subcommand vs.
-  a `-p`/`--print`-style flag) and how the prompt and final
-  result/exit status are passed in and reported back to the caller.
+- Implement the `headless` subcommand: new arg parsing (prompt via
+  positional-or-stdin, `--resume`, `--mode`, `--show-policy`), sandbox
+  setup against cwd (not `repo_root()`), hard failure on non-git-repo
+  (no `offer_git_init` prompt), `--print` always appended to the
+  underlying `claude` invocation, exit code passed through unchanged.
+- Note (not blocking, flagged during design): concurrent headless
+  agents in the same repo still share one `.git` — sandbox isolation is
+  per-cwd for file writes, but git-level races (e.g. simultaneous
+  commits) between concurrent agents are not addressed by this design
+  and are out of scope for this issue.
 
 ## Grill Log
 
