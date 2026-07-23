@@ -779,6 +779,29 @@ fn resolve(p: PathBuf) -> PathBuf {
     config::resolve_existing_prefix(&p)
 }
 
+/// Resolves the git metadata directory that actually needs to be writable
+/// for sandbox-policy purposes. For a normal checkout, `<repo_root>/.git`
+/// already is that directory. For a linked worktree (`git worktree add`),
+/// `<repo_root>/.git` is instead a pointer file containing `gitdir: <path>`,
+/// and the real metadata — `FETCH_HEAD`, the per-worktree index, `HEAD`,
+/// `MERGE_HEAD`, etc. — lives at that path, under the main repo's
+/// `.git/worktrees/<name>/`.
+fn git_metadata_dir(repo_root: &Path) -> PathBuf {
+    let dot_git = repo_root.join(".git");
+    if dot_git.is_file()
+        && let Ok(contents) = std::fs::read_to_string(&dot_git)
+        && let Some(gitdir) = contents.trim().strip_prefix("gitdir:")
+    {
+        let gitdir = PathBuf::from(gitdir.trim());
+        return if gitdir.is_absolute() {
+            gitdir
+        } else {
+            repo_root.join(gitdir)
+        };
+    }
+    dot_git
+}
+
 /// Translate a shell-style glob (`*` only, usable anywhere in the pattern)
 /// into a whole-string-anchored SBPL regex. `subpath` matches by path
 /// component, not by glob/wildcard, so it can't express `.tmpXXXX`-style
@@ -858,6 +881,7 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
     let raw: Vec<PathBuf> = [
         sandbox.to_path_buf(),
         repo_root.join(".git"),
+        git_metadata_dir(repo_root),
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
         PathBuf::from("/var/folders"),
@@ -1036,6 +1060,43 @@ mod tests {
             literal,
             vec!["/Users/x/.cargo".to_string(), "/tmp/plain".to_string()]
         );
+    }
+
+    #[test]
+    fn git_metadata_dir_returns_dot_git_when_it_is_a_real_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "wtclaude-test-normal-repo-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+
+        assert_eq!(git_metadata_dir(&root), root.join(".git"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn git_metadata_dir_follows_gitdir_pointer_for_a_linked_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "wtclaude-test-linked-worktree-{}",
+            std::process::id()
+        ));
+        let main_repo_worktree_dir = std::env::temp_dir().join(format!(
+            "wtclaude-test-main-repo-worktrees-name-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&main_repo_worktree_dir).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", main_repo_worktree_dir.display()),
+        )
+        .unwrap();
+
+        assert_eq!(git_metadata_dir(&root), main_repo_worktree_dir);
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&main_repo_worktree_dir).unwrap();
     }
 }
 
