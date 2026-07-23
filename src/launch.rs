@@ -225,10 +225,10 @@ fn sandbox_warning_common() -> &'static str {
 }
 
 pub struct HeadlessArgs {
-    pub mode: Option<String>,
-    pub prompt: Option<String>,
-    pub resume: Option<String>,
-    pub show_policy: bool,
+    mode: Option<String>,
+    prompt: Option<String>,
+    resume: Option<String>,
+    show_policy: bool,
 }
 
 pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
@@ -284,9 +284,15 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
         .with_context(|| format!("unknown mode: {}", mode))?;
 
     let repo_root = repo_root()
-        .context("not a git repository; headless mode requires an existing git repository")?;
+        .context("resolving repo root (headless mode requires an existing git repository)")?;
     let cwd = std::env::current_dir().context("getting current directory")?;
-    let canonical = cwd.canonicalize().unwrap_or(cwd);
+    let canonical = cwd.canonicalize().unwrap_or_else(|e| {
+        eprintln!(
+            "wtclaude: warning: could not canonicalize sandbox root {}: {e}",
+            cwd.display()
+        );
+        cwd.clone()
+    });
 
     update_trust(&repo_root)?;
 
@@ -295,8 +301,10 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     let _sbpl_policy = write_sbpl_policy(&canonical, &repo_root, "headless")?;
 
     if args.show_policy {
+        // Printed to stderr, not stdout, so it never mixes into `claude
+        // --print`'s own stdout output (headless mode's passthrough result).
         let policy = std::fs::read_to_string(&_sbpl_policy.0).context("reading sbpl policy")?;
-        println!("{}", policy);
+        eprintln!("{}", policy);
     }
 
     let sandbox_notice = format!(
@@ -326,7 +334,15 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     }
 
     let status = cmd.status().context("launching claude")?;
-    Ok(status.code().unwrap_or(1))
+    match status.code() {
+        Some(code) => Ok(code),
+        None => {
+            use std::os::unix::process::ExitStatusExt;
+            let signal = status.signal().unwrap_or(0);
+            eprintln!("wtclaude: claude was terminated by signal {signal}");
+            Ok(128 + signal)
+        }
+    }
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -875,4 +891,53 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
     std::fs::write(&path, serde_json::to_string_pretty(&settings)?)
         .context("writing settings file")?;
     Ok(TempFile(path))
+}
+
+#[cfg(test)]
+mod headless_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<HeadlessArgs> {
+        parse_headless_args(args.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn parse_headless_args_joins_interleaved_flags_and_prompt() {
+        let parsed = parse(&["--mode", "fast", "do", "the", "thing", "--resume", "abc"]).unwrap();
+        assert_eq!(parsed.mode.as_deref(), Some("fast"));
+        assert_eq!(parsed.prompt.as_deref(), Some("do the thing"));
+        assert_eq!(parsed.resume.as_deref(), Some("abc"));
+        assert!(!parsed.show_policy);
+    }
+
+    #[test]
+    fn parse_headless_args_show_policy_does_not_consume_a_value() {
+        let parsed = parse(&["--show-policy", "explain this"]).unwrap();
+        assert!(parsed.show_policy);
+        assert_eq!(parsed.prompt.as_deref(), Some("explain this"));
+    }
+
+    #[test]
+    fn parse_headless_args_errors_on_missing_mode_value() {
+        assert!(parse(&["--mode"]).is_err());
+    }
+
+    #[test]
+    fn parse_headless_args_errors_on_missing_resume_value() {
+        assert!(parse(&["--resume"]).is_err());
+    }
+
+    #[test]
+    fn parse_headless_args_errors_on_unknown_flag() {
+        assert!(parse(&["--nonsense"]).is_err());
+    }
+
+    #[test]
+    fn parse_headless_args_defaults_are_empty() {
+        let parsed = parse(&[]).unwrap();
+        assert!(parsed.mode.is_none());
+        assert!(parsed.prompt.is_none());
+        assert!(parsed.resume.is_none());
+        assert!(!parsed.show_policy);
+    }
 }
