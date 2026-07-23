@@ -637,6 +637,26 @@ fn resolve(p: PathBuf) -> PathBuf {
     p.canonicalize().unwrap_or(p)
 }
 
+/// Translate a shell-style glob (only `*`, matched anywhere) into an anchored
+/// SBPL regex. `subpath` does literal prefix matching on real filesystem
+/// paths, so it can't express "this file plus its `-tmpXXXX` siblings" —
+/// entries like `~/.claude.json*` need `regex` instead.
+fn glob_to_regex(pattern: &str) -> String {
+    let mut out = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '*' => out.push_str(".*"),
+            '.' | '^' | '$' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.push('$');
+    out
+}
+
 pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<String> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
@@ -667,6 +687,16 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
 
     let user_config = config::load_user()?;
 
+    // Entries containing `*` are globs (e.g. `~/.claude.json*` covering the
+    // file plus its atomic-write tmp siblings) — `canonicalize`/`subpath`
+    // can't express those, since no real path literally contains a `*`.
+    // Route them to a separate `regex` rule instead of the subpath pipeline.
+    let (glob_allow, literal_allow): (Vec<String>, Vec<String>) = user_config
+        .allowlist
+        .iter()
+        .map(|p| p.replace("~", &home))
+        .partition(|p| p.contains('*'));
+
     let raw: Vec<PathBuf> = [
         sandbox.to_path_buf(),
         repo_root.join(".git"),
@@ -678,10 +708,7 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
     ]
     .into_iter()
     .chain(pkg_cache_dirs.iter().map(|d| PathBuf::from(&home).join(d)))
-    .chain(user_config.allowlist.iter().map(|p| {
-        let p = p.replace("~", &home);
-        PathBuf::from(p)
-    }))
+    .chain(literal_allow.into_iter().map(PathBuf::from))
     .collect();
 
     let mut seen = std::collections::HashSet::new();
@@ -713,6 +740,13 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
         lines.push(format!(
             "(allow file-write* (subpath \"{}\"))",
             p.to_string_lossy()
+        ));
+    }
+
+    for pattern in &glob_allow {
+        lines.push(format!(
+            "(allow file-write* (regex #\"{}\"))",
+            glob_to_regex(pattern)
         ));
     }
 
@@ -766,4 +800,25 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
     std::fs::write(&path, serde_json::to_string_pretty(&settings)?)
         .context("writing settings file")?;
     Ok(TempFile(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_to_regex_translates_trailing_star_to_anchored_dotstar() {
+        // Regression test: `~/.claude.json*` in wtclaude.yml must produce a
+        // regex that matches the base file, not just literal-`*` paths that
+        // never exist (the bug that made the entry a silent no-op).
+        assert_eq!(
+            glob_to_regex("/Users/earlye/.claude.json*"),
+            r"^/Users/earlye/\.claude\.json.*$"
+        );
+    }
+
+    #[test]
+    fn glob_to_regex_escapes_regex_metacharacters() {
+        assert_eq!(glob_to_regex("/a/b.c*"), r"^/a/b\.c.*$");
+    }
 }

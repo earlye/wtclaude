@@ -296,9 +296,44 @@ fn is_within_sandbox(file_path: &str, cwd: &str, sandbox: &str, allowlist: &[Str
             // non-absolute path), matching every absolute path.
             return false;
         }
+        if expanded.contains('*') {
+            // Glob entries (e.g. `~/.claude.json*`, covering the file plus
+            // its atomic-write tmp siblings) can't be canonicalized — no
+            // real path literally contains a `*` — and component-wise
+            // starts_with can't express a wildcard either. Match the
+            // pattern directly against the normalized path string instead.
+            return glob_match(&expanded, &normalized.to_string_lossy());
+        }
         let allowed = normalize_path(Path::new(&expanded), Path::new("/"));
         normalized.starts_with(&allowed)
     })
+}
+
+// Simple shell-style glob match supporting only the `*` wildcard (matches
+// any run of characters, including none). Used for allowlist entries like
+// `~/.claude.json*` that can't be expressed as a literal path component.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut pos = 0;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !text[pos..].starts_with(part) {
+                return false;
+            }
+            pos += part.len();
+        } else if i == parts.len() - 1 {
+            return text[pos..].ends_with(part);
+        } else {
+            match text[pos..].find(part) {
+                Some(idx) => pos += idx + part.len(),
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 // Lexical path normalization that doesn't require paths to exist.
@@ -418,6 +453,50 @@ mod tests {
             "/tmp/wtclaude-test-sandbox",
             &allowlist
         ));
+    }
+
+    #[test]
+    fn is_within_sandbox_allows_glob_allowlist_entry_for_the_base_file() {
+        // Regression test: `~/.claude.json*` style entries must permit
+        // writes to `~/.claude.json` itself, not just its tmp siblings.
+        let allowlist = vec!["/tmp/wtclaude-test-glob.json*".to_string()];
+        assert!(is_within_sandbox(
+            "/tmp/wtclaude-test-glob.json",
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &allowlist
+        ));
+    }
+
+    #[test]
+    fn is_within_sandbox_allows_glob_allowlist_entry_for_tmp_siblings() {
+        // Atomic config writers create a `<file>.tmpXXXX` sibling before
+        // renaming it over the real file — the glob must cover that too.
+        let allowlist = vec!["/tmp/wtclaude-test-glob.json*".to_string()];
+        assert!(is_within_sandbox(
+            "/tmp/wtclaude-test-glob.json.tmp1234",
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &allowlist
+        ));
+    }
+
+    #[test]
+    fn is_within_sandbox_glob_allowlist_entry_does_not_match_unrelated_path() {
+        let allowlist = vec!["/tmp/wtclaude-test-glob.json*".to_string()];
+        assert!(!is_within_sandbox(
+            "/tmp/wtclaude-test-glob-other.txt",
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &allowlist
+        ));
+    }
+
+    #[test]
+    fn glob_match_matches_prefix_and_siblings() {
+        assert!(glob_match("/a/.claude.json*", "/a/.claude.json"));
+        assert!(glob_match("/a/.claude.json*", "/a/.claude.json.tmp1234"));
+        assert!(!glob_match("/a/.claude.json*", "/a/.claude-other"));
     }
 
     // Runs `command` the way the sandbox wrapper's output is ultimately run: as
