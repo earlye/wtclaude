@@ -50,3 +50,15 @@ will likely need to be pulled apart for this to work.
   matches the existing flat-dispatch pattern in `main.rs` (`hook`,
   `sessions`, `worktrees`, etc. are already single-word subcommands with
   their own entry points).
+- Q: Sandbox scope when there's no worktree — the whole `repo_root()`
+  (generalizing `in_place`), or just the invoking cwd? — A: The starting
+  (invoking) directory, not `repo_root`. Reason: in a monorepo, multiple
+  headless agents may run concurrently in different subdirectories: if
+  they all sandbox against the shared `repo_root`, they can each write
+  anywhere in the repo and stomp on each other's areas. Note:
+  `generate_sbpl_policy` (`src/launch.rs:640`) already allow-lists
+  `repo_root.join(".git")` as a path independent of `sandbox`, so scoping
+  the writable sandbox to cwd still leaves git commands (commit, etc.)
+  working — `repo_root` is still resolved via `git rev-parse
+  --show-toplevel` for that purpose and for `update_trust`, it's just no
+  longer the sandbox boundary itself.
