@@ -60,7 +60,17 @@ pub fn run() -> Result<()> {
 
     let allowlist = crate::config::load_user()
         .map(|c| c.allowlist)
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            // load_user() can now fail on a bad allowlist entry (e.g. an
+            // unanchored wildcard), not just I/O/parse errors — surface it
+            // instead of silently degrading to an empty allowlist, which
+            // would otherwise deny every allowlisted write with no clue why.
+            eprintln!(
+                "wtclaude: warning: failed to load allowlist ({e}); \
+                 proceeding with an empty allowlist"
+            );
+            Vec::new()
+        });
 
     if let Some(path_str) = extract_file_path(&payload)
         && !is_within_sandbox(&path_str, &payload.cwd, &sandbox, &allowlist)
@@ -110,6 +120,17 @@ fn wrap_bash_in_sandbox(payload: &HookPayload) -> Result<Option<HookResponse>> {
             "WTCLAUDE_SBPL is not set; sandbox policy unavailable. Bash is blocked.",
         )));
     }
+    // Known limitation: this SBPL file is compiled once at `wtclaude` launch
+    // and only regenerated here if it's missing — not on every Bash call.
+    // Its glob rules bake in `config::resolve_glob_prefix`'s output for
+    // whatever the filesystem looked like at that moment, while
+    // `is_within_sandbox` (governing Write/Edit/NotebookEdit) recomputes the
+    // same resolution fresh on every call. A glob's static prefix changing
+    // existence/symlink-ness mid-session (e.g. its target file being created
+    // for the first time) can make the two enforcement paths disagree on
+    // the same allowlist entry for the rest of the session. Regenerating on
+    // every Bash call would close this but adds per-call overhead; treated
+    // as an accepted tradeoff for now rather than silently unnoticed.
     if !std::path::Path::new(&sbpl_path).exists() {
         if let Err(e) = regenerate_sbpl_policy(&sbpl_path) {
             return Ok(Some(deny_bash(&format!(
@@ -298,11 +319,19 @@ fn is_within_sandbox(file_path: &str, cwd: &str, sandbox: &str, allowlist: &[Str
         }
         if expanded.contains('*') {
             // Glob entries (e.g. `~/.claude.json*`, covering the file plus
-            // its atomic-write tmp siblings) can't be canonicalized — no
-            // real path literally contains a `*` — and component-wise
+            // its atomic-write tmp siblings) can't be canonicalized whole —
+            // no real path literally contains a `*` — and component-wise
             // starts_with can't express a wildcard either. Match the
-            // pattern directly against the normalized path string instead.
-            return glob_match(&expanded, &normalized.to_string_lossy());
+            // pattern's resolved static prefix against the normalized path
+            // string instead. Resolving the prefix matters because
+            // `normalized` above gets symlink-resolved by `canonicalize()`
+            // whenever the target file already exists (e.g. anything under
+            // /tmp, which is a symlink to /private/tmp on macOS) — without
+            // this, the pattern and the path it's meant to match diverge and
+            // silently never match, the same failure mode this glob support
+            // exists to fix.
+            let resolved_pattern = crate::config::resolve_glob_prefix(&expanded);
+            return glob_match(&resolved_pattern, &normalized.to_string_lossy());
         }
         let allowed = normalize_path(Path::new(&expanded), Path::new("/"));
         normalized.starts_with(&allowed)
@@ -338,6 +367,14 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
 // Lexical path normalization that doesn't require paths to exist.
 // relative_to is used as the base when path is relative and canonicalize fails.
+//
+// Once the path is lexically joined/collapsed, its longest existing ancestor
+// (if any) is canonicalized too — e.g. a not-yet-created file under /tmp
+// still resolves through the /tmp -> /private/tmp symlink on macOS. This
+// keeps target-path resolution consistent with `config::resolve_glob_prefix`,
+// which does the same for glob allowlist patterns; comparing an unresolved
+// pattern against a resolved path (or vice versa) would silently never
+// match.
 fn normalize_path(path: &Path, relative_to: &Path) -> PathBuf {
     if let Ok(canonical) = path.canonicalize() {
         return canonical;
@@ -356,7 +393,7 @@ fn normalize_path(path: &Path, relative_to: &Path) -> PathBuf {
             c => result.push(c),
         }
     }
-    result
+    crate::config::resolve_existing_prefix(&result)
 }
 
 #[cfg(test)]
@@ -493,10 +530,67 @@ mod tests {
     }
 
     #[test]
+    fn is_within_sandbox_allows_glob_allowlist_entry_when_target_file_already_exists() {
+        // Regression test: the earlier three glob tests all use paths that
+        // don't exist on disk, so normalize_path()'s canonicalize() fails
+        // for the target too and both sides fall back to identical lexical
+        // joining — masking the symlink-resolution asymmetry that occurs
+        // once a target file is real. /tmp is a symlink to /private/tmp on
+        // macOS, so creating a real file here and matching it against an
+        // un-canonicalized glob pattern exercises exactly that asymmetry.
+        let path = format!("/tmp/wtclaude-test-glob-exists-{}.json", std::process::id());
+        std::fs::write(&path, "{}").expect("write test fixture");
+        let allowlist = vec![format!("{path}*")];
+        let result = is_within_sandbox(
+            &path,
+            "/tmp/wtclaude-test-sandbox",
+            "/tmp/wtclaude-test-sandbox",
+            &allowlist,
+        );
+        let _ = std::fs::remove_file(&path);
+        assert!(result);
+    }
+
+    #[test]
     fn glob_match_matches_prefix_and_siblings() {
         assert!(glob_match("/a/.claude.json*", "/a/.claude.json"));
         assert!(glob_match("/a/.claude.json*", "/a/.claude.json.tmp1234"));
         assert!(!glob_match("/a/.claude.json*", "/a/.claude-other"));
+    }
+
+    #[test]
+    fn glob_match_matches_wildcard_in_the_middle() {
+        assert!(glob_match("/a/foo*bar", "/a/fooXXbar"));
+        assert!(!glob_match("/a/foo*bar", "/a/fooXXbaz"));
+    }
+
+    #[test]
+    fn glob_match_matches_leading_wildcard() {
+        assert!(glob_match("*.log", "/a/b/app.log"));
+        assert!(!glob_match("*.log", "/a/b/app.txt"));
+    }
+
+    #[test]
+    fn glob_match_matches_multiple_wildcards() {
+        assert!(glob_match("/a/*/b*c", "/a/x/bYYc"));
+        assert!(!glob_match("/a/*/b*c", "/a/x/bYYd"));
+    }
+
+    #[test]
+    fn normalize_path_resolves_symlinked_ancestor_for_a_nonexistent_target() {
+        // Regression test for making target-path resolution consistent with
+        // glob-pattern prefix resolution (config::resolve_glob_prefix),
+        // independent of the glob machinery: a not-yet-existing path under
+        // /tmp (a symlink to /private/tmp on macOS) must resolve through
+        // that symlink even though the exact target doesn't exist.
+        let resolved = normalize_path(
+            Path::new("/tmp/wtclaude-test-normalize-path-nonexistent-target"),
+            Path::new("/"),
+        );
+        assert_eq!(
+            resolved,
+            Path::new("/private/tmp/wtclaude-test-normalize-path-nonexistent-target")
+        );
     }
 
     // Runs `command` the way the sandbox wrapper's output is ultimately run: as
