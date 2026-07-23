@@ -89,3 +89,13 @@ will likely need to be pulled apart for this to work.
   `post_exit_menu` — falls out naturally, never called for headless
   (agreed). `TmuxWindowName::rename` — do not call it; tmux window naming
   is the caller's concern in this mode, not wtclaude's.
+- Q: With nobody present to approve tool-use prompts, how does headless
+  mode avoid hanging/refusing under `--mode safe`? Should it default to a
+  permissive mode (e.g. `dangerous`) instead? — A: No special-casing —
+  headless mode uses the existing `--mode`/config mechanism completely
+  unchanged, same default (`default-mode` from config, currently `safe`)
+  as the interactive path. The sandbox bounds the risk regardless of
+  mode. Anyone wanting headless runs to default to permissive can already
+  set their own `default-mode: dangerous` in their user config — that's a
+  per-user choice, not something wtclaude should silently do for
+  everyone.
