@@ -765,8 +765,58 @@ fn update_trust(repo_root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a literal allowlist/sandbox path for the SBPL `subpath` rule it
+/// becomes. Delegates to `config::resolve_existing_prefix`, which is a
+/// strict superset of a plain `canonicalize().unwrap_or(p)`: identical
+/// result when `p` exists in full, but also walks up to the longest
+/// existing ancestor and canonicalizes *that* when it doesn't — e.g. a
+/// literal entry for a not-yet-created directory under `/tmp` (symlinked to
+/// `/private/tmp` on macOS) still resolves through the symlink instead of
+/// silently compiling into a `subpath` rule that can never match the
+/// kernel-resolved path. Keeps literal-entry resolution consistent with
+/// `resolve_glob_prefix` and `hook.rs`'s `normalize_path`.
 fn resolve(p: PathBuf) -> PathBuf {
-    p.canonicalize().unwrap_or(p)
+    config::resolve_existing_prefix(&p)
+}
+
+/// Translate a shell-style glob (`*` only, usable anywhere in the pattern)
+/// into a whole-string-anchored SBPL regex. `subpath` matches by path
+/// component, not by glob/wildcard, so it can't express `.tmpXXXX`-style
+/// siblings of a file — entries like `~/.claude.json*` need `regex` instead.
+fn glob_to_regex(pattern: &str) -> String {
+    let mut out = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '*' => out.push_str(".*"),
+            '.' | '^' | '$' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.push('$');
+    out
+}
+
+/// Escapes a string for embedding inside an SBPL `#"..."` string literal.
+/// `glob_to_regex`'s output can itself contain backslashes (from escaping
+/// regex metacharacters); those and any literal `"` both need escaping here
+/// so the emitted profile stays valid SBPL rather than truncating the
+/// string literal or failing to parse.
+fn sbpl_string_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Splits `allowlist` into entries containing a `*` glob and plain literal
+/// entries, expanding `~` to `home` in both. Pure and parameterized by
+/// `home` (rather than reading `$HOME` itself) so it's directly unit
+/// testable without mutating global process state.
+fn partition_allowlist(allowlist: &[String], home: &str) -> (Vec<String>, Vec<String>) {
+    allowlist
+        .iter()
+        .map(|p| p.replace('~', home))
+        .partition(|p| p.contains('*'))
 }
 
 pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<String> {
@@ -799,6 +849,12 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
 
     let user_config = config::load_user()?;
 
+    // Entries containing `*` are globs (e.g. `~/.claude.json*` covering the
+    // file plus its atomic-write tmp siblings) — `canonicalize`/`subpath`
+    // can't express those, since no real path literally contains a `*`.
+    // Route them to a separate `regex` rule instead of the subpath pipeline.
+    let (glob_allow, literal_allow) = partition_allowlist(&user_config.allowlist, &home);
+
     let raw: Vec<PathBuf> = [
         sandbox.to_path_buf(),
         repo_root.join(".git"),
@@ -810,10 +866,7 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
     ]
     .into_iter()
     .chain(pkg_cache_dirs.iter().map(|d| PathBuf::from(&home).join(d)))
-    .chain(user_config.allowlist.iter().map(|p| {
-        let p = p.replace("~", &home);
-        PathBuf::from(p)
-    }))
+    .chain(literal_allow.into_iter().map(PathBuf::from))
     .collect();
 
     let mut seen = std::collections::HashSet::new();
@@ -845,6 +898,20 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
         lines.push(format!(
             "(allow file-write* (subpath \"{}\"))",
             p.to_string_lossy()
+        ));
+    }
+
+    for pattern in &glob_allow {
+        // Resolve the pattern's static prefix the same way literal entries
+        // are resolved (line ~717 above): Seatbelt evaluates rules against
+        // the kernel-resolved, symlink-free path, so a glob rooted under a
+        // symlinked prefix (e.g. anything under /tmp) would otherwise
+        // compile into a regex that can never match — silently permitting
+        // nothing, the exact bug class this glob support exists to fix.
+        let resolved_pattern = config::resolve_glob_prefix(pattern);
+        lines.push(format!(
+            "(allow file-write* (regex #\"{}\"))",
+            sbpl_string_escape(&glob_to_regex(&resolved_pattern))
         ));
     }
 
@@ -898,6 +965,78 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
     std::fs::write(&path, serde_json::to_string_pretty(&settings)?)
         .context("writing settings file")?;
     Ok(TempFile(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_resolves_a_symlinked_existing_ancestor_for_a_nonexistent_literal_entry() {
+        // Regression test: a literal (non-glob) allowlist entry for a path
+        // that doesn't exist yet under /tmp (symlinked to /private/tmp on
+        // macOS) must still resolve through that symlink — otherwise the
+        // emitted SBPL `subpath` rule can never match the kernel-resolved
+        // path, silently denying Bash writes that Write/Edit/NotebookEdit
+        // (via hook.rs's normalize_path) would allow for the same entry.
+        let resolved = resolve(PathBuf::from(
+            "/tmp/wtclaude-test-nonexistent-literal-entry",
+        ));
+        assert_eq!(
+            resolved,
+            PathBuf::from("/private/tmp/wtclaude-test-nonexistent-literal-entry")
+        );
+    }
+
+    #[test]
+    fn glob_to_regex_translates_trailing_star_to_anchored_dotstar() {
+        // Regression test: `~/.claude.json*` in wtclaude.yml must produce a
+        // regex that matches the base file, not just literal-`*` paths that
+        // never exist (the bug that made the entry a silent no-op).
+        assert_eq!(
+            glob_to_regex("/Users/earlye/.claude.json*"),
+            r"^/Users/earlye/\.claude\.json.*$"
+        );
+    }
+
+    #[test]
+    fn glob_to_regex_escapes_regex_metacharacters() {
+        assert_eq!(glob_to_regex("/a/b.c*"), r"^/a/b\.c.*$");
+    }
+
+    #[test]
+    fn glob_to_regex_escapes_every_listed_metacharacter() {
+        assert_eq!(
+            glob_to_regex(r"a.b^c$d+e?f(g)h[i]j{k}l|m\n"),
+            r"^a\.b\^c\$d\+e\?f\(g\)h\[i\]j\{k\}l\|m\\n$"
+        );
+    }
+
+    #[test]
+    fn glob_to_regex_handles_leading_and_middle_wildcards() {
+        assert_eq!(glob_to_regex("*.log"), r"^.*\.log$");
+        assert_eq!(glob_to_regex("/a/foo*bar"), r"^/a/foo.*bar$");
+    }
+
+    #[test]
+    fn sbpl_string_escape_escapes_backslash_and_quote() {
+        assert_eq!(sbpl_string_escape(r#"a\b"c"#), r#"a\\b\"c"#);
+    }
+
+    #[test]
+    fn partition_allowlist_splits_glob_from_literal_and_expands_tilde() {
+        let allowlist = vec![
+            "~/.claude.json*".to_string(),
+            "~/.cargo".to_string(),
+            "/tmp/plain".to_string(),
+        ];
+        let (glob, literal) = partition_allowlist(&allowlist, "/Users/x");
+        assert_eq!(glob, vec!["/Users/x/.claude.json*".to_string()]);
+        assert_eq!(
+            literal,
+            vec!["/Users/x/.cargo".to_string(), "/tmp/plain".to_string()]
+        );
+    }
 }
 
 #[cfg(test)]
