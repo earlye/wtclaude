@@ -69,3 +69,12 @@ will likely need to be pulled apart for this to work.
   stdin when no positional prompt is given (mirroring `claude -p` itself),
   and carry `--resume SESSION_ID` over unchanged so a headless run can
   continue a prior session.
+- Q: What does "reports the result back to the caller" mean — pure
+  passthrough of `claude`'s own stdout/exit code, or should wtclaude parse
+  and wrap the result itself? — A: Pure passthrough, no wrapping. Headless
+  mode always appends `--print` to the underlying `claude` invocation,
+  runs it via the same `Command::status()` (inherited stdio) as today, and
+  returns `claude`'s own exit code as wtclaude's exit code. wtclaude does
+  not parse or envelope the result; a caller wanting structured output
+  (e.g. `--output-format json`) passes that through like any other
+  `claude` flag.
