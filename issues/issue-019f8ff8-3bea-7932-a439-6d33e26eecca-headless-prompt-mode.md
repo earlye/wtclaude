@@ -78,3 +78,14 @@ will likely need to be pulled apart for this to work.
   not parse or envelope the result; a caller wanting structured output
   (e.g. `--output-format json`) passes that through like any other
   `claude` flag.
+- Q: How to handle the currently-interactive bits — `offer_git_init`'s
+  stdin prompt, `--show-policy`'s "press enter" pause, `post_exit_menu`,
+  `TmuxWindowName::rename`? — A: `offer_git_init` — do not auto-run
+  `git init` either; just bail loudly if `repo_root()` fails. Target
+  scenario for headless mode is "repo was just cloned, and you're being
+  launched by something else" — the repo is expected to already exist, so
+  there's no interactive-vs-auto-init tradeoff to make, it's simply an
+  error case. `--show-policy` — keep it, drop the pause (agreed).
+  `post_exit_menu` — falls out naturally, never called for headless
+  (agreed). `TmuxWindowName::rename` — do not call it; tmux window naming
+  is the caller's concern in this mode, not wtclaude's.
