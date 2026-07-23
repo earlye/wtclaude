@@ -779,27 +779,38 @@ fn resolve(p: PathBuf) -> PathBuf {
     config::resolve_existing_prefix(&p)
 }
 
-/// Resolves the git metadata directory that actually needs to be writable
-/// for sandbox-policy purposes. For a normal checkout, `<repo_root>/.git`
-/// already is that directory. For a linked worktree (`git worktree add`),
-/// `<repo_root>/.git` is instead a pointer file containing `gitdir: <path>`,
-/// and the real metadata — `FETCH_HEAD`, the per-worktree index, `HEAD`,
-/// `MERGE_HEAD`, etc. — lives at that path, under the main repo's
-/// `.git/worktrees/<name>/`.
-fn git_metadata_dir(repo_root: &Path) -> PathBuf {
-    let dot_git = repo_root.join(".git");
-    if dot_git.is_file()
-        && let Ok(contents) = std::fs::read_to_string(&dot_git)
-        && let Some(gitdir) = contents.trim().strip_prefix("gitdir:")
-    {
-        let gitdir = PathBuf::from(gitdir.trim());
-        return if gitdir.is_absolute() {
-            gitdir
-        } else {
-            repo_root.join(gitdir)
-        };
+/// Resolves the git directories that need to be writable for sandbox-policy
+/// purposes: the per-worktree git-dir (`HEAD`, `index`, `FETCH_HEAD`,
+/// `MERGE_HEAD`, ...) and the git-common-dir shared across worktrees
+/// (`objects`, `packed-refs`, `config`, ...). For a normal checkout these
+/// are both `<repo_root>/.git`. For a linked worktree (`git worktree add`),
+/// `<repo_root>/.git` is instead a pointer file, and the two real
+/// directories live under the main repository's `.git` and
+/// `.git/worktrees/<name>/` — asking git itself (rather than re-parsing the
+/// `gitdir:`/`commondir` indirection by hand) follows both correctly.
+fn git_dirs(repo_root: &Path) -> Vec<PathBuf> {
+    let fallback = || vec![repo_root.join(".git")];
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--git-dir", "--git-common-dir"])
+        .current_dir(repo_root)
+        .output()
+    else {
+        return fallback();
+    };
+    if !output.status.success() {
+        return fallback();
     }
-    dot_git
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| {
+            let p = PathBuf::from(line.trim());
+            if p.is_absolute() {
+                p
+            } else {
+                repo_root.join(p)
+            }
+        })
+        .collect()
 }
 
 /// Translate a shell-style glob (`*` only, usable anywhere in the pattern)
@@ -880,8 +891,6 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
 
     let raw: Vec<PathBuf> = [
         sandbox.to_path_buf(),
-        repo_root.join(".git"),
-        git_metadata_dir(repo_root),
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
         PathBuf::from("/var/folders"),
@@ -889,6 +898,7 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
         PathBuf::from(&tmpdir),
     ]
     .into_iter()
+    .chain(git_dirs(repo_root))
     .chain(pkg_cache_dirs.iter().map(|d| PathBuf::from(&home).join(d)))
     .chain(literal_allow.into_iter().map(PathBuf::from))
     .collect();
@@ -1062,41 +1072,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn git_metadata_dir_returns_dot_git_when_it_is_a_real_directory() {
-        let root = std::env::temp_dir().join(format!(
-            "wtclaude-test-normal-repo-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(root.join(".git")).unwrap();
+    // git canonicalizes symlinked ancestors (e.g. macOS's /tmp -> /private/tmp)
+    // in its own `rev-parse` output, so test dirs must be canonicalized too —
+    // otherwise comparisons against git_dirs()'s output spuriously mismatch.
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("wtclaude-test-{}-{}", std::process::id(), label));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
 
-        assert_eq!(git_metadata_dir(&root), root.join(".git"));
+    #[test]
+    fn git_dirs_returns_dot_git_for_a_normal_repo() {
+        let root = unique_test_dir("git-dirs-normal-repo");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        assert!(git_dirs(&root).iter().all(|d| *d == root.join(".git")));
 
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn git_metadata_dir_follows_gitdir_pointer_for_a_linked_worktree() {
-        let root = std::env::temp_dir().join(format!(
-            "wtclaude-test-linked-worktree-{}",
-            std::process::id()
-        ));
-        let main_repo_worktree_dir = std::env::temp_dir().join(format!(
-            "wtclaude-test-main-repo-worktrees-name-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&main_repo_worktree_dir).unwrap();
-        std::fs::write(
-            root.join(".git"),
-            format!("gitdir: {}\n", main_repo_worktree_dir.display()),
-        )
-        .unwrap();
+    fn git_dirs_returns_both_the_worktree_dir_and_the_shared_common_dir() {
+        let main_repo = unique_test_dir("git-dirs-main-repo");
+        let worktree = unique_test_dir("git-dirs-linked-worktree");
+        std::fs::remove_dir_all(&worktree).unwrap(); // `git worktree add` must create this itself
 
-        assert_eq!(git_metadata_dir(&root), main_repo_worktree_dir);
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&main_repo)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"]);
+        std::fs::write(main_repo.join("f.txt"), "x").unwrap();
+        run(&["add", "f.txt"]);
+        run(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        run(&[
+            "worktree",
+            "add",
+            "-q",
+            worktree.to_str().unwrap(),
+            "-b",
+            "git-dirs-test-branch",
+        ]);
 
-        std::fs::remove_dir_all(&root).unwrap();
-        std::fs::remove_dir_all(&main_repo_worktree_dir).unwrap();
+        let dirs = git_dirs(&worktree);
+
+        assert_eq!(dirs.len(), 2);
+        assert!(dirs.contains(&main_repo.join(".git")));
+        assert!(
+            dirs.iter()
+                .any(|p| p.starts_with(main_repo.join(".git").join("worktrees")))
+        );
+
+        run(&["worktree", "remove", "-f", worktree.to_str().unwrap()]);
+        std::fs::remove_dir_all(&main_repo).unwrap();
     }
 }
 
