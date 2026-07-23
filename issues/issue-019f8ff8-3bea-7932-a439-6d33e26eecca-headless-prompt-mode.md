@@ -38,3 +38,15 @@ will likely need to be pulled apart for this to work.
 - Decide how the headless invocation is triggered (new subcommand vs.
   a `-p`/`--print`-style flag) and how the prompt and final
   result/exit status are passed in and reported back to the caller.
+
+## Grill Log
+
+### 2026-07-23
+
+- Q: New subcommand (e.g. `wtclaude headless <PROMPT>`) vs. a `-p`/`--print`
+  flag bolted onto the existing default (worktree-launching) invocation? —
+  A: New subcommand. Keeps `launch.rs`'s worktree-required assumptions
+  (`WORKTREE_NAME` as a required positional in `parse_args`) untouched, and
+  matches the existing flat-dispatch pattern in `main.rs` (`hook`,
+  `sessions`, `worktrees`, etc. are already single-word subcommands with
+  their own entry points).
