@@ -62,3 +62,10 @@ will likely need to be pulled apart for this to work.
   working — `repo_root` is still resolved via `git rev-parse
   --show-toplevel` for that purpose and for `update_trust`, it's just no
   longer the sandbox boundary itself.
+- Q: How is the prompt supplied, and does `--resume` carry over? — A: Yes
+  to both — keep the existing trailing-positional-prompt convention
+  (`wtclaude headless <PROMPT...>`, same join-by-space style as
+  `Args.prompt` today), additionally fall back to reading the prompt from
+  stdin when no positional prompt is given (mirroring `claude -p` itself),
+  and carry `--resume SESSION_ID` over unchanged so a headless run can
+  continue a prior session.
