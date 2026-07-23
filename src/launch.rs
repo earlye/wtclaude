@@ -156,24 +156,10 @@ pub fn run(args: Args) -> Result<i32> {
 
     let sandbox_notice = format!(
         "You are running in a git worktree sandbox for branch '{}'. \
-         You may only write files under: {}. \
-         Do not attempt to create new worktrees (e.g. via `git worktree add`, `wtclaude new`, \
-         or an EnterWorktree/spawn-agent-in-worktree tool) from within this sandbox: creating a \
-         worktree requires writing to the main repository's `.git` directory, which is outside \
-         this sandbox and will be rejected. \
-         Avoid heredocs (e.g. `cat <<'EOF' ... EOF`) nested inside a `$(...)` command \
-         substitution inside double quotes — the common `git commit -m \"$(cat <<'EOF' ... \
-         EOF)\"` idiom included. Apple's bash 3.2 (which backs both /bin/sh and /bin/bash on \
-         macOS, and is what this sandbox's `sh -c` wrapper runs) has a real parsing bug there: \
-         depending on the exact single-quote/backslash content of the heredoc body, it can \
-         miscount quote nesting and fail with 'unexpected EOF while looking for matching' or a \
-         syntax error, even though the same text is valid POSIX shell and works fine in zsh. \
-         This is unrelated to sandboxing and reproduces with no sandbox involved at all. Prefer \
-         writing multi-line content (like a commit message) to a temp file and using it \
-         directly, e.g. `git commit -F /tmp/msg.txt`, instead of the heredoc-in-command-\
-         substitution pattern.",
+         You may only write files under: {}. {}",
         args.name,
-        canonical.display()
+        canonical.display(),
+        sandbox_warning_common()
     );
 
     let mut cmd = Command::new("claude");
@@ -218,6 +204,129 @@ pub fn run(args: Args) -> Result<i32> {
     }
 
     Ok(exit_code)
+}
+
+fn sandbox_warning_common() -> &'static str {
+    "Do not attempt to create new worktrees (e.g. via `git worktree add`, `wtclaude new`, \
+     or an EnterWorktree/spawn-agent-in-worktree tool) from within this sandbox: creating a \
+     worktree requires writing to the main repository's `.git` directory, which is outside \
+     this sandbox and will be rejected. \
+     Avoid heredocs (e.g. `cat <<'EOF' ... EOF`) nested inside a `$(...)` command \
+     substitution inside double quotes — the common `git commit -m \"$(cat <<'EOF' ... \
+     EOF)\"` idiom included. Apple's bash 3.2 (which backs both /bin/sh and /bin/bash on \
+     macOS, and is what this sandbox's `sh -c` wrapper runs) has a real parsing bug there: \
+     depending on the exact single-quote/backslash content of the heredoc body, it can \
+     miscount quote nesting and fail with 'unexpected EOF while looking for matching' or a \
+     syntax error, even though the same text is valid POSIX shell and works fine in zsh. \
+     This is unrelated to sandboxing and reproduces with no sandbox involved at all. Prefer \
+     writing multi-line content (like a commit message) to a temp file and using it \
+     directly, e.g. `git commit -F /tmp/msg.txt`, instead of the heredoc-in-command-\
+     substitution pattern."
+}
+
+pub struct HeadlessArgs {
+    pub mode: Option<String>,
+    pub prompt: Option<String>,
+    pub resume: Option<String>,
+    pub show_policy: bool,
+}
+
+pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
+    let mut iter = raw.into_iter().peekable();
+    let mut mode = None;
+    let mut prompt_parts: Vec<String> = Vec::new();
+    let mut resume = None;
+    let mut show_policy = false;
+
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--mode" => {
+                mode = Some(iter.next().context("--mode requires a value")?);
+            }
+            "--show-policy" => {
+                show_policy = true;
+            }
+            "--resume" => {
+                resume = Some(iter.next().context("--resume requires a session id")?);
+            }
+            _ if arg.starts_with("--") => {
+                bail!("unknown flag: {}", arg);
+            }
+            _ => {
+                prompt_parts.push(arg);
+            }
+        }
+    }
+
+    let prompt = if prompt_parts.is_empty() {
+        None
+    } else {
+        Some(prompt_parts.join(" "))
+    };
+
+    Ok(HeadlessArgs {
+        mode,
+        prompt,
+        resume,
+        show_policy,
+    })
+}
+
+pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
+    let config = config::load()?;
+    let mode = args
+        .mode
+        .or_else(|| std::env::var("WTCLAUDE_DEFAULT_MODE").ok())
+        .unwrap_or_else(|| config.default_mode.clone());
+    let mode_config = config
+        .modes
+        .get(&mode)
+        .with_context(|| format!("unknown mode: {}", mode))?;
+
+    let repo_root = repo_root()
+        .context("not a git repository; headless mode requires an existing git repository")?;
+    let cwd = std::env::current_dir().context("getting current directory")?;
+    let canonical = cwd.canonicalize().unwrap_or(cwd);
+
+    update_trust(&repo_root)?;
+
+    let binary_path = std::env::current_exe().context("resolving binary path")?;
+    let _settings = write_hook_settings(&binary_path)?;
+    let _sbpl_policy = write_sbpl_policy(&canonical, &repo_root, "headless")?;
+
+    if args.show_policy {
+        let policy = std::fs::read_to_string(&_sbpl_policy.0).context("reading sbpl policy")?;
+        println!("{}", policy);
+    }
+
+    let sandbox_notice = format!(
+        "You are running in a headless wtclaude sandbox rooted at: {}. \
+         You may only write files under that directory (plus the repo's .git and a few \
+         package-manager cache dirs). {}",
+        canonical.display(),
+        sandbox_warning_common()
+    );
+
+    let mut cmd = Command::new("claude");
+    cmd.current_dir(&canonical);
+    for flag in &mode_config.claude_flags {
+        cmd.arg(flag);
+    }
+    if let Some(session_id) = args.resume {
+        cmd.arg("--resume").arg(session_id);
+    }
+    cmd.arg("--print");
+    cmd.arg("--settings").arg(&_settings.0);
+    cmd.arg("--append-system-prompt").arg(&sandbox_notice);
+    cmd.env("WTCLAUDE_SANDBOX", &canonical);
+    cmd.env("WTCLAUDE_REPO_ROOT", &repo_root);
+    cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
+    if let Some(p) = args.prompt {
+        cmd.arg(p);
+    }
+
+    let status = cmd.status().context("launching claude")?;
+    Ok(status.code().unwrap_or(1))
 }
 
 fn sanitize_name(name: &str) -> String {
