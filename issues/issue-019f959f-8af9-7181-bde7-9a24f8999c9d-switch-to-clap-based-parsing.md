@@ -70,3 +70,12 @@ get validation, `--help` generation, and shell completions for free.
   completions and cannot replicate that runtime behavior, so switching would
   be a regression. Migrating arg parsing to clap does not require touching
   completions at all.
+- Q: Existing tests assert exact CLI contract details (exit code 1 on parse
+  errors, stderr wording like "--mode requires a value" and
+  "usage: wtclaude ..."). Clap's own defaults differ (its own error wording,
+  exit code 2 for usage errors, its own `--help`/usage format). Preserve the
+  old wording/exit codes, or adopt clap's conventions? — A: Adopt clap's
+  conventions. Let clap own error formatting, `--help` text, and exit codes.
+  Update `tests/headless.rs` (and any equivalent tests for the interactive
+  path) to assert against clap's actual output instead of translating clap
+  errors back into today's exact wording.
