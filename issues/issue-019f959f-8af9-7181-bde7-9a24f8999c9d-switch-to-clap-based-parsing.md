@@ -46,6 +46,9 @@ get validation, `--help` generation, and shell completions for free.
   to clap's standard completion generation flow.
 - Once scope is decided, revisit `issues/issue-019f959e-2450-7030-93dc-165c555689ae-headless-output-format-flag.md`
   to implement `--output-format` on top of clap rather than the old manual parser.
+- `issues/issue-019f95be-1006-79b2-abc1-49e3b13b1bdc-headless-include-partial-messages-flag.md`
+  (new `--include-partial-messages` headless flag) is soft-blocked on this issue too —
+  build it against the clap-derived `HeadlessArgs` once this lands.
 
 ## Grill Log
 
