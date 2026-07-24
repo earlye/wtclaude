@@ -14,7 +14,7 @@ impl Drop for TempFile {
 use crate::config;
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-pub enum SbplBreakage {
+enum SbplBreakage {
     Hide,
     Missing,
 }
@@ -28,22 +28,22 @@ pub enum SbplBreakage {
 pub struct Args {
     /// Operation mode (see wtclaude.yml)
     #[arg(long)]
-    pub mode: Option<String>,
+    mode: Option<String>,
     /// Skip git pull before launch
     #[arg(long)]
-    pub no_pull: bool,
+    no_pull: bool,
     /// Resume a previous session
     #[arg(long, value_name = "SESSION_ID")]
-    pub resume: Option<String>,
+    resume: Option<String>,
     /// Print the generated sandbox policy and pause for Enter before launching
     #[arg(long)]
-    pub show_policy: bool,
+    show_policy: bool,
     /// Inject sandbox policy breakage for testing
     #[arg(long, value_enum, value_name = "TYPE")]
-    pub test_sbpl_breakage: Option<SbplBreakage>,
+    test_sbpl_breakage: Option<SbplBreakage>,
     /// Name of the worktree/branch to launch
     #[arg(value_name = "WORKTREE_NAME")]
-    pub name: String,
+    name: String,
     /// Initial prompt to hand to claude (use `--` to pass prompt text that
     /// starts with a hyphen)
     #[arg(value_name = "INITIAL_PROMPT")]

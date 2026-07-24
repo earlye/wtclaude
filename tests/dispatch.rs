@@ -70,6 +70,13 @@ fn top_level_help_documents_the_full_command_surface() {
         stdout.contains("wtclaude --completions zsh"),
         "stdout: {stdout}"
     );
+    // Regression guard: the after_help wiring note in src/launch.rs must
+    // stay a plain `//` comment, not a `///` doc comment — the latter
+    // leaks it into this exact --help output (caught once during review).
+    assert!(
+        !stdout.contains("injects an after_help"),
+        "stdout leaked an internal implementation comment: {stdout}"
+    );
 }
 
 #[test]

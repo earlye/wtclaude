@@ -101,7 +101,9 @@ are replaced with `+` to match Claude's own directory naming.
 
 `INITIAL_PROMPT` (optional) is passed as the opening prompt to Claude.
 If it contains spaces, quote it or pass it as multiple trailing
-arguments — they are joined with spaces.
+arguments — they are joined with spaces. A prompt that starts with a
+hyphen must be preceded by `--`, e.g. `wtclaude my-feature -- "-1 fix
+this"` — otherwise it looks like an unrecognized flag.
 
 ### Flags
 
