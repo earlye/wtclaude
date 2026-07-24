@@ -79,3 +79,12 @@ get validation, `--help` generation, and shell completions for free.
   Update `tests/headless.rs` (and any equivalent tests for the interactive
   path) to assert against clap's actual output instead of translating clap
   errors back into today's exact wording.
+- Q: Today `wtclaude WORKTREE_NAME [PROMPT]` works with no subcommand
+  keyword (interactive launch is the implicit default when the first arg
+  isn't `hook`/`sessions`/`headless`/etc). Keep that bare-invocation UX, or
+  require an explicit subcommand (e.g. `wtclaude launch WORKTREE_NAME`)? —
+  A: Keep bare invocation working. Interactive launch stays the zero-ceremony
+  default with no keyword required — implement via clap's external-subcommand
+  / catch-all fallback pattern (or a first-token peek before invoking clap),
+  not by forcing a new `launch` keyword onto the most frequently typed
+  command.
