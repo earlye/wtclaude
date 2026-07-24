@@ -63,12 +63,12 @@ fn headless_subcommand_prints_usage_on_parse_error() {
         .expect("failed to spawn wtclaude");
     std::fs::remove_dir_all(&dir).ok();
     assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2), "clap usage errors exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--mode requires a value"),
+        stderr.contains("a value is required for '--mode <MODE>'"),
         "stderr: {stderr}"
     );
-    assert!(stderr.contains("usage: wtclaude"), "stderr: {stderr}");
 }
 
 // The following tests exercise the actual `claude` subprocess invocation

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,91 +13,55 @@ impl Drop for TempFile {
 
 use crate::config;
 
+#[derive(Clone, Copy, clap::ValueEnum)]
 pub enum SbplBreakage {
     Hide,
     Missing,
 }
 
+/// Launch a sandboxed Claude session in a worktree for WORKTREE_NAME.
+#[derive(Parser)]
+#[command(name = "wtclaude")]
 pub struct Args {
+    /// Operation mode (see wtclaude.yml)
+    #[arg(long)]
     pub mode: Option<String>,
-    pub name: String,
+    /// Skip git pull before launch
+    #[arg(long)]
     pub no_pull: bool,
-    pub prompt: Option<String>,
+    /// Resume a previous session
+    #[arg(long)]
     pub resume: Option<String>,
+    /// Print the generated sandbox policy before launching
+    #[arg(long)]
     pub show_policy: bool,
+    /// Inject sandbox policy breakage for testing
+    #[arg(long, value_enum)]
     pub test_sbpl_breakage: Option<SbplBreakage>,
+    /// Name of the worktree/branch to launch
+    #[arg(value_name = "WORKTREE_NAME")]
+    pub name: String,
+    /// Initial prompt to hand to claude
+    #[arg(value_name = "INITIAL_PROMPT")]
+    prompt_parts: Vec<String>,
 }
 
-pub fn parse_args(raw: Vec<String>) -> Result<Args> {
-    let mut iter = raw.into_iter().peekable();
-    let mut mode = None;
-    let mut name = None;
-    let mut no_pull = false;
-    let mut prompt_parts: Vec<String> = Vec::new();
-    let mut resume = None;
-    let mut show_policy = false;
-    let mut test_sbpl_breakage = None;
-
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--mode" => {
-                mode = Some(iter.next().context("--mode requires a value")?);
-            }
-            "--no-pull" => {
-                no_pull = true;
-            }
-            "--show-policy" => {
-                show_policy = true;
-            }
-            "--resume" => {
-                resume = Some(iter.next().context("--resume requires a session id")?);
-            }
-            "--test-sbpl-breakage" => {
-                let val = iter
-                    .next()
-                    .context("--test-sbpl-breakage requires a value")?;
-                test_sbpl_breakage = Some(match val.as_str() {
-                    "hide" => SbplBreakage::Hide,
-                    "missing" => SbplBreakage::Missing,
-                    other => bail!(
-                        "--test-sbpl-breakage must be 'hide' or 'missing', got '{}'",
-                        other
-                    ),
-                });
-            }
-            _ if arg.starts_with("--") => {
-                bail!("unknown flag: {}", arg);
-            }
-            _ if name.is_none() => {
-                name = Some(arg);
-            }
-            _ => {
-                prompt_parts.push(arg);
-            }
+impl Args {
+    fn prompt(&self) -> Option<String> {
+        if self.prompt_parts.is_empty() {
+            None
+        } else {
+            Some(self.prompt_parts.join(" "))
         }
     }
-
-    let name = name.context("worktree name is required")?;
-    let prompt = if prompt_parts.is_empty() {
-        None
-    } else {
-        Some(prompt_parts.join(" "))
-    };
-
-    Ok(Args {
-        mode,
-        name,
-        no_pull,
-        prompt,
-        resume,
-        show_policy,
-        test_sbpl_breakage,
-    })
 }
 
 pub fn run(args: Args) -> Result<i32> {
+    let prompt = args.prompt();
     let config = config::load()?;
-    let mode = args.mode
+    let mode = args
+        .mode
+        .clone()
         .or_else(|| std::env::var("WTCLAUDE_DEFAULT_MODE").ok())
         .unwrap_or_else(|| config.default_mode.clone());
     let mode_config = config
@@ -186,7 +151,7 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
-    if let Some(p) = args.prompt {
+    if let Some(p) = prompt {
         cmd.arg(p);
     }
 
@@ -224,70 +189,46 @@ fn sandbox_warning_common() -> &'static str {
      substitution pattern."
 }
 
+/// Run a sandboxed, non-interactive claude session against the current directory.
+#[derive(Parser)]
+#[command(name = "wtclaude headless")]
 pub struct HeadlessArgs {
+    /// Operation mode (see wtclaude.yml)
+    #[arg(long)]
     mode: Option<String>,
-    prompt: Option<String>,
+    /// Resume a previous session
+    #[arg(long)]
     resume: Option<String>,
+    /// Print the generated sandbox policy to stderr before launching
+    #[arg(long)]
     show_policy: bool,
+    /// Output format to pass through to `claude --print`
+    #[arg(long)]
     output_format: Option<String>,
+    /// Pass --include-partial-messages through to `claude --print`
+    #[arg(long)]
     include_partial_messages: bool,
+    /// Prompt to hand to claude (read from stdin if omitted)
+    #[arg(value_name = "PROMPT")]
+    prompt_parts: Vec<String>,
 }
 
-pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
-    let mut iter = raw.into_iter().peekable();
-    let mut mode = None;
-    let mut prompt_parts: Vec<String> = Vec::new();
-    let mut resume = None;
-    let mut show_policy = false;
-    let mut output_format = None;
-    let mut include_partial_messages = false;
-
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--mode" => {
-                mode = Some(iter.next().context("--mode requires a value")?);
-            }
-            "--show-policy" => {
-                show_policy = true;
-            }
-            "--resume" => {
-                resume = Some(iter.next().context("--resume requires a session id")?);
-            }
-            "--output-format" => {
-                output_format = Some(iter.next().context("--output-format requires a value")?);
-            }
-            "--include-partial-messages" => {
-                include_partial_messages = true;
-            }
-            _ if arg.starts_with("--") => {
-                bail!("unknown flag: {}", arg);
-            }
-            _ => {
-                prompt_parts.push(arg);
-            }
+impl HeadlessArgs {
+    fn prompt(&self) -> Option<String> {
+        if self.prompt_parts.is_empty() {
+            None
+        } else {
+            Some(self.prompt_parts.join(" "))
         }
     }
-
-    let prompt = if prompt_parts.is_empty() {
-        None
-    } else {
-        Some(prompt_parts.join(" "))
-    };
-
-    Ok(HeadlessArgs {
-        mode,
-        prompt,
-        resume,
-        show_policy,
-        output_format,
-        include_partial_messages,
-    })
 }
 
 pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
+    let prompt = args.prompt();
     let config = config::load()?;
     let mode = args
         .mode
+        .clone()
         .or_else(|| std::env::var("WTCLAUDE_DEFAULT_MODE").ok())
         .unwrap_or_else(|| config.default_mode.clone());
     let mode_config = config
@@ -347,7 +288,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     cmd.env("WTCLAUDE_SANDBOX", &canonical);
     cmd.env("WTCLAUDE_REPO_ROOT", &repo_root);
     cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
-    if let Some(p) = args.prompt {
+    if let Some(p) = prompt {
         cmd.arg(p);
     }
 
@@ -1175,15 +1116,17 @@ mod tests {
 mod headless_tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<HeadlessArgs> {
-        parse_headless_args(args.iter().map(|s| s.to_string()).collect())
+    fn parse(args: &[&str]) -> std::result::Result<HeadlessArgs, clap::Error> {
+        let mut full = vec!["wtclaude-headless"];
+        full.extend_from_slice(args);
+        HeadlessArgs::try_parse_from(full)
     }
 
     #[test]
     fn parse_headless_args_joins_interleaved_flags_and_prompt() {
         let parsed = parse(&["--mode", "fast", "do", "the", "thing", "--resume", "abc"]).unwrap();
         assert_eq!(parsed.mode.as_deref(), Some("fast"));
-        assert_eq!(parsed.prompt.as_deref(), Some("do the thing"));
+        assert_eq!(parsed.prompt().as_deref(), Some("do the thing"));
         assert_eq!(parsed.resume.as_deref(), Some("abc"));
         assert!(!parsed.show_policy);
     }
@@ -1192,7 +1135,7 @@ mod headless_tests {
     fn parse_headless_args_show_policy_does_not_consume_a_value() {
         let parsed = parse(&["--show-policy", "explain this"]).unwrap();
         assert!(parsed.show_policy);
-        assert_eq!(parsed.prompt.as_deref(), Some("explain this"));
+        assert_eq!(parsed.prompt().as_deref(), Some("explain this"));
     }
 
     #[test]
@@ -1214,7 +1157,7 @@ mod headless_tests {
     fn parse_headless_args_defaults_are_empty() {
         let parsed = parse(&[]).unwrap();
         assert!(parsed.mode.is_none());
-        assert!(parsed.prompt.is_none());
+        assert!(parsed.prompt().is_none());
         assert!(parsed.resume.is_none());
         assert!(!parsed.show_policy);
         assert!(parsed.output_format.is_none());
@@ -1225,7 +1168,7 @@ mod headless_tests {
     fn parse_headless_args_captures_output_format() {
         let parsed = parse(&["--output-format", "json", "hello"]).unwrap();
         assert_eq!(parsed.output_format.as_deref(), Some("json"));
-        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+        assert_eq!(parsed.prompt().as_deref(), Some("hello"));
     }
 
     #[test]
@@ -1237,6 +1180,6 @@ mod headless_tests {
     fn parse_headless_args_captures_include_partial_messages() {
         let parsed = parse(&["--include-partial-messages", "hello"]).unwrap();
         assert!(parsed.include_partial_messages);
-        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+        assert_eq!(parsed.prompt().as_deref(), Some("hello"));
     }
 }

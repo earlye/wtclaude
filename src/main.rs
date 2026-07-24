@@ -3,92 +3,119 @@ mod hook;
 mod launch;
 mod sessions;
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+use clap::{Parser, Subcommand};
+use launch::{Args as LaunchArgs, HeadlessArgs};
 
-    match args.first().map(|s| s.as_str()) {
-        Some("hook") => {
-            if let Err(e) = hook::run() {
-                eprintln!("hook error: {}", e);
+#[derive(Parser)]
+#[command(name = "wtclaude", disable_help_subcommand = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Invoked internally as a PreToolUse hook
+    Hook,
+    /// List recent sessions for completion
+    Sessions,
+    /// List worktrees for completion
+    Worktrees,
+    /// List modes for completion
+    Modes,
+    /// Sandboxed, non-interactive run against cwd (no worktree/branch created;
+    /// reads PROMPT from stdin if omitted)
+    Headless(HeadlessArgs),
+    /// Print the worktree name for a session
+    SessionWorktree { session_id: String },
+}
+
+/// First-token keywords that dispatch to the clap subcommand tree below. Any
+/// other invocation (including bare `wtclaude WORKTREE_NAME [PROMPT]` with no
+/// keyword, and `--completions`, handled separately) falls through to the
+/// interactive-launch parser instead.
+const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "hook",
+    "sessions",
+    "worktrees",
+    "modes",
+    "headless",
+    "session-worktree",
+    "--help",
+    "-h",
+];
+
+fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let first = raw_args.get(1).map(|s| s.as_str());
+
+    if first == Some("--completions") {
+        match raw_args.get(2).map(|s| s.as_str()) {
+            Some("zsh") => print_completions_zsh(),
+            Some(other) => {
+                eprintln!("unsupported shell: {}. Supported: zsh", other);
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("usage: wtclaude --completions zsh");
                 std::process::exit(1);
             }
         }
-        Some("sessions") => {
-            if let Err(e) = sessions::run_sessions() {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Some("worktrees") => {
-            if let Err(e) = sessions::run_worktrees() {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Some("modes") => {
-            if let Err(e) = sessions::run_modes() {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Some("headless") => {
-            let rest = args[1..].to_vec();
-            match launch::parse_headless_args(rest) {
-                Ok(parsed) => match launch::run_headless(parsed) {
-                    Ok(code) => std::process::exit(code),
-                    Err(e) => {
-                        eprintln!("error: {:#}", e);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("error: {:#}", e);
-                    print_usage();
+        return;
+    }
+
+    if first.is_some_and(|f| KNOWN_SUBCOMMANDS.contains(&f)) {
+        match Cli::parse().command {
+            Commands::Hook => {
+                if let Err(e) = hook::run() {
+                    eprintln!("hook error: {}", e);
                     std::process::exit(1);
                 }
             }
-        }
-        Some("session-worktree") => {
-            let session_id = args.get(1).map(|s| s.as_str()).unwrap_or("");
-            if session_id.is_empty() {
-                eprintln!("usage: wtclaude session-worktree SESSION_ID");
-                std::process::exit(1);
-            }
-            if let Err(e) = sessions::run_session_worktree(session_id) {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Some("--completions") => {
-            match args.get(1).map(|s| s.as_str()) {
-                Some("zsh") => print_completions_zsh(),
-                Some(other) => {
-                    eprintln!("unsupported shell: {}. Supported: zsh", other);
-                    std::process::exit(1);
-                }
-                None => {
-                    eprintln!("usage: wtclaude --completions zsh");
-                    std::process::exit(1);
-                }
-            }
-        }
-        Some("--help") | Some("-h") => {
-            print_usage();
-        }
-        _ => match launch::parse_args(args) {
-            Ok(parsed) => match launch::run(parsed) {
-                Ok(code) => std::process::exit(code),
-                Err(e) => {
+            Commands::Sessions => {
+                if let Err(e) = sessions::run_sessions() {
                     eprintln!("error: {}", e);
                     std::process::exit(1);
                 }
+            }
+            Commands::Worktrees => {
+                if let Err(e) = sessions::run_worktrees() {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            Commands::Modes => {
+                if let Err(e) = sessions::run_modes() {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            Commands::Headless(parsed) => match launch::run_headless(parsed) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {:#}", e);
+                    std::process::exit(1);
+                }
             },
+            Commands::SessionWorktree { session_id } => {
+                if let Err(e) = sessions::run_session_worktree(&session_id) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
+
+    match LaunchArgs::try_parse_from(&raw_args) {
+        Ok(parsed) => match launch::run(parsed) {
+            Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("error: {}", e);
-                print_usage();
                 std::process::exit(1);
             }
         },
+        Err(e) => e.exit(),
     }
 }
 
@@ -151,21 +178,4 @@ _wtclaude() {{
 compdef _wtclaude wtclaude
 "#
     );
-}
-
-fn print_usage() {
-    eprintln!(
-        "usage: wtclaude [--mode MODE] [--resume SESSION_ID] [--test-sbpl-breakage hide|missing] WORKTREE_NAME [INITIAL_PROMPT]"
-    );
-    eprintln!(
-        "       wtclaude headless [--mode MODE] [--resume SESSION_ID] [--show-policy] [--output-format FORMAT] [--include-partial-messages] [PROMPT]"
-    );
-    eprintln!(
-        "                     (sandboxed, non-interactive run against cwd; no worktree/branch created; reads PROMPT from stdin if omitted)"
-    );
-    eprintln!("       wtclaude --completions zsh   (print zsh completion script)");
-    eprintln!("       wtclaude hook                (invoked internally as a PreToolUse hook)");
-    eprintln!("       wtclaude sessions            (list recent sessions for completion)");
-    eprintln!("       wtclaude worktrees           (list worktrees for completion)");
-    eprintln!("       wtclaude session-worktree SESSION_ID  (print worktree name for a session)");
 }
