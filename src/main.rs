@@ -3,7 +3,7 @@ mod hook;
 mod launch;
 mod sessions;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use launch::{Args as LaunchArgs, HeadlessArgs};
 
 #[derive(Parser)]
@@ -30,21 +30,6 @@ enum Commands {
     SessionWorktree { session_id: String },
 }
 
-/// First-token keywords that dispatch to the clap subcommand tree below. Any
-/// other invocation (including bare `wtclaude WORKTREE_NAME [PROMPT]` with no
-/// keyword, and `--completions`, handled separately) falls through to the
-/// interactive-launch parser instead.
-const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "hook",
-    "sessions",
-    "worktrees",
-    "modes",
-    "headless",
-    "session-worktree",
-    "--help",
-    "-h",
-];
-
 fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let first = raw_args.get(1).map(|s| s.as_str());
@@ -64,7 +49,20 @@ fn main() {
         return;
     }
 
-    if first.is_some_and(|f| KNOWN_SUBCOMMANDS.contains(&f)) {
+    // Peek at the first token to decide whether this looks like one of the
+    // known subcommand keywords (in which case route through the Cli
+    // subcommand tree) or the bare `wtclaude WORKTREE_NAME [PROMPT]` launch
+    // form (which has no keyword and must fall through to LaunchArgs).
+    // Derived from Cli itself so the keyword list can't drift out of sync
+    // with `enum Commands`. Deliberately excludes --help/-h: those fall
+    // through to LaunchArgs so `wtclaude --help` documents the primary,
+    // most-frequently-used invocation form (see Args's after_help for the
+    // rest of the command surface).
+    let known_subcommand = Cli::command()
+        .get_subcommands()
+        .any(|c| first == Some(c.get_name()));
+
+    if known_subcommand {
         match Cli::parse().command {
             Commands::Hook => {
                 if let Err(e) = hook::run() {
@@ -98,6 +96,10 @@ fn main() {
                 }
             },
             Commands::SessionWorktree { session_id } => {
+                if session_id.is_empty() {
+                    eprintln!("usage: wtclaude session-worktree SESSION_ID");
+                    std::process::exit(1);
+                }
                 if let Err(e) = sessions::run_session_worktree(&session_id) {
                     eprintln!("error: {}", e);
                     std::process::exit(1);

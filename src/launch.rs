@@ -21,7 +21,18 @@ pub enum SbplBreakage {
 
 /// Launch a sandboxed Claude session in a worktree for WORKTREE_NAME.
 #[derive(Parser)]
-#[command(name = "wtclaude")]
+#[command(
+    name = "wtclaude",
+    after_help = "Other commands:\n  \
+                  wtclaude headless [OPTIONS] [PROMPT]...  (sandboxed, non-interactive run against cwd)\n  \
+                  wtclaude session-worktree SESSION_ID     (print worktree name for a session)\n  \
+                  wtclaude hook                            (invoked internally as a PreToolUse hook)\n  \
+                  wtclaude sessions                        (list recent sessions for completion)\n  \
+                  wtclaude worktrees                       (list worktrees for completion)\n  \
+                  wtclaude modes                           (list modes for completion)\n  \
+                  wtclaude --completions zsh                (print zsh completion script)\n\n\
+                  Run `wtclaude <command> --help` for details on a specific command."
+)]
 pub struct Args {
     /// Operation mode (see wtclaude.yml)
     #[arg(long)]
@@ -30,18 +41,19 @@ pub struct Args {
     #[arg(long)]
     pub no_pull: bool,
     /// Resume a previous session
-    #[arg(long)]
+    #[arg(long, value_name = "SESSION_ID")]
     pub resume: Option<String>,
     /// Print the generated sandbox policy before launching
     #[arg(long)]
     pub show_policy: bool,
     /// Inject sandbox policy breakage for testing
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, value_name = "TYPE")]
     pub test_sbpl_breakage: Option<SbplBreakage>,
     /// Name of the worktree/branch to launch
     #[arg(value_name = "WORKTREE_NAME")]
     pub name: String,
-    /// Initial prompt to hand to claude
+    /// Initial prompt to hand to claude (use `--` to pass prompt text that
+    /// starts with a hyphen)
     #[arg(value_name = "INITIAL_PROMPT")]
     prompt_parts: Vec<String>,
 }
@@ -189,26 +201,31 @@ fn sandbox_warning_common() -> &'static str {
      substitution pattern."
 }
 
-/// Run a sandboxed, non-interactive claude session against the current directory.
+// Note: this struct's own doc comment / #[command(...)] attributes are
+// inert when used as the `Commands::Headless` subcommand variant in
+// main.rs — that variant's doc comment supplies the `--help` about text.
 #[derive(Parser)]
-#[command(name = "wtclaude headless")]
 pub struct HeadlessArgs {
     /// Operation mode (see wtclaude.yml)
     #[arg(long)]
     mode: Option<String>,
     /// Resume a previous session
-    #[arg(long)]
+    #[arg(long, value_name = "SESSION_ID")]
     resume: Option<String>,
     /// Print the generated sandbox policy to stderr before launching
     #[arg(long)]
     show_policy: bool,
     /// Output format to pass through to `claude --print`
-    #[arg(long)]
+    #[arg(long, value_name = "FORMAT")]
     output_format: Option<String>,
     /// Pass --include-partial-messages through to `claude --print`
     #[arg(long)]
     include_partial_messages: bool,
-    /// Prompt to hand to claude (read from stdin if omitted)
+    /// Pass --verbose through to `claude --print`
+    #[arg(long)]
+    verbose: bool,
+    /// Prompt to hand to claude (read from stdin if omitted; use `--` to
+    /// pass prompt text that starts with a hyphen)
     #[arg(value_name = "PROMPT")]
     prompt_parts: Vec<String>,
 }
@@ -282,6 +299,9 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     }
     if args.include_partial_messages {
         cmd.arg("--include-partial-messages");
+    }
+    if args.verbose {
+        cmd.arg("--verbose");
     }
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
@@ -1113,6 +1133,87 @@ mod tests {
 }
 
 #[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> std::result::Result<Args, clap::Error> {
+        let mut full = vec!["wtclaude"];
+        full.extend_from_slice(args);
+        Args::try_parse_from(full)
+    }
+
+    #[test]
+    fn parse_args_defaults_are_empty() {
+        let parsed = parse(&["myworktree"]).unwrap();
+        assert_eq!(parsed.name, "myworktree");
+        assert!(parsed.mode.is_none());
+        assert!(!parsed.no_pull);
+        assert!(parsed.resume.is_none());
+        assert!(!parsed.show_policy);
+        assert!(parsed.test_sbpl_breakage.is_none());
+        assert!(parsed.prompt().is_none());
+    }
+
+    #[test]
+    fn parse_args_errors_on_missing_worktree_name() {
+        assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_args_captures_no_pull() {
+        let parsed = parse(&["--no-pull", "myworktree"]).unwrap();
+        assert!(parsed.no_pull);
+    }
+
+    #[test]
+    fn parse_args_joins_interleaved_flags_and_prompt() {
+        let parsed = parse(&[
+            "--mode",
+            "fast",
+            "myworktree",
+            "do",
+            "the",
+            "thing",
+            "--resume",
+            "abc",
+        ])
+        .unwrap();
+        assert_eq!(parsed.mode.as_deref(), Some("fast"));
+        assert_eq!(parsed.name, "myworktree");
+        assert_eq!(parsed.prompt().as_deref(), Some("do the thing"));
+        assert_eq!(parsed.resume.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn parse_args_accepts_hyphen_leading_prompt_text_after_dash_dash() {
+        let parsed = parse(&["myworktree", "--", "-1 fix this"]).unwrap();
+        assert_eq!(parsed.prompt().as_deref(), Some("-1 fix this"));
+    }
+
+    #[test]
+    fn parse_args_accepts_test_sbpl_breakage_values() {
+        let hide = parse(&["--test-sbpl-breakage", "hide", "myworktree"]).unwrap();
+        assert!(matches!(hide.test_sbpl_breakage, Some(SbplBreakage::Hide)));
+
+        let missing = parse(&["--test-sbpl-breakage", "missing", "myworktree"]).unwrap();
+        assert!(matches!(
+            missing.test_sbpl_breakage,
+            Some(SbplBreakage::Missing)
+        ));
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_test_sbpl_breakage_value() {
+        assert!(parse(&["--test-sbpl-breakage", "bogus", "myworktree"]).is_err());
+    }
+
+    #[test]
+    fn parse_args_errors_on_unknown_flag() {
+        assert!(parse(&["--nonsense", "myworktree"]).is_err());
+    }
+}
+
+#[cfg(test)]
 mod headless_tests {
     use super::*;
 
@@ -1129,6 +1230,16 @@ mod headless_tests {
         assert_eq!(parsed.prompt().as_deref(), Some("do the thing"));
         assert_eq!(parsed.resume.as_deref(), Some("abc"));
         assert!(!parsed.show_policy);
+    }
+
+    #[test]
+    fn parse_headless_args_accepts_hyphen_leading_prompt_text_after_dash_dash() {
+        // A prompt that itself starts with a hyphen (e.g. "-1 fix this")
+        // looks like an unknown flag to clap; per clap convention (and its
+        // own error tip), `--` escapes the rest of argv as literal values.
+        let parsed = parse(&["--mode", "fast", "--", "-1 fix this"]).unwrap();
+        assert_eq!(parsed.mode.as_deref(), Some("fast"));
+        assert_eq!(parsed.prompt().as_deref(), Some("-1 fix this"));
     }
 
     #[test]
@@ -1162,6 +1273,7 @@ mod headless_tests {
         assert!(!parsed.show_policy);
         assert!(parsed.output_format.is_none());
         assert!(!parsed.include_partial_messages);
+        assert!(!parsed.verbose);
     }
 
     #[test]
@@ -1180,6 +1292,13 @@ mod headless_tests {
     fn parse_headless_args_captures_include_partial_messages() {
         let parsed = parse(&["--include-partial-messages", "hello"]).unwrap();
         assert!(parsed.include_partial_messages);
+        assert_eq!(parsed.prompt().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_headless_args_captures_verbose() {
+        let parsed = parse(&["--verbose", "hello"]).unwrap();
+        assert!(parsed.verbose);
         assert_eq!(parsed.prompt().as_deref(), Some("hello"));
     }
 }
