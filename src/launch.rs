@@ -19,20 +19,12 @@ pub enum SbplBreakage {
     Missing,
 }
 
+// main.rs injects an after_help listing the other subcommands (built live
+// from the `Commands` enum) before parsing, so this struct's own `--help`
+// documents the full command surface without hand-duplicating it here.
 /// Launch a sandboxed Claude session in a worktree for WORKTREE_NAME.
 #[derive(Parser)]
-#[command(
-    name = "wtclaude",
-    after_help = "Other commands:\n  \
-                  wtclaude headless [OPTIONS] [PROMPT]...  (sandboxed, non-interactive run against cwd)\n  \
-                  wtclaude session-worktree SESSION_ID     (print worktree name for a session)\n  \
-                  wtclaude hook                            (invoked internally as a PreToolUse hook)\n  \
-                  wtclaude sessions                        (list recent sessions for completion)\n  \
-                  wtclaude worktrees                       (list worktrees for completion)\n  \
-                  wtclaude modes                           (list modes for completion)\n  \
-                  wtclaude --completions zsh                (print zsh completion script)\n\n\
-                  Run `wtclaude <command> --help` for details on a specific command."
-)]
+#[command(name = "wtclaude")]
 pub struct Args {
     /// Operation mode (see wtclaude.yml)
     #[arg(long)]
@@ -43,7 +35,7 @@ pub struct Args {
     /// Resume a previous session
     #[arg(long, value_name = "SESSION_ID")]
     pub resume: Option<String>,
-    /// Print the generated sandbox policy before launching
+    /// Print the generated sandbox policy and pause for Enter before launching
     #[arg(long)]
     pub show_policy: bool,
     /// Inject sandbox policy breakage for testing
@@ -73,7 +65,6 @@ pub fn run(args: Args) -> Result<i32> {
     let config = config::load()?;
     let mode = args
         .mode
-        .clone()
         .or_else(|| std::env::var("WTCLAUDE_DEFAULT_MODE").ok())
         .unwrap_or_else(|| config.default_mode.clone());
     let mode_config = config
@@ -201,9 +192,11 @@ fn sandbox_warning_common() -> &'static str {
      substitution pattern."
 }
 
-// Note: this struct's own doc comment / #[command(...)] attributes are
-// inert when used as the `Commands::Headless` subcommand variant in
-// main.rs — that variant's doc comment supplies the `--help` about text.
+// Note: when used as the `Commands::Headless` subcommand variant in
+// main.rs, that variant's own doc comment overrides this struct's `name`/
+// `about` (i.e. this struct's doc comment is inert there) — but other
+// #[command(...)] attributes on this struct, if added, would still apply
+// via clap's augment_args.
 #[derive(Parser)]
 pub struct HeadlessArgs {
     /// Operation mode (see wtclaude.yml)
@@ -245,7 +238,6 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     let config = config::load()?;
     let mode = args
         .mode
-        .clone()
         .or_else(|| std::env::var("WTCLAUDE_DEFAULT_MODE").ok())
         .unwrap_or_else(|| config.default_mode.clone());
     let mode_config = config

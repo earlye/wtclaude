@@ -3,7 +3,7 @@ mod hook;
 mod launch;
 mod sessions;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use launch::{Args as LaunchArgs, HeadlessArgs};
 
 #[derive(Parser)]
@@ -27,7 +27,11 @@ enum Commands {
     /// reads PROMPT from stdin if omitted)
     Headless(HeadlessArgs),
     /// Print the worktree name for a session
-    SessionWorktree { session_id: String },
+    SessionWorktree {
+        /// Session ID to resolve to a worktree name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        session_id: String,
+    },
 }
 
 fn main() {
@@ -96,10 +100,6 @@ fn main() {
                 }
             },
             Commands::SessionWorktree { session_id } => {
-                if session_id.is_empty() {
-                    eprintln!("usage: wtclaude session-worktree SESSION_ID");
-                    std::process::exit(1);
-                }
                 if let Err(e) = sessions::run_session_worktree(&session_id) {
                     eprintln!("error: {}", e);
                     std::process::exit(1);
@@ -109,7 +109,11 @@ fn main() {
         return;
     }
 
-    match LaunchArgs::try_parse_from(&raw_args) {
+    let launch_command = LaunchArgs::command().after_help(build_after_help());
+    match launch_command
+        .try_get_matches_from(&raw_args)
+        .and_then(|matches| LaunchArgs::from_arg_matches(&matches))
+    {
         Ok(parsed) => match launch::run(parsed) {
             Ok(code) => std::process::exit(code),
             Err(e) => {
@@ -119,6 +123,38 @@ fn main() {
         },
         Err(e) => e.exit(),
     }
+}
+
+/// Lists the other subcommands (name + about, pulled live from `Commands`)
+/// so `wtclaude --help` documents the full command surface without
+/// hand-duplicating it — the one exception is `--completions zsh`, which
+/// isn't a `Commands` variant (it's intercepted before clap ever runs).
+fn build_after_help() -> String {
+    let entries: Vec<(String, String)> = Cli::command()
+        .get_subcommands()
+        .map(|sub| {
+            (
+                sub.get_name().to_string(),
+                sub.get_about().map(|a| a.to_string()).unwrap_or_default(),
+            )
+        })
+        .chain(std::iter::once((
+            "--completions zsh".to_string(),
+            "Print the zsh completion script".to_string(),
+        )))
+        .collect();
+    let width = entries
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut help = String::from("Other commands:\n");
+    for (name, about) in &entries {
+        help.push_str(&format!("  wtclaude {name:width$}  {about}\n"));
+    }
+    help.push_str("\nRun `wtclaude <command> --help` for details on a specific command.");
+    help
 }
 
 fn print_completions_zsh() {

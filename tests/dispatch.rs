@@ -45,17 +45,16 @@ fn session_worktree_with_no_arg_errors_via_clap() {
 }
 
 #[test]
-fn session_worktree_with_empty_arg_errors_explicitly() {
+fn session_worktree_with_empty_arg_errors_via_clap() {
+    // NonEmptyStringValueParser rejects "" the same way it rejects a
+    // missing value, so this must not silently succeed (it did briefly
+    // during development, before the value_parser was added).
     let output = run(&["session-worktree", ""]);
     assert!(
         !output.status.success(),
         "empty SESSION_ID must not silently succeed"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("usage: wtclaude session-worktree SESSION_ID"),
-        "stderr: {stderr}"
-    );
+    assert_eq!(output.status.code(), Some(2), "clap usage errors exit 2");
 }
 
 #[test]
