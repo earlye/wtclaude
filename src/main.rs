@@ -158,7 +158,7 @@ fn print_usage() {
         "usage: wtclaude [--mode MODE] [--resume SESSION_ID] [--test-sbpl-breakage hide|missing] WORKTREE_NAME [INITIAL_PROMPT]"
     );
     eprintln!(
-        "       wtclaude headless [--mode MODE] [--resume SESSION_ID] [--show-policy] [--output-format FORMAT] [PROMPT]"
+        "       wtclaude headless [--mode MODE] [--resume SESSION_ID] [--show-policy] [--output-format FORMAT] [--include-partial-messages] [PROMPT]"
     );
     eprintln!(
         "                     (sandboxed, non-interactive run against cwd; no worktree/branch created; reads PROMPT from stdin if omitted)"

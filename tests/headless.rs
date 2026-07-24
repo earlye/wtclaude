@@ -196,6 +196,10 @@ fn headless_subcommand_places_resume_and_print_flags_and_forwards_prompt() {
         !logged_args.contains(&"--output-format"),
         "expected --output-format to be omitted when not requested, got {logged_args:?}"
     );
+    assert!(
+        !logged_args.contains(&"--include-partial-messages"),
+        "expected --include-partial-messages to be omitted when not requested, got {logged_args:?}"
+    );
 }
 
 #[test]
@@ -237,5 +241,46 @@ fn headless_subcommand_forwards_output_format_to_claude() {
         .position(|a| *a == "--output-format")
         .expect("--output-format should be present in claude's argv");
     assert_eq!(logged_args.get(output_format_pos + 1), Some(&"json"));
+    assert_eq!(logged_args.last(), Some(&"hello there"));
+}
+
+#[test]
+fn headless_subcommand_forwards_include_partial_messages_to_claude() {
+    let repo = git_init_dir("include-partial-messages-repo");
+    let home = unique_temp_dir("include-partial-messages-home");
+    let stub_dir = unique_temp_dir("include-partial-messages-stub");
+    let log_path = stub_dir.join("argv.log");
+    make_executable_script(
+        &stub_dir.join("claude"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGV_LOG_PATH\"\nexit 0\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["headless", "--include-partial-messages", "hello there"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("PATH", stub_path_env(&stub_dir))
+        .env("ARGV_LOG_PATH", &log_path)
+        .output()
+        .expect("failed to spawn wtclaude");
+
+    let logged = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        panic!("reading argv log at {}: {e}", log_path.display());
+    });
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&stub_dir).ok();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let logged_args: Vec<&str> = logged.lines().collect();
+    assert!(
+        logged_args.contains(&"--include-partial-messages"),
+        "--include-partial-messages should be present in claude's argv, got {logged_args:?}"
+    );
     assert_eq!(logged_args.last(), Some(&"hello there"));
 }

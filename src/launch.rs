@@ -230,6 +230,7 @@ pub struct HeadlessArgs {
     resume: Option<String>,
     show_policy: bool,
     output_format: Option<String>,
+    include_partial_messages: bool,
 }
 
 pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
@@ -239,6 +240,7 @@ pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
     let mut resume = None;
     let mut show_policy = false;
     let mut output_format = None;
+    let mut include_partial_messages = false;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -253,6 +255,9 @@ pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
             }
             "--output-format" => {
                 output_format = Some(iter.next().context("--output-format requires a value")?);
+            }
+            "--include-partial-messages" => {
+                include_partial_messages = true;
             }
             _ if arg.starts_with("--") => {
                 bail!("unknown flag: {}", arg);
@@ -275,6 +280,7 @@ pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
         resume,
         show_policy,
         output_format,
+        include_partial_messages,
     })
 }
 
@@ -332,6 +338,9 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     cmd.arg("--print");
     if let Some(output_format) = args.output_format {
         cmd.arg("--output-format").arg(output_format);
+    }
+    if args.include_partial_messages {
+        cmd.arg("--include-partial-messages");
     }
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
@@ -1209,6 +1218,7 @@ mod headless_tests {
         assert!(parsed.resume.is_none());
         assert!(!parsed.show_policy);
         assert!(parsed.output_format.is_none());
+        assert!(!parsed.include_partial_messages);
     }
 
     #[test]
@@ -1221,5 +1231,12 @@ mod headless_tests {
     #[test]
     fn parse_headless_args_errors_on_missing_output_format_value() {
         assert!(parse(&["--output-format"]).is_err());
+    }
+
+    #[test]
+    fn parse_headless_args_captures_include_partial_messages() {
+        let parsed = parse(&["--include-partial-messages", "hello"]).unwrap();
+        assert!(parsed.include_partial_messages);
+        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
     }
 }
