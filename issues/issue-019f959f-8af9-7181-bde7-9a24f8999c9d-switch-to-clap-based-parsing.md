@@ -59,3 +59,11 @@ get validation, `--help` generation, and shell completions for free.
   flag-taking subcommands, ~5 simple no-arg ones), so migrating incrementally
   would leave hand-rolled and clap parsing coexisting indefinitely, undercutting
   the point of migrating at all (consistent validation/`--help`/completions).
+- Q: Keep the current hand-written dynamic zsh completion script, or switch to
+  `clap_complete`? — A: Keep the custom script (`print_completions_zsh` in
+  `main.rs`) as-is. It does live completion — shelling out to `wtclaude
+  sessions`/`worktrees`/`modes` at completion time to suggest real session
+  IDs, worktree names, and modes. `clap_complete` only generates static
+  completions and cannot replicate that runtime behavior, so switching would
+  be a regression. Migrating arg parsing to clap does not require touching
+  completions at all.
