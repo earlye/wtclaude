@@ -40,15 +40,23 @@ get validation, `--help` generation, and shell completions for free.
 
 ## Next steps
 
-- Decide scope: migrate only headless args first, or the whole CLI (all
-  subcommands) in one pass.
-- Decide whether to keep `--completions zsh` as a custom subcommand or switch
-  to clap's standard completion generation flow.
-- Once scope is decided, revisit `issues/issue-019f959e-2450-7030-93dc-165c555689ae-headless-output-format-flag.md`
-  to implement `--output-format` on top of clap rather than the old manual parser.
-- `issues/issue-019f95be-1006-79b2-abc1-49e3b13b1bdc-headless-include-partial-messages-flag.md`
-  (new `--include-partial-messages` headless flag) is soft-blocked on this issue too —
-  build it against the clap-derived `HeadlessArgs` once this lands.
+Scope and approach are now decided (see Grill Log below). Concrete
+implementation steps:
+
+- Add `clap` to `Cargo.toml` (derive feature). Do **not** add `clap_complete`
+  — the existing hand-written zsh completion script stays as-is.
+- Convert `launch::Args`/`launch::parse_args` and
+  `launch::HeadlessArgs`/`launch::parse_headless_args` to clap derive structs.
+- Convert `main.rs`'s top-level dispatch to a clap derive `Subcommand` enum,
+  using an external-subcommand/catch-all (or first-token peek) so
+  `wtclaude WORKTREE_NAME [PROMPT]` keeps working with no keyword.
+- Update `tests/headless.rs` and `src/launch.rs`'s `headless_tests` (and any
+  equivalent interactive-path tests) to assert against clap's actual
+  error/usage output and exit codes, rather than today's hand-rolled wording.
+- Once this lands, revisit these two flag issues to implement them against
+  the new clap-derived `HeadlessArgs` instead of the old hand-rolled parser:
+  - `issues/issue-019f959e-2450-7030-93dc-165c555689ae-headless-output-format-flag.md` (already implemented against the old parser — will need porting)
+  - `issues/issue-019f95be-1006-79b2-abc1-49e3b13b1bdc-headless-include-partial-messages-flag.md` (not yet implemented)
 
 ## Grill Log
 
