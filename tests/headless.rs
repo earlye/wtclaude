@@ -192,6 +192,10 @@ fn headless_subcommand_places_resume_and_print_flags_and_forwards_prompt() {
         "expected --resume before --print, got {logged_args:?}"
     );
     assert_eq!(logged_args.last(), Some(&"hello there"));
+    assert!(
+        !logged_args.contains(&"--output-format"),
+        "expected --output-format to be omitted when not requested, got {logged_args:?}"
+    );
 }
 
 #[test]
