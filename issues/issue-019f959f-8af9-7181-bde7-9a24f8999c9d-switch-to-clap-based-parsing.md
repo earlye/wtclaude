@@ -46,3 +46,16 @@ get validation, `--help` generation, and shell completions for free.
   to clap's standard completion generation flow.
 - Once scope is decided, revisit `issues/issue-019f959e-2450-7030-93dc-165c555689ae-headless-output-format-flag.md`
   to implement `--output-format` on top of clap rather than the old manual parser.
+
+## Grill Log
+
+### 2026-07-24
+
+- Q: Migrate only headless args to clap, or the whole CLI (interactive launch
+  path + top-level subcommand dispatch) in one pass? — A: Whole CLI in one
+  pass. `main.rs`'s top-level dispatch becomes a clap derive enum/subcommand
+  tree; both `parse_args` (interactive) and `parse_headless_args` (headless)
+  become clap derive structs. Rationale: the CLI surface is small (2
+  flag-taking subcommands, ~5 simple no-arg ones), so migrating incrementally
+  would leave hand-rolled and clap parsing coexisting indefinitely, undercutting
+  the point of migrating at all (consistent validation/`--help`/completions).
