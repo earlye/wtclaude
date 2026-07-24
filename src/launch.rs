@@ -229,6 +229,7 @@ pub struct HeadlessArgs {
     prompt: Option<String>,
     resume: Option<String>,
     show_policy: bool,
+    output_format: Option<String>,
 }
 
 pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
@@ -237,6 +238,7 @@ pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
     let mut prompt_parts: Vec<String> = Vec::new();
     let mut resume = None;
     let mut show_policy = false;
+    let mut output_format = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -248,6 +250,9 @@ pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
             }
             "--resume" => {
                 resume = Some(iter.next().context("--resume requires a session id")?);
+            }
+            "--output-format" => {
+                output_format = Some(iter.next().context("--output-format requires a value")?);
             }
             _ if arg.starts_with("--") => {
                 bail!("unknown flag: {}", arg);
@@ -269,6 +274,7 @@ pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
         prompt,
         resume,
         show_policy,
+        output_format,
     })
 }
 
@@ -324,6 +330,9 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
         cmd.arg("--resume").arg(session_id);
     }
     cmd.arg("--print");
+    if let Some(output_format) = args.output_format {
+        cmd.arg("--output-format").arg(output_format);
+    }
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     cmd.env("WTCLAUDE_SANDBOX", &canonical);
@@ -1199,5 +1208,18 @@ mod headless_tests {
         assert!(parsed.prompt.is_none());
         assert!(parsed.resume.is_none());
         assert!(!parsed.show_policy);
+        assert!(parsed.output_format.is_none());
+    }
+
+    #[test]
+    fn parse_headless_args_captures_output_format() {
+        let parsed = parse(&["--output-format", "json", "hello"]).unwrap();
+        assert_eq!(parsed.output_format.as_deref(), Some("json"));
+        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_headless_args_errors_on_missing_output_format_value() {
+        assert!(parse(&["--output-format"]).is_err());
     }
 }
