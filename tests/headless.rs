@@ -63,12 +63,12 @@ fn headless_subcommand_prints_usage_on_parse_error() {
         .expect("failed to spawn wtclaude");
     std::fs::remove_dir_all(&dir).ok();
     assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2), "clap usage errors exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--mode requires a value"),
+        stderr.contains("a value is required for '--mode <MODE>'"),
         "stderr: {stderr}"
     );
-    assert!(stderr.contains("usage: wtclaude"), "stderr: {stderr}");
 }
 
 // The following tests exercise the actual `claude` subprocess invocation
@@ -281,6 +281,47 @@ fn headless_subcommand_forwards_include_partial_messages_to_claude() {
     assert!(
         logged_args.contains(&"--include-partial-messages"),
         "--include-partial-messages should be present in claude's argv, got {logged_args:?}"
+    );
+    assert_eq!(logged_args.last(), Some(&"hello there"));
+}
+
+#[test]
+fn headless_subcommand_forwards_verbose_to_claude() {
+    let repo = git_init_dir("verbose-repo");
+    let home = unique_temp_dir("verbose-home");
+    let stub_dir = unique_temp_dir("verbose-stub");
+    let log_path = stub_dir.join("argv.log");
+    make_executable_script(
+        &stub_dir.join("claude"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ARGV_LOG_PATH\"\nexit 0\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["headless", "--verbose", "hello there"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("PATH", stub_path_env(&stub_dir))
+        .env("ARGV_LOG_PATH", &log_path)
+        .output()
+        .expect("failed to spawn wtclaude");
+
+    let logged = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        panic!("reading argv log at {}: {e}", log_path.display());
+    });
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&stub_dir).ok();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let logged_args: Vec<&str> = logged.lines().collect();
+    assert!(
+        logged_args.contains(&"--verbose"),
+        "--verbose should be present in claude's argv, got {logged_args:?}"
     );
     assert_eq!(logged_args.last(), Some(&"hello there"));
 }

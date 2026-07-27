@@ -3,93 +3,158 @@ mod hook;
 mod launch;
 mod sessions;
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use launch::{Args as LaunchArgs, HeadlessArgs};
 
-    match args.first().map(|s| s.as_str()) {
-        Some("hook") => {
-            if let Err(e) = hook::run() {
-                eprintln!("hook error: {}", e);
+#[derive(Parser)]
+#[command(name = "wtclaude", disable_help_subcommand = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Invoked internally as a PreToolUse hook
+    Hook,
+    /// List recent sessions for completion
+    Sessions,
+    /// List worktrees for completion
+    Worktrees,
+    /// List modes for completion
+    Modes,
+    /// Sandboxed, non-interactive run against cwd (no worktree/branch created;
+    /// reads PROMPT from stdin if omitted)
+    Headless(HeadlessArgs),
+    /// Print the worktree name for a session
+    SessionWorktree {
+        /// Session ID to resolve to a worktree name
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        session_id: String,
+    },
+}
+
+fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+    let first = raw_args.get(1).map(|s| s.as_str());
+
+    if first == Some("--completions") {
+        match raw_args.get(2).map(|s| s.as_str()) {
+            Some("zsh") => print_completions_zsh(),
+            Some(other) => {
+                eprintln!("unsupported shell: {}. Supported: zsh", other);
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("usage: wtclaude --completions zsh");
                 std::process::exit(1);
             }
         }
-        Some("sessions") => {
-            if let Err(e) = sessions::run_sessions() {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Some("worktrees") => {
-            if let Err(e) = sessions::run_worktrees() {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Some("modes") => {
-            if let Err(e) = sessions::run_modes() {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Some("headless") => {
-            let rest = args[1..].to_vec();
-            match launch::parse_headless_args(rest) {
-                Ok(parsed) => match launch::run_headless(parsed) {
-                    Ok(code) => std::process::exit(code),
-                    Err(e) => {
-                        eprintln!("error: {:#}", e);
-                        std::process::exit(1);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("error: {:#}", e);
-                    print_usage();
+        return;
+    }
+
+    // Peek at the first token to decide whether this looks like one of the
+    // known subcommand keywords (in which case route through the Cli
+    // subcommand tree) or the bare `wtclaude WORKTREE_NAME [PROMPT]` launch
+    // form (which has no keyword and must fall through to LaunchArgs).
+    // Derived from Cli itself so the keyword list can't drift out of sync
+    // with `enum Commands`. Deliberately excludes --help/-h: those fall
+    // through to LaunchArgs so `wtclaude --help` documents the primary,
+    // most-frequently-used invocation form (see Args's after_help for the
+    // rest of the command surface).
+    let known_subcommand = Cli::command()
+        .get_subcommands()
+        .any(|c| first == Some(c.get_name()));
+
+    if known_subcommand {
+        match Cli::parse().command {
+            Commands::Hook => {
+                if let Err(e) = hook::run() {
+                    eprintln!("hook error: {}", e);
                     std::process::exit(1);
                 }
             }
-        }
-        Some("session-worktree") => {
-            let session_id = args.get(1).map(|s| s.as_str()).unwrap_or("");
-            if session_id.is_empty() {
-                eprintln!("usage: wtclaude session-worktree SESSION_ID");
-                std::process::exit(1);
-            }
-            if let Err(e) = sessions::run_session_worktree(session_id) {
-                eprintln!("error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Some("--completions") => {
-            match args.get(1).map(|s| s.as_str()) {
-                Some("zsh") => print_completions_zsh(),
-                Some(other) => {
-                    eprintln!("unsupported shell: {}. Supported: zsh", other);
-                    std::process::exit(1);
-                }
-                None => {
-                    eprintln!("usage: wtclaude --completions zsh");
-                    std::process::exit(1);
-                }
-            }
-        }
-        Some("--help") | Some("-h") => {
-            print_usage();
-        }
-        _ => match launch::parse_args(args) {
-            Ok(parsed) => match launch::run(parsed) {
-                Ok(code) => std::process::exit(code),
-                Err(e) => {
+            Commands::Sessions => {
+                if let Err(e) = sessions::run_sessions() {
                     eprintln!("error: {}", e);
                     std::process::exit(1);
                 }
+            }
+            Commands::Worktrees => {
+                if let Err(e) = sessions::run_worktrees() {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            Commands::Modes => {
+                if let Err(e) = sessions::run_modes() {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            Commands::Headless(parsed) => match launch::run_headless(parsed) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {:#}", e);
+                    std::process::exit(1);
+                }
             },
+            Commands::SessionWorktree { session_id } => {
+                if let Err(e) = sessions::run_session_worktree(&session_id) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        return;
+    }
+
+    let launch_command = LaunchArgs::command().after_help(build_after_help());
+    match launch_command
+        .try_get_matches_from(&raw_args)
+        .and_then(|matches| LaunchArgs::from_arg_matches(&matches))
+    {
+        Ok(parsed) => match launch::run(parsed) {
+            Ok(code) => std::process::exit(code),
             Err(e) => {
                 eprintln!("error: {}", e);
-                print_usage();
                 std::process::exit(1);
             }
         },
+        Err(e) => e.exit(),
     }
+}
+
+/// Lists the other subcommands (name + about, pulled live from `Commands`)
+/// so `wtclaude --help` documents the full command surface without
+/// hand-duplicating it — the one exception is `--completions zsh`, which
+/// isn't a `Commands` variant (it's intercepted before clap ever runs).
+fn build_after_help() -> String {
+    let entries: Vec<(String, String)> = Cli::command()
+        .get_subcommands()
+        .map(|sub| {
+            (
+                sub.get_name().to_string(),
+                sub.get_about().map(|a| a.to_string()).unwrap_or_default(),
+            )
+        })
+        .chain(std::iter::once((
+            "--completions zsh".to_string(),
+            "Print the zsh completion script".to_string(),
+        )))
+        .collect();
+    let width = entries
+        .iter()
+        .map(|(name, _)| name.len())
+        .max()
+        .unwrap_or(0);
+
+    let mut help = String::from("Other commands:\n");
+    for (name, about) in &entries {
+        help.push_str(&format!("  wtclaude {name:width$}  {about}\n"));
+    }
+    help.push_str("\nRun `wtclaude <command> --help` for details on a specific command.");
+    help
 }
 
 fn print_completions_zsh() {
@@ -151,21 +216,4 @@ _wtclaude() {{
 compdef _wtclaude wtclaude
 "#
     );
-}
-
-fn print_usage() {
-    eprintln!(
-        "usage: wtclaude [--mode MODE] [--resume SESSION_ID] [--test-sbpl-breakage hide|missing] WORKTREE_NAME [INITIAL_PROMPT]"
-    );
-    eprintln!(
-        "       wtclaude headless [--mode MODE] [--resume SESSION_ID] [--show-policy] [--output-format FORMAT] [--include-partial-messages] [PROMPT]"
-    );
-    eprintln!(
-        "                     (sandboxed, non-interactive run against cwd; no worktree/branch created; reads PROMPT from stdin if omitted)"
-    );
-    eprintln!("       wtclaude --completions zsh   (print zsh completion script)");
-    eprintln!("       wtclaude hook                (invoked internally as a PreToolUse hook)");
-    eprintln!("       wtclaude sessions            (list recent sessions for completion)");
-    eprintln!("       wtclaude worktrees           (list worktrees for completion)");
-    eprintln!("       wtclaude session-worktree SESSION_ID  (print worktree name for a session)");
 }

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,91 +13,58 @@ impl Drop for TempFile {
 
 use crate::config;
 
-pub enum SbplBreakage {
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SbplBreakage {
     Hide,
     Missing,
 }
 
+// main.rs injects an after_help listing the other subcommands (built live
+// from the `Commands` enum) before parsing, so this struct's own `--help`
+// documents the full command surface without hand-duplicating it here.
+/// Launch a sandboxed Claude session in a worktree for WORKTREE_NAME.
+#[derive(Parser)]
+#[command(name = "wtclaude")]
 pub struct Args {
-    pub mode: Option<String>,
-    pub name: String,
-    pub no_pull: bool,
-    pub prompt: Option<String>,
-    pub resume: Option<String>,
-    pub show_policy: bool,
-    pub test_sbpl_breakage: Option<SbplBreakage>,
+    /// Operation mode (see wtclaude.yml)
+    #[arg(long)]
+    mode: Option<String>,
+    /// Skip git pull before launch
+    #[arg(long)]
+    no_pull: bool,
+    /// Resume a previous session
+    #[arg(long, value_name = "SESSION_ID")]
+    resume: Option<String>,
+    /// Print the generated sandbox policy and pause for Enter before launching
+    #[arg(long)]
+    show_policy: bool,
+    /// Inject sandbox policy breakage for testing
+    #[arg(long, value_enum, value_name = "TYPE")]
+    test_sbpl_breakage: Option<SbplBreakage>,
+    /// Name of the worktree/branch to launch
+    #[arg(value_name = "WORKTREE_NAME")]
+    name: String,
+    /// Initial prompt to hand to claude (use `--` to pass prompt text that
+    /// starts with a hyphen)
+    #[arg(value_name = "INITIAL_PROMPT")]
+    prompt_parts: Vec<String>,
 }
 
-pub fn parse_args(raw: Vec<String>) -> Result<Args> {
-    let mut iter = raw.into_iter().peekable();
-    let mut mode = None;
-    let mut name = None;
-    let mut no_pull = false;
-    let mut prompt_parts: Vec<String> = Vec::new();
-    let mut resume = None;
-    let mut show_policy = false;
-    let mut test_sbpl_breakage = None;
-
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--mode" => {
-                mode = Some(iter.next().context("--mode requires a value")?);
-            }
-            "--no-pull" => {
-                no_pull = true;
-            }
-            "--show-policy" => {
-                show_policy = true;
-            }
-            "--resume" => {
-                resume = Some(iter.next().context("--resume requires a session id")?);
-            }
-            "--test-sbpl-breakage" => {
-                let val = iter
-                    .next()
-                    .context("--test-sbpl-breakage requires a value")?;
-                test_sbpl_breakage = Some(match val.as_str() {
-                    "hide" => SbplBreakage::Hide,
-                    "missing" => SbplBreakage::Missing,
-                    other => bail!(
-                        "--test-sbpl-breakage must be 'hide' or 'missing', got '{}'",
-                        other
-                    ),
-                });
-            }
-            _ if arg.starts_with("--") => {
-                bail!("unknown flag: {}", arg);
-            }
-            _ if name.is_none() => {
-                name = Some(arg);
-            }
-            _ => {
-                prompt_parts.push(arg);
-            }
+impl Args {
+    fn prompt(&self) -> Option<String> {
+        if self.prompt_parts.is_empty() {
+            None
+        } else {
+            Some(self.prompt_parts.join(" "))
         }
     }
-
-    let name = name.context("worktree name is required")?;
-    let prompt = if prompt_parts.is_empty() {
-        None
-    } else {
-        Some(prompt_parts.join(" "))
-    };
-
-    Ok(Args {
-        mode,
-        name,
-        no_pull,
-        prompt,
-        resume,
-        show_policy,
-        test_sbpl_breakage,
-    })
 }
 
 pub fn run(args: Args) -> Result<i32> {
+    let prompt = args.prompt();
     let config = config::load()?;
-    let mode = args.mode
+    let mode = args
+        .mode
         .or_else(|| std::env::var("WTCLAUDE_DEFAULT_MODE").ok())
         .unwrap_or_else(|| config.default_mode.clone());
     let mode_config = config
@@ -186,7 +154,7 @@ pub fn run(args: Args) -> Result<i32> {
             );
         }
     }
-    if let Some(p) = args.prompt {
+    if let Some(p) = prompt {
         cmd.arg(p);
     }
 
@@ -224,67 +192,49 @@ fn sandbox_warning_common() -> &'static str {
      substitution pattern."
 }
 
+// Note: when used as the `Commands::Headless` subcommand variant in
+// main.rs, that variant's own doc comment overrides this struct's `name`/
+// `about` (i.e. this struct's doc comment is inert there) — but other
+// #[command(...)] attributes on this struct, if added, would still apply
+// via clap's augment_args.
+#[derive(Parser)]
 pub struct HeadlessArgs {
+    /// Operation mode (see wtclaude.yml)
+    #[arg(long)]
     mode: Option<String>,
-    prompt: Option<String>,
+    /// Resume a previous session
+    #[arg(long, value_name = "SESSION_ID")]
     resume: Option<String>,
+    /// Print the generated sandbox policy to stderr before launching
+    #[arg(long)]
     show_policy: bool,
+    /// Output format to pass through to `claude --print`
+    #[arg(long, value_name = "FORMAT")]
     output_format: Option<String>,
+    /// Pass --include-partial-messages through to `claude --print`
+    #[arg(long)]
     include_partial_messages: bool,
+    /// Pass --verbose through to `claude --print`
+    #[arg(long)]
+    verbose: bool,
+    /// Prompt to hand to claude (read from stdin if omitted; use `--` to
+    /// pass prompt text that starts with a hyphen)
+    #[arg(value_name = "PROMPT")]
+    prompt_parts: Vec<String>,
 }
 
-pub fn parse_headless_args(raw: Vec<String>) -> Result<HeadlessArgs> {
-    let mut iter = raw.into_iter().peekable();
-    let mut mode = None;
-    let mut prompt_parts: Vec<String> = Vec::new();
-    let mut resume = None;
-    let mut show_policy = false;
-    let mut output_format = None;
-    let mut include_partial_messages = false;
-
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--mode" => {
-                mode = Some(iter.next().context("--mode requires a value")?);
-            }
-            "--show-policy" => {
-                show_policy = true;
-            }
-            "--resume" => {
-                resume = Some(iter.next().context("--resume requires a session id")?);
-            }
-            "--output-format" => {
-                output_format = Some(iter.next().context("--output-format requires a value")?);
-            }
-            "--include-partial-messages" => {
-                include_partial_messages = true;
-            }
-            _ if arg.starts_with("--") => {
-                bail!("unknown flag: {}", arg);
-            }
-            _ => {
-                prompt_parts.push(arg);
-            }
+impl HeadlessArgs {
+    fn prompt(&self) -> Option<String> {
+        if self.prompt_parts.is_empty() {
+            None
+        } else {
+            Some(self.prompt_parts.join(" "))
         }
     }
-
-    let prompt = if prompt_parts.is_empty() {
-        None
-    } else {
-        Some(prompt_parts.join(" "))
-    };
-
-    Ok(HeadlessArgs {
-        mode,
-        prompt,
-        resume,
-        show_policy,
-        output_format,
-        include_partial_messages,
-    })
 }
 
 pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
+    let prompt = args.prompt();
     let config = config::load()?;
     let mode = args
         .mode
@@ -342,12 +292,15 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     if args.include_partial_messages {
         cmd.arg("--include-partial-messages");
     }
+    if args.verbose {
+        cmd.arg("--verbose");
+    }
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     cmd.env("WTCLAUDE_SANDBOX", &canonical);
     cmd.env("WTCLAUDE_REPO_ROOT", &repo_root);
     cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
-    if let Some(p) = args.prompt {
+    if let Some(p) = prompt {
         cmd.arg(p);
     }
 
@@ -1172,27 +1125,120 @@ mod tests {
 }
 
 #[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> std::result::Result<Args, clap::Error> {
+        let mut full = vec!["wtclaude"];
+        full.extend_from_slice(args);
+        Args::try_parse_from(full)
+    }
+
+    #[test]
+    fn parse_args_defaults_are_empty() {
+        let parsed = parse(&["myworktree"]).unwrap();
+        assert_eq!(parsed.name, "myworktree");
+        assert!(parsed.mode.is_none());
+        assert!(!parsed.no_pull);
+        assert!(parsed.resume.is_none());
+        assert!(!parsed.show_policy);
+        assert!(parsed.test_sbpl_breakage.is_none());
+        assert!(parsed.prompt().is_none());
+    }
+
+    #[test]
+    fn parse_args_errors_on_missing_worktree_name() {
+        assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_args_captures_no_pull() {
+        let parsed = parse(&["--no-pull", "myworktree"]).unwrap();
+        assert!(parsed.no_pull);
+    }
+
+    #[test]
+    fn parse_args_joins_interleaved_flags_and_prompt() {
+        let parsed = parse(&[
+            "--mode",
+            "fast",
+            "myworktree",
+            "do",
+            "the",
+            "thing",
+            "--resume",
+            "abc",
+        ])
+        .unwrap();
+        assert_eq!(parsed.mode.as_deref(), Some("fast"));
+        assert_eq!(parsed.name, "myworktree");
+        assert_eq!(parsed.prompt().as_deref(), Some("do the thing"));
+        assert_eq!(parsed.resume.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn parse_args_accepts_hyphen_leading_prompt_text_after_dash_dash() {
+        let parsed = parse(&["myworktree", "--", "-1 fix this"]).unwrap();
+        assert_eq!(parsed.prompt().as_deref(), Some("-1 fix this"));
+    }
+
+    #[test]
+    fn parse_args_accepts_test_sbpl_breakage_values() {
+        let hide = parse(&["--test-sbpl-breakage", "hide", "myworktree"]).unwrap();
+        assert!(matches!(hide.test_sbpl_breakage, Some(SbplBreakage::Hide)));
+
+        let missing = parse(&["--test-sbpl-breakage", "missing", "myworktree"]).unwrap();
+        assert!(matches!(
+            missing.test_sbpl_breakage,
+            Some(SbplBreakage::Missing)
+        ));
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_test_sbpl_breakage_value() {
+        assert!(parse(&["--test-sbpl-breakage", "bogus", "myworktree"]).is_err());
+    }
+
+    #[test]
+    fn parse_args_errors_on_unknown_flag() {
+        assert!(parse(&["--nonsense", "myworktree"]).is_err());
+    }
+}
+
+#[cfg(test)]
 mod headless_tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Result<HeadlessArgs> {
-        parse_headless_args(args.iter().map(|s| s.to_string()).collect())
+    fn parse(args: &[&str]) -> std::result::Result<HeadlessArgs, clap::Error> {
+        let mut full = vec!["wtclaude-headless"];
+        full.extend_from_slice(args);
+        HeadlessArgs::try_parse_from(full)
     }
 
     #[test]
     fn parse_headless_args_joins_interleaved_flags_and_prompt() {
         let parsed = parse(&["--mode", "fast", "do", "the", "thing", "--resume", "abc"]).unwrap();
         assert_eq!(parsed.mode.as_deref(), Some("fast"));
-        assert_eq!(parsed.prompt.as_deref(), Some("do the thing"));
+        assert_eq!(parsed.prompt().as_deref(), Some("do the thing"));
         assert_eq!(parsed.resume.as_deref(), Some("abc"));
         assert!(!parsed.show_policy);
+    }
+
+    #[test]
+    fn parse_headless_args_accepts_hyphen_leading_prompt_text_after_dash_dash() {
+        // A prompt that itself starts with a hyphen (e.g. "-1 fix this")
+        // looks like an unknown flag to clap; per clap convention (and its
+        // own error tip), `--` escapes the rest of argv as literal values.
+        let parsed = parse(&["--mode", "fast", "--", "-1 fix this"]).unwrap();
+        assert_eq!(parsed.mode.as_deref(), Some("fast"));
+        assert_eq!(parsed.prompt().as_deref(), Some("-1 fix this"));
     }
 
     #[test]
     fn parse_headless_args_show_policy_does_not_consume_a_value() {
         let parsed = parse(&["--show-policy", "explain this"]).unwrap();
         assert!(parsed.show_policy);
-        assert_eq!(parsed.prompt.as_deref(), Some("explain this"));
+        assert_eq!(parsed.prompt().as_deref(), Some("explain this"));
     }
 
     #[test]
@@ -1214,18 +1260,19 @@ mod headless_tests {
     fn parse_headless_args_defaults_are_empty() {
         let parsed = parse(&[]).unwrap();
         assert!(parsed.mode.is_none());
-        assert!(parsed.prompt.is_none());
+        assert!(parsed.prompt().is_none());
         assert!(parsed.resume.is_none());
         assert!(!parsed.show_policy);
         assert!(parsed.output_format.is_none());
         assert!(!parsed.include_partial_messages);
+        assert!(!parsed.verbose);
     }
 
     #[test]
     fn parse_headless_args_captures_output_format() {
         let parsed = parse(&["--output-format", "json", "hello"]).unwrap();
         assert_eq!(parsed.output_format.as_deref(), Some("json"));
-        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+        assert_eq!(parsed.prompt().as_deref(), Some("hello"));
     }
 
     #[test]
@@ -1237,6 +1284,13 @@ mod headless_tests {
     fn parse_headless_args_captures_include_partial_messages() {
         let parsed = parse(&["--include-partial-messages", "hello"]).unwrap();
         assert!(parsed.include_partial_messages);
-        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+        assert_eq!(parsed.prompt().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_headless_args_captures_verbose() {
+        let parsed = parse(&["--verbose", "hello"]).unwrap();
+        assert!(parsed.verbose);
+        assert_eq!(parsed.prompt().as_deref(), Some("hello"));
     }
 }
