@@ -447,6 +447,23 @@ fn ensure_worktree(worktree_path: &Path, name: &str, repo_root: &Path) -> Result
         return Ok(());
     }
 
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("is already checked out at") || stderr.contains("already used by worktree") {
+        let existing = find_worktree_for_branch(name, repo_root)?;
+        match existing {
+            Some(path) => bail!(
+                "branch '{name}' is already checked out in another worktree at {}\n\
+                 cd there instead, or pick a different branch name.",
+                path.display()
+            ),
+            None => bail!(
+                "branch '{name}' is already checked out in another worktree, \
+                 but its location could not be determined: {}",
+                stderr.trim()
+            ),
+        }
+    }
+
     // Try creating a new branch tracking the remote
     let remote_ref = format!("origin/{}", name);
     let out = Command::new("git")
@@ -475,6 +492,33 @@ fn ensure_worktree(worktree_path: &Path, name: &str, repo_root: &Path) -> Result
 
     let msg = String::from_utf8_lossy(&out.stderr);
     bail!("git worktree add failed: {}", msg.trim())
+}
+
+fn find_worktree_for_branch(name: &str, repo_root: &Path) -> Result<Option<PathBuf>> {
+    let output = Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo_root)
+        .output()
+        .context("git worktree list")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let target_ref = format!("refs/heads/{name}");
+
+    let mut current_path: Option<&str> = None;
+    for line in text.lines() {
+        if let Some(wt_path) = line.strip_prefix("worktree ") {
+            current_path = Some(wt_path);
+        } else if let Some(branch_ref) = line.strip_prefix("branch ") {
+            if branch_ref == target_ref {
+                if let Some(wt_path) = current_path {
+                    let canonical = PathBuf::from(wt_path)
+                        .canonicalize()
+                        .unwrap_or_else(|_| PathBuf::from(wt_path));
+                    return Ok(Some(canonical));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn is_registered_worktree(path: &Path, repo_root: &Path) -> Result<bool> {
@@ -1120,6 +1164,70 @@ mod tests {
         );
 
         run(&["worktree", "remove", "-f", worktree.to_str().unwrap()]);
+        std::fs::remove_dir_all(&main_repo).unwrap();
+    }
+
+    #[test]
+    fn ensure_worktree_reports_the_existing_path_when_branch_is_checked_out_elsewhere() {
+        // Regression test: requesting a worktree under a *new* directory name
+        // for a branch that's already checked out somewhere else used to
+        // surface git's confusing final-fallback error ("a branch named 'X'
+        // already exists") instead of pointing at where the branch actually
+        // lives.
+        let main_repo = unique_test_dir("ensure-worktree-main-repo");
+        let existing_worktree = unique_test_dir("ensure-worktree-existing");
+        let new_worktree = unique_test_dir("ensure-worktree-new");
+        std::fs::remove_dir_all(&existing_worktree).unwrap();
+        std::fs::remove_dir_all(&new_worktree).unwrap();
+
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&main_repo)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"]);
+        std::fs::write(main_repo.join("f.txt"), "x").unwrap();
+        run(&["add", "f.txt"]);
+        run(&[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        run(&[
+            "worktree",
+            "add",
+            "-q",
+            existing_worktree.to_str().unwrap(),
+            "-b",
+            "the-branch",
+        ]);
+
+        let err =
+            ensure_worktree(&new_worktree, "the-branch", &main_repo).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&existing_worktree.to_string_lossy().to_string()),
+            "error should point at the existing worktree path, got: {msg}"
+        );
+        assert!(!new_worktree.exists());
+
+        run(&[
+            "worktree",
+            "remove",
+            "-f",
+            existing_worktree.to_str().unwrap(),
+        ]);
         std::fs::remove_dir_all(&main_repo).unwrap();
     }
 }
