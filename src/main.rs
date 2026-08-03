@@ -4,7 +4,7 @@ mod launch;
 mod sessions;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use launch::{Args as LaunchArgs, HeadlessArgs};
+use launch::{Args as LaunchArgs, HeadlessArgs, PathArgs};
 
 #[derive(Parser)]
 #[command(name = "wtclaude", disable_help_subcommand = true)]
@@ -26,6 +26,8 @@ enum Commands {
     /// Sandboxed, non-interactive run against cwd (no worktree/branch created;
     /// reads PROMPT from stdin if omitted)
     Headless(HeadlessArgs),
+    /// Sandboxed, interactive run against DIRECTORY (no worktree/branch created)
+    Path(PathArgs),
     /// Print the worktree name for a session
     SessionWorktree {
         /// Session ID to resolve to a worktree name
@@ -93,6 +95,13 @@ fn main() {
                 }
             }
             Commands::Headless(parsed) => match launch::run_headless(parsed) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {:#}", e);
+                    std::process::exit(1);
+                }
+            },
+            Commands::Path(parsed) => match launch::run_path(parsed) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("error: {:#}", e);
