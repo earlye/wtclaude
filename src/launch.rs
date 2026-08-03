@@ -491,21 +491,30 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
 /// the filesystem root, or the user's home directory (or any ancestor of
 /// it, e.g. `~/..`) — matching `config::validate_allowlist`'s precedent for
 /// refusing sandbox-nullifying input rather than silently allow-writing
-/// almost everything. `$HOME` is canonicalized before comparing, the same
-/// way `canonical` itself was derived — a raw string comparison would miss
-/// this entirely whenever `$HOME` resolves through a symlink (e.g. macOS's
-/// `/tmp` -> `/private/tmp`).
+/// almost everything. Compares filesystem identity (device + inode) rather
+/// than path strings: a string comparison — even a canonicalized one — is
+/// still fooled by macOS APFS's case-insensitive-but-case-preserving
+/// default (`/users/x` and `/Users/x` canonicalize to different strings but
+/// are the same file), which `home.ancestors()` walks past `/` itself, so
+/// the explicit filesystem-root check falls out of this for free.
 fn is_sandbox_nullifying_root(canonical: &Path) -> bool {
-    if canonical == Path::new("/") {
-        return true;
-    }
+    use std::os::unix::fs::MetadataExt;
+    let Ok(target) = std::fs::metadata(canonical) else {
+        return false;
+    };
     let Ok(home) = std::env::var("HOME") else {
         return false;
     };
     let Ok(home) = Path::new(&home).canonicalize() else {
-        return false;
+        // HOME is set but can't be resolved (e.g. an unmounted network
+        // home) — fail closed rather than silently trust DIRECTORY.
+        return true;
     };
-    home.starts_with(canonical)
+    home.ancestors().any(|ancestor| {
+        std::fs::metadata(ancestor)
+            .map(|m| m.dev() == target.dev() && m.ino() == target.ino())
+            .unwrap_or(false)
+    })
 }
 
 /// The tmux window title for `path` mode: the canonicalized directory's
@@ -597,6 +606,12 @@ fn repo_root_at(dir: &Path) -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(dir)
+        // run_path's caller pattern-matches this error's text for "not a
+        // git repository" to distinguish a real failure from "just not a
+        // repo" — git translates that message under a non-C locale, which
+        // would silently break repo-less `path` mode for non-English
+        // users. Force English output so the match is locale-independent.
+        .env("LC_ALL", "C")
         .output()
         .context("running git rev-parse")?;
     if !output.status.success() {
@@ -1794,6 +1809,35 @@ mod path_tests {
         let parent = home_path.parent().expect("HOME should have a parent");
         let sibling = parent.join("wtclaude-test-definitely-not-a-real-user-dir");
         assert!(!is_sandbox_nullifying_root(&sibling));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_rejects_a_case_variant_of_home() {
+        // Regression test: a string comparison (even canonicalized) is
+        // fooled by macOS APFS's default case-insensitive-but-case-
+        // preserving behavior — `/users/x` and `/Users/x` canonicalize to
+        // different strings yet name the identical file. Only meaningful
+        // when the filesystem actually behaves that way; skipped as a
+        // harmless no-op otherwise rather than failing on an unusual setup.
+        let home = std::env::var("HOME").unwrap();
+        let home_path = Path::new(&home).canonicalize().unwrap();
+        let flipped: String = home_path
+            .to_string_lossy()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_uppercase() {
+                    c.to_ascii_lowercase()
+                } else if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let flipped_path = PathBuf::from(&flipped);
+        if flipped_path != home_path && std::fs::metadata(&flipped_path).is_ok() {
+            assert!(is_sandbox_nullifying_root(&flipped_path));
+        }
     }
 
     #[test]

@@ -511,3 +511,100 @@ fn path_subcommand_sbpl_policy_allowlists_directory_and_repo_git_dir() {
         "policy should allowlist the repo's .git dir: {stdout}"
     );
 }
+
+#[test]
+fn path_subcommand_treats_directory_as_repo_less_regardless_of_locale() {
+    // Regression test: repo_root_at distinguishes "genuinely not a repo"
+    // from other git failures by pattern-matching git's stderr for "not a
+    // git repository" — which git translates under a non-C locale, so
+    // repo-less `path` mode used to hard-fail entirely for non-English
+    // users. Best-effort: if fr_FR.UTF-8 isn't installed on this machine,
+    // git/libc silently ignore it and this just re-confirms the C-locale
+    // case, still useful but not exercising the original bug.
+    let dir = unique_temp_dir("locale-non-repo-dir");
+    let home = unique_temp_dir("locale-non-repo-home");
+    let stub_dir = unique_temp_dir("locale-non-repo-stub");
+    make_executable_script(&stub_dir.join("claude"), "#!/bin/sh\nexit 0\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["path", dir.to_str().unwrap(), "hello"])
+        .env("HOME", &home)
+        .env("LANG", "fr_FR.UTF-8")
+        .env("LC_ALL", "fr_FR.UTF-8")
+        .env("PATH", stub_path_env(&stub_dir))
+        .env_remove("TMUX")
+        .output()
+        .expect("failed to spawn wtclaude");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&stub_dir).ok();
+
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("resolving repo root"),
+        "a non-C locale must not make repo-less DIRECTORY detection fail: stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn hook_regenerates_missing_sbpl_policy_without_repo_root_when_directory_is_repo_less() {
+    // Directly exercises hook.rs's regenerate_sbpl_policy with
+    // WTCLAUDE_REPO_ROOT unset — the exact scenario `wtclaude path` against
+    // a non-repo DIRECTORY produces, and the code path this diff moved from
+    // a hard `bail!` to tolerating a missing repo root. Runs as its own
+    // subprocess so mutating WTCLAUDE_SANDBOX/WTCLAUDE_SBPL/WTCLAUDE_REPO_ROOT
+    // here can't race with any other test's use of those process-global vars.
+    let dir = unique_temp_dir("hook-regen-dir");
+    // Deliberately does not exist yet: wrap_bash_in_sandbox regenerates a
+    // missing policy file, which is the behavior under test.
+    let sbpl_path = dir.join("missing-policy.sb");
+    let payload = format!(
+        r#"{{"tool_name":"Bash","cwd":"{}","tool_input":{{"command":"echo hi"}}}}"#,
+        dir.to_str().unwrap()
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["hook"])
+        .env("WTCLAUDE_SANDBOX", &dir)
+        .env("WTCLAUDE_SBPL", &sbpl_path)
+        .env_remove("WTCLAUDE_REPO_ROOT")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn wtclaude hook");
+
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(payload.as_bytes())
+        .expect("write hook payload");
+
+    let output = child.wait_with_output().expect("wait for wtclaude hook");
+    let regenerated = std::fs::read_to_string(&sbpl_path);
+
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("updatedInput"),
+        "hook should wrap the Bash command, not deny it: stdout: {stdout}"
+    );
+    assert!(
+        !stdout.contains("deny"),
+        "hook should not deny the Bash call: stdout: {stdout}"
+    );
+    let regenerated = regenerated.expect("policy file should have been regenerated");
+    assert!(
+        !regenerated.contains(".git"),
+        "regenerated policy should have no repo .git allowlisted: {regenerated}"
+    );
+}
