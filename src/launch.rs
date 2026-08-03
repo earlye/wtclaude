@@ -503,6 +503,15 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
 /// default (`/users/x` and `/Users/x` canonicalize to different strings but
 /// are the same file), which `home.ancestors()` walks past `/` itself, so
 /// the explicit filesystem-root check falls out of this for free.
+///
+/// Also rejects a *different* alias for the root filesystem that isn't a
+/// string ancestor of `$HOME` at all — e.g. macOS's `/System/Volumes/Data`
+/// firmlink, which re-exposes the same writable volume (so
+/// `/System/Volumes/Data/Users/x` is the identical file as `/Users/x`)
+/// without `/System/Volumes/Data` itself ever appearing in `home`'s
+/// ancestors. Detected by treating `canonical` as a hypothetical "/" and
+/// checking whether re-appending `$HOME`'s own path components onto it
+/// lands back on the real `$HOME`.
 fn is_sandbox_nullifying_root(canonical: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(target) = std::fs::metadata(canonical) else {
@@ -516,11 +525,25 @@ fn is_sandbox_nullifying_root(canonical: &Path) -> bool {
         // home) — fail closed rather than silently trust DIRECTORY.
         return true;
     };
-    home.ancestors().any(|ancestor| {
-        std::fs::metadata(ancestor)
+    let Ok(home_meta) = std::fs::metadata(&home) else {
+        return true;
+    };
+
+    let same_as_target = |p: &Path| {
+        std::fs::metadata(p)
             .map(|m| m.dev() == target.dev() && m.ino() == target.ino())
             .unwrap_or(false)
-    })
+    };
+    if home.ancestors().any(same_as_target) {
+        return true;
+    }
+
+    if let Ok(home_rel) = home.strip_prefix("/")
+        && let Ok(aliased) = std::fs::metadata(canonical.join(home_rel))
+    {
+        return aliased.dev() == home_meta.dev() && aliased.ino() == home_meta.ino();
+    }
+    false
 }
 
 /// The tmux window title for `path` mode: the canonicalized directory's
