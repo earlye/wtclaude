@@ -381,15 +381,30 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         .get(&mode)
         .with_context(|| format!("unknown mode: {}", mode))?;
 
-    if !args.directory.exists() {
-        bail!("directory {} does not exist", args.directory.display());
+    if !args.directory.is_dir() {
+        bail!(
+            "{} is not a directory (or does not exist)",
+            args.directory.display()
+        );
     }
     let canonical = args
         .directory
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", args.directory.display()))?;
 
-    let repo_root = repo_root_at(&canonical).ok();
+    if is_sandbox_nullifying_root(&canonical) {
+        bail!(
+            "refusing to sandbox against {}: this would allow writes to (almost) \
+             any path, defeating the sandbox entirely. Pass a more specific directory.",
+            canonical.display()
+        );
+    }
+
+    let repo_root = match repo_root_at(&canonical) {
+        Ok(root) => Some(root),
+        Err(e) if e.to_string().contains("not a git repository") => None,
+        Err(e) => return Err(e).context("resolving repo root for DIRECTORY"),
+    };
 
     if let Some(repo_root) = &repo_root
         && !args.no_pull
@@ -397,11 +412,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         git_pull(repo_root)?;
     }
 
-    let tmux_label = canonical
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| canonical.to_string_lossy().to_string());
-    let _window_name = TmuxWindowName::rename(&tmux_label);
+    let _window_name = TmuxWindowName::rename(&directory_label(&canonical));
     update_trust(repo_root.as_deref().unwrap_or(&canonical))?;
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
@@ -419,10 +430,10 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
 
     let sandbox_notice = format!(
         "You are running in a wtclaude directory sandbox rooted at: {}. You may only write \
-         files under that directory{}. {}",
+         files under that directory (plus a few package-manager cache dirs{}). {}",
         canonical.display(),
         if repo_root.is_some() {
-            " (plus the repo's .git and a few package-manager cache dirs)"
+            ", and the repo's .git"
         } else {
             ""
         },
@@ -466,6 +477,30 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
 
     let status = cmd.status().context("launching claude")?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Rejects a canonicalized DIRECTORY that would make the sandbox a no-op:
+/// the filesystem root, or the user's home directory exactly (matching
+/// `config::validate_allowlist`'s precedent for refusing sandbox-nullifying
+/// input rather than silently allow-writing almost everything).
+fn is_sandbox_nullifying_root(canonical: &Path) -> bool {
+    if canonical == Path::new("/") {
+        return true;
+    }
+    match std::env::var("HOME") {
+        Ok(home) => canonical == Path::new(&home),
+        Err(_) => false,
+    }
+}
+
+/// The tmux window title for `path` mode: the canonicalized directory's
+/// basename, not whatever string the user actually typed (e.g. `path .`
+/// labels the window with the real directory name, not `.`).
+fn directory_label(canonical: &Path) -> String {
+    canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| canonical.to_string_lossy().to_string())
 }
 
 fn sanitize_name(name: &str) -> String {
@@ -1680,8 +1715,70 @@ mod path_tests {
         let args = parse(&[missing.to_str().unwrap()]).unwrap();
         let err = run_path(args).unwrap_err();
         assert!(
-            err.to_string().contains("does not exist"),
+            err.to_string().contains("is not a directory"),
             "error: {err}"
         );
+    }
+
+    #[test]
+    fn run_path_bails_on_a_regular_file() {
+        let file = std::env::temp_dir().join(format!(
+            "wtclaude-path-test-regular-file-{}",
+            std::process::id()
+        ));
+        std::fs::write(&file, "not a directory").unwrap();
+        let args = parse(&[file.to_str().unwrap()]).unwrap();
+        let err = run_path(args).unwrap_err();
+        assert!(
+            err.to_string().contains("is not a directory"),
+            "error: {err}"
+        );
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn run_path_bails_on_filesystem_root() {
+        let args = parse(&["/"]).unwrap();
+        let err = run_path(args).unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to sandbox"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_rejects_filesystem_root() {
+        assert!(is_sandbox_nullifying_root(Path::new("/")));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_rejects_home_directory_exactly() {
+        let home = std::env::var("HOME").unwrap();
+        assert!(is_sandbox_nullifying_root(Path::new(&home)));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_allows_a_normal_subdirectory() {
+        let home = std::env::var("HOME").unwrap();
+        let sub = PathBuf::from(home).join("some-project");
+        assert!(!is_sandbox_nullifying_root(&sub));
+    }
+
+    #[test]
+    fn directory_label_uses_basename_not_literal_dot() {
+        let dir =
+            std::env::temp_dir().join(format!("wtclaude-path-test-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = dir.canonicalize().unwrap();
+        let expected = canonical.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(directory_label(&canonical), expected);
+        assert_ne!(expected, ".");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn directory_label_falls_back_to_full_path_when_no_file_name() {
+        assert_eq!(directory_label(Path::new("/")), "/");
     }
 }
