@@ -608,3 +608,28 @@ fn hook_regenerates_missing_sbpl_policy_without_repo_root_when_directory_is_repo
         "regenerated policy should have no repo .git allowlisted: {regenerated}"
     );
 }
+
+#[test]
+fn path_subcommand_fails_closed_when_home_cannot_be_resolved() {
+    // is_sandbox_nullifying_root fails closed (refuses) when $HOME is set
+    // but can't be canonicalized (e.g. an unmounted network home) — a
+    // future refactor could silently flip this to fail-open, which this
+    // guards against.
+    let dir = unique_temp_dir("unresolvable-home-dir");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["path", dir.to_str().unwrap(), "hello"])
+        .env("HOME", "/definitely/does/not/exist/wtclaude-test-home")
+        .env_remove("TMUX")
+        .output()
+        .expect("failed to spawn wtclaude");
+
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        !output.status.success(),
+        "expected wtclaude to fail closed when $HOME can't be resolved"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refusing to sandbox"), "stderr: {stderr}");
+}

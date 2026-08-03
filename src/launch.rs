@@ -387,7 +387,13 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
             "{} is not a directory (it's a file)",
             args.directory.display()
         ),
-        Err(_) => bail!("{} does not exist", args.directory.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("{} does not exist", args.directory.display())
+        }
+        // Distinct from "does not exist": e.g. permission denied on a
+        // parent, or a symlink loop — the path is genuinely inaccessible
+        // rather than simply absent.
+        Err(e) => bail!("{}: {}", args.directory.display(), e),
     }
     let canonical = args
         .directory
