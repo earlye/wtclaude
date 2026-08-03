@@ -393,3 +393,121 @@ fn path_subcommand_forwards_resume_and_prompt_and_omits_print() {
     );
     assert_eq!(logged_args.last(), Some(&"hello there"));
 }
+
+#[test]
+fn path_subcommand_rejects_home_directory_reached_through_a_symlink() {
+    // Regression test: is_sandbox_nullifying_root used to compare a raw,
+    // uncanonicalized $HOME against the canonicalized DIRECTORY, so this
+    // exact case (a HOME whose path is itself a symlink, same as macOS's
+    // real /tmp -> /private/tmp) silently bypassed the guard.
+    let real_home = unique_temp_dir("symlinked-home-real");
+    let home_parent = unique_temp_dir("symlinked-home-parent");
+    let home_symlink = home_parent.join("home-symlink");
+    std::os::unix::fs::symlink(&real_home, &home_symlink).expect("create symlink");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["path", home_symlink.to_str().unwrap(), "hello"])
+        .env("HOME", &home_symlink)
+        .env_remove("TMUX")
+        .output()
+        .expect("failed to spawn wtclaude");
+
+    std::fs::remove_dir_all(&real_home).ok();
+    std::fs::remove_dir_all(&home_parent).ok();
+
+    assert!(
+        !output.status.success(),
+        "expected wtclaude to refuse sandboxing against $HOME even reached via a symlink"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("refusing to sandbox"), "stderr: {stderr}");
+}
+
+#[test]
+fn path_subcommand_accepts_a_literal_dot_as_the_current_directory() {
+    // The flag's own --help text recommends `.` as the idiomatic way to
+    // mean "here" — every other test above passes a pre-resolved absolute
+    // path instead, so this is the one exercising that documented usage.
+    let dir = unique_temp_dir("dot-arg-dir");
+    let home = unique_temp_dir("dot-arg-home");
+    let stub_dir = unique_temp_dir("dot-arg-stub");
+    let log_path = stub_dir.join("result.log");
+    make_executable_script(
+        &stub_dir.join("claude"),
+        "#!/bin/sh\nprintf '%s' \"$WTCLAUDE_SANDBOX\" > \"$RESULT_LOG_PATH\"\nexit 0\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["path", ".", "hello"])
+        .current_dir(&dir)
+        .env("HOME", &home)
+        .env("PATH", stub_path_env(&stub_dir))
+        .env("RESULT_LOG_PATH", &log_path)
+        .env_remove("TMUX")
+        .output()
+        .expect("failed to spawn wtclaude");
+
+    let logged = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("reading result log at {}: {e}", log_path.display()));
+    let expected = dir.canonicalize().expect("canonicalize dir");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&stub_dir).ok();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(PathBuf::from(logged.trim()), expected);
+}
+
+#[test]
+fn path_subcommand_sbpl_policy_allowlists_directory_and_repo_git_dir() {
+    // Confirms the *actual generated policy content* for repo-mode `path`,
+    // not just the WTCLAUDE_REPO_ROOT env var wiring: a regression that
+    // accidentally passed `None` instead of `repo_root.as_deref()` into
+    // `write_sbpl_policy` would leave every existing env-var-only test
+    // passing while silently dropping the repo's .git from the allowlist.
+    let repo = git_init_dir("sbpl-policy-repo");
+    let home = unique_temp_dir("sbpl-policy-home");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["path", "--show-policy", repo.to_str().unwrap(), "hello"])
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin") // no `claude` on PATH: never reached
+        .env_remove("TMUX")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn wtclaude");
+
+    // --show-policy prints the policy, then blocks on a stdin read waiting
+    // for Enter; closing stdin immediately unblocks it without needing to
+    // press anything, and it then fails to exec `claude` (not on PATH),
+    // which is fine — the policy was already printed by that point.
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait for wtclaude");
+
+    let expected_repo_dir = repo.canonicalize().expect("canonicalize repo path");
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            expected_repo_dir.display()
+        )),
+        "policy should allowlist DIRECTORY itself: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "(allow file-write* (subpath \"{}\"))",
+            expected_repo_dir.join(".git").display()
+        )),
+        "policy should allowlist the repo's .git dir: {stdout}"
+    );
+}

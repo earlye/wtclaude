@@ -381,11 +381,13 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         .get(&mode)
         .with_context(|| format!("unknown mode: {}", mode))?;
 
-    if !args.directory.is_dir() {
-        bail!(
-            "{} is not a directory (or does not exist)",
+    match std::fs::metadata(&args.directory) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => bail!(
+            "{} is not a directory (it's a file)",
             args.directory.display()
-        );
+        ),
+        Err(_) => bail!("{} does not exist", args.directory.display()),
     }
     let canonical = args
         .directory
@@ -463,7 +465,13 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         None => {
             cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
         }
-        Some(SbplBreakage::Hide) => {}
+        // Cleared, not just left unset, for the same ambient-leak reason as
+        // WTCLAUDE_REPO_ROOT above: this simulates "policy unavailable",
+        // which an inherited WTCLAUDE_SBPL from an outer wtclaude sandbox
+        // would otherwise quietly defeat.
+        Some(SbplBreakage::Hide) => {
+            cmd.env_remove("WTCLAUDE_SBPL");
+        }
         Some(SbplBreakage::Missing) => {
             cmd.env(
                 "WTCLAUDE_SBPL",
@@ -480,17 +488,24 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
 }
 
 /// Rejects a canonicalized DIRECTORY that would make the sandbox a no-op:
-/// the filesystem root, or the user's home directory exactly (matching
-/// `config::validate_allowlist`'s precedent for refusing sandbox-nullifying
-/// input rather than silently allow-writing almost everything).
+/// the filesystem root, or the user's home directory (or any ancestor of
+/// it, e.g. `~/..`) — matching `config::validate_allowlist`'s precedent for
+/// refusing sandbox-nullifying input rather than silently allow-writing
+/// almost everything. `$HOME` is canonicalized before comparing, the same
+/// way `canonical` itself was derived — a raw string comparison would miss
+/// this entirely whenever `$HOME` resolves through a symlink (e.g. macOS's
+/// `/tmp` -> `/private/tmp`).
 fn is_sandbox_nullifying_root(canonical: &Path) -> bool {
     if canonical == Path::new("/") {
         return true;
     }
-    match std::env::var("HOME") {
-        Ok(home) => canonical == Path::new(&home),
-        Err(_) => false,
-    }
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let Ok(home) = Path::new(&home).canonicalize() else {
+        return false;
+    };
+    home.starts_with(canonical)
 }
 
 /// The tmux window title for `path` mode: the canonicalized directory's
@@ -1714,10 +1729,7 @@ mod path_tests {
         let _ = std::fs::remove_dir_all(&missing);
         let args = parse(&[missing.to_str().unwrap()]).unwrap();
         let err = run_path(args).unwrap_err();
-        assert!(
-            err.to_string().contains("is not a directory"),
-            "error: {err}"
-        );
+        assert!(err.to_string().contains("does not exist"), "error: {err}");
     }
 
     #[test]
@@ -1762,6 +1774,26 @@ mod path_tests {
         let home = std::env::var("HOME").unwrap();
         let sub = PathBuf::from(home).join("some-project");
         assert!(!is_sandbox_nullifying_root(&sub));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_rejects_an_ancestor_of_home() {
+        // `~/..` canonicalizes to HOME's parent, e.g. `/Users` — still broad
+        // enough to nullify the sandbox for every user on the machine, not
+        // just the current one, so this must be rejected too.
+        let home = std::env::var("HOME").unwrap();
+        let home_path = Path::new(&home).canonicalize().unwrap();
+        let parent = home_path.parent().expect("HOME should have a parent");
+        assert!(is_sandbox_nullifying_root(parent));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_does_not_reject_a_sibling_of_home() {
+        let home = std::env::var("HOME").unwrap();
+        let home_path = Path::new(&home).canonicalize().unwrap();
+        let parent = home_path.parent().expect("HOME should have a parent");
+        let sibling = parent.join("wtclaude-test-definitely-not-a-real-user-dir");
+        assert!(!is_sandbox_nullifying_root(&sibling));
     }
 
     #[test]
