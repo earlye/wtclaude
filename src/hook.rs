@@ -159,11 +159,11 @@ fn wrap_bash_in_sandbox(payload: &HookPayload) -> Result<Option<HookResponse>> {
 fn regenerate_sbpl_policy(sbpl_path: &str) -> anyhow::Result<()> {
     let sandbox = std::env::var("WTCLAUDE_SANDBOX")
         .map_err(|_| anyhow::anyhow!("WTCLAUDE_SANDBOX not set"))?;
-    let repo_root = std::env::var("WTCLAUDE_REPO_ROOT")
-        .map_err(|_| anyhow::anyhow!("WTCLAUDE_REPO_ROOT not set"))?;
+    // Absent for `wtclaude path` against a directory outside any git repo.
+    let repo_root = std::env::var("WTCLAUDE_REPO_ROOT").ok();
     let policy = crate::launch::generate_sbpl_policy(
         std::path::Path::new(&sandbox),
-        std::path::Path::new(&repo_root),
+        repo_root.as_deref().map(std::path::Path::new),
     )?;
     std::fs::write(sbpl_path, policy)
         .map_err(|e| anyhow::anyhow!("writing regenerated policy: {e}"))?;

@@ -111,7 +111,7 @@ pub fn run(args: Args) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let _sbpl_policy = write_sbpl_policy(&canonical, &repo_root, &sanitize_name(&args.name))?;
+    let _sbpl_policy = write_sbpl_policy(&canonical, Some(&repo_root), &sanitize_name(&args.name))?;
 
     if args.show_policy {
         let policy = std::fs::read_to_string(&_sbpl_policy.0).context("reading sbpl policy")?;
@@ -260,7 +260,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let _sbpl_policy = write_sbpl_policy(&canonical, &repo_root, "headless")?;
+    let _sbpl_policy = write_sbpl_policy(&canonical, Some(&repo_root), "headless")?;
 
     if args.show_policy {
         // Printed to stderr, not stdout, so it never mixes into `claude
@@ -323,6 +323,239 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     }
 }
 
+// Note: when used as the `Commands::Path` subcommand variant in main.rs,
+// that variant's own doc comment overrides this struct's `name`/`about`
+// (i.e. this struct's doc comment is inert there) — but other
+// #[command(...)] attributes on this struct, if added, would still apply
+// via clap's augment_args.
+#[derive(Parser)]
+pub struct PathArgs {
+    /// Operation mode (see wtclaude.yml)
+    #[arg(long)]
+    mode: Option<String>,
+    /// Skip git pull before launch (only applies when DIRECTORY is inside a git repo)
+    #[arg(long)]
+    no_pull: bool,
+    /// Resume a previous session
+    #[arg(long, value_name = "SESSION_ID")]
+    resume: Option<String>,
+    /// Print the generated sandbox policy and pause for Enter before launching
+    #[arg(long)]
+    show_policy: bool,
+    /// Inject sandbox policy breakage for testing
+    #[arg(long, value_enum, value_name = "TYPE")]
+    test_sbpl_breakage: Option<SbplBreakage>,
+    /// Directory to sandbox against and launch claude in (use `.` for the current directory)
+    #[arg(value_name = "DIRECTORY")]
+    directory: PathBuf,
+    /// Initial prompt to hand to claude (use `--` to pass prompt text that
+    /// starts with a hyphen)
+    #[arg(value_name = "INITIAL_PROMPT")]
+    prompt_parts: Vec<String>,
+}
+
+impl PathArgs {
+    fn prompt(&self) -> Option<String> {
+        if self.prompt_parts.is_empty() {
+            None
+        } else {
+            Some(self.prompt_parts.join(" "))
+        }
+    }
+}
+
+/// Interactive, sandboxed launch against an arbitrary directory — no
+/// worktree, no branch checkout. Unlike `run()`'s in-place mode (which
+/// requires an existing git repo and sandboxes the whole repo_root) or
+/// `run_headless()` (non-interactive, hardcoded to cwd), this works with or
+/// without a surrounding git repo and sandboxes exactly `args.directory`.
+pub fn run_path(args: PathArgs) -> Result<i32> {
+    let prompt = args.prompt();
+    let config = config::load()?;
+    let mode = args
+        .mode
+        .or_else(|| std::env::var("WTCLAUDE_DEFAULT_MODE").ok())
+        .unwrap_or_else(|| config.default_mode.clone());
+    let mode_config = config
+        .modes
+        .get(&mode)
+        .with_context(|| format!("unknown mode: {}", mode))?;
+
+    match std::fs::metadata(&args.directory) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => bail!(
+            "{} is not a directory (it's a file)",
+            args.directory.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("{} does not exist", args.directory.display())
+        }
+        // Distinct from "does not exist": e.g. permission denied on a
+        // parent, or a symlink loop — the path is genuinely inaccessible
+        // rather than simply absent.
+        Err(e) => bail!("{}: {}", args.directory.display(), e),
+    }
+    let canonical = args
+        .directory
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", args.directory.display()))?;
+
+    if is_sandbox_nullifying_root(&canonical) {
+        bail!(
+            "refusing to sandbox against {}: this would allow writes to (almost) \
+             any path, defeating the sandbox entirely. Pass a more specific directory.",
+            canonical.display()
+        );
+    }
+
+    let repo_root = match repo_root_at(&canonical) {
+        Ok(root) => Some(root),
+        Err(e) if e.to_string().contains("not a git repository") => None,
+        Err(e) => return Err(e).context("resolving repo root for DIRECTORY"),
+    };
+
+    if let Some(repo_root) = &repo_root
+        && !args.no_pull
+    {
+        git_pull(repo_root)?;
+    }
+
+    let _window_name = TmuxWindowName::rename(&directory_label(&canonical));
+    update_trust(repo_root.as_deref().unwrap_or(&canonical))?;
+
+    let binary_path = std::env::current_exe().context("resolving binary path")?;
+    let _settings = write_hook_settings(&binary_path)?;
+    let _sbpl_policy = write_sbpl_policy(&canonical, repo_root.as_deref(), "path")?;
+
+    if args.show_policy {
+        let policy = std::fs::read_to_string(&_sbpl_policy.0).context("reading sbpl policy")?;
+        println!("{}", policy);
+        print!("Press Enter to continue...");
+        use std::io::{self, BufRead, Write};
+        io::stdout().flush()?;
+        let _ = io::stdin().lock().lines().next();
+    }
+
+    let sandbox_notice = format!(
+        "You are running in a wtclaude directory sandbox rooted at: {}. You may only write \
+         files under that directory (plus a few package-manager cache dirs{}). {}",
+        canonical.display(),
+        if repo_root.is_some() {
+            ", and the repo's .git"
+        } else {
+            ""
+        },
+        sandbox_warning_common()
+    );
+
+    let mut cmd = Command::new("claude");
+    cmd.current_dir(&canonical);
+    for flag in &mode_config.claude_flags {
+        cmd.arg(flag);
+    }
+    if let Some(session_id) = args.resume {
+        cmd.arg("--resume").arg(session_id);
+    }
+    cmd.arg("--settings").arg(&_settings.0);
+    cmd.arg("--append-system-prompt").arg(&sandbox_notice);
+    cmd.env("WTCLAUDE_SANDBOX", &canonical);
+    // Explicitly cleared (not just left unset) when there's no repo: this
+    // process may itself be running inside another wtclaude sandbox, whose
+    // own WTCLAUDE_REPO_ROOT would otherwise leak through to the child via
+    // ambient env inheritance.
+    match &repo_root {
+        Some(repo_root) => cmd.env("WTCLAUDE_REPO_ROOT", repo_root),
+        None => cmd.env_remove("WTCLAUDE_REPO_ROOT"),
+    };
+    match args.test_sbpl_breakage {
+        None => {
+            cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
+        }
+        // Cleared, not just left unset, for the same ambient-leak reason as
+        // WTCLAUDE_REPO_ROOT above: this simulates "policy unavailable",
+        // which an inherited WTCLAUDE_SBPL from an outer wtclaude sandbox
+        // would otherwise quietly defeat.
+        Some(SbplBreakage::Hide) => {
+            cmd.env_remove("WTCLAUDE_SBPL");
+        }
+        Some(SbplBreakage::Missing) => {
+            cmd.env(
+                "WTCLAUDE_SBPL",
+                format!("/tmp/wtclaude-sbpl-missing-{}.sb", std::process::id()),
+            );
+        }
+    }
+    if let Some(p) = prompt {
+        cmd.arg(p);
+    }
+
+    let status = cmd.status().context("launching claude")?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Rejects a canonicalized DIRECTORY that would make the sandbox a no-op:
+/// the filesystem root, or the user's home directory (or any ancestor of
+/// it, e.g. `~/..`) — matching `config::validate_allowlist`'s precedent for
+/// refusing sandbox-nullifying input rather than silently allow-writing
+/// almost everything. Compares filesystem identity (device + inode) rather
+/// than path strings: a string comparison — even a canonicalized one — is
+/// still fooled by macOS APFS's case-insensitive-but-case-preserving
+/// default (`/users/x` and `/Users/x` canonicalize to different strings but
+/// are the same file), which `home.ancestors()` walks past `/` itself, so
+/// the explicit filesystem-root check falls out of this for free.
+///
+/// Also rejects a *different* alias for the root filesystem that isn't a
+/// string ancestor of `$HOME` at all — e.g. macOS's `/System/Volumes/Data`
+/// firmlink, which re-exposes the same writable volume (so
+/// `/System/Volumes/Data/Users/x` is the identical file as `/Users/x`)
+/// without `/System/Volumes/Data` itself ever appearing in `home`'s
+/// ancestors. Detected by treating `canonical` as a hypothetical "/" and
+/// checking whether re-appending `$HOME`'s own path components onto it
+/// lands back on the real `$HOME`.
+fn is_sandbox_nullifying_root(canonical: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(target) = std::fs::metadata(canonical) else {
+        return false;
+    };
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let Ok(home) = Path::new(&home).canonicalize() else {
+        // HOME is set but can't be resolved (e.g. an unmounted network
+        // home) — fail closed rather than silently trust DIRECTORY.
+        return true;
+    };
+    let Ok(home_meta) = std::fs::metadata(&home) else {
+        return true;
+    };
+
+    let same_as_target = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| m.dev() == target.dev() && m.ino() == target.ino())
+            .unwrap_or(false)
+    };
+    if home.ancestors().any(same_as_target) {
+        return true;
+    }
+
+    if let Ok(home_rel) = home.strip_prefix("/")
+        && let Ok(aliased) = std::fs::metadata(canonical.join(home_rel))
+    {
+        return aliased.dev() == home_meta.dev() && aliased.ino() == home_meta.ino();
+    }
+    false
+}
+
+/// The tmux window title for `path` mode: the canonicalized directory's
+/// basename, not whatever string the user actually typed (e.g. `path .`
+/// labels the window with the real directory name, not `.`).
+fn directory_label(canonical: &Path) -> String {
+    canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| canonical.to_string_lossy().to_string())
+}
+
 fn sanitize_name(name: &str) -> String {
     // claude replaces '/' with '+' in worktree directory names
     name.replace('/', "+")
@@ -382,6 +615,32 @@ fn current_branch() -> Result<String> {
 pub(crate) fn repo_root() -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("running git rev-parse")?;
+    if !output.status.success() {
+        let msg = String::from_utf8_lossy(&output.stderr);
+        bail!("git rev-parse failed: {}", msg.trim());
+    }
+    let path = String::from_utf8(output.stdout)
+        .context("git output")?
+        .trim()
+        .to_string();
+    Ok(PathBuf::from(path))
+}
+
+/// Like `repo_root()`, but resolved relative to an arbitrary directory
+/// rather than the process's own cwd — used by `path` mode, whose DIRECTORY
+/// argument may not be where `wtclaude` itself was invoked from.
+fn repo_root_at(dir: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        // run_path's caller pattern-matches this error's text for "not a
+        // git repository" to distinguish a real failure from "just not a
+        // repo" — git translates that message under a non-C locale, which
+        // would silently break repo-less `path` mode for non-English
+        // users. Force English output so the match is locale-independent.
+        .env("LC_ALL", "C")
         .output()
         .context("running git rev-parse")?;
     if !output.status.success() {
@@ -868,7 +1127,7 @@ fn partition_allowlist(allowlist: &[String], home: &str) -> (Vec<String>, Vec<St
         .partition(|p| p.contains('*'))
 }
 
-pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<String> {
+pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: Option<&Path>) -> Result<String> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
 
@@ -913,7 +1172,7 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
         PathBuf::from(&tmpdir),
     ]
     .into_iter()
-    .chain(git_dirs(repo_root))
+    .chain(repo_root.map(git_dirs).unwrap_or_default())
     .chain(pkg_cache_dirs.iter().map(|d| PathBuf::from(&home).join(d)))
     .chain(literal_allow.into_iter().map(PathBuf::from))
     .collect();
@@ -974,7 +1233,11 @@ pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: &Path) -> Result<S
     Ok(lines.join("\n") + "\n")
 }
 
-fn write_sbpl_policy(sandbox: &Path, repo_root: &Path, _worktree_name: &str) -> Result<TempFile> {
+fn write_sbpl_policy(
+    sandbox: &Path,
+    repo_root: Option<&Path>,
+    _worktree_name: &str,
+) -> Result<TempFile> {
     let policy = generate_sbpl_policy(sandbox, repo_root)?;
     let path = PathBuf::from(format!("/tmp/wtclaude-sbpl-{}.sb", std::process::id()));
     std::fs::write(&path, policy).context("writing sbpl policy")?;
@@ -1230,6 +1493,36 @@ mod tests {
         ]);
         std::fs::remove_dir_all(&main_repo).unwrap();
     }
+
+    #[test]
+    fn generate_sbpl_policy_omits_repo_git_dirs_when_repo_root_is_none() {
+        let repo_root = unique_test_dir("generate-sbpl-no-repo-root");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&repo_root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sandbox = unique_test_dir("generate-sbpl-no-repo-root-sandbox");
+
+        let with_repo = generate_sbpl_policy(&sandbox, Some(&repo_root)).unwrap();
+        let without_repo = generate_sbpl_policy(&sandbox, None).unwrap();
+
+        let git_dir = repo_root.join(".git").to_string_lossy().to_string();
+        assert!(
+            with_repo.contains(&git_dir),
+            "expected repo .git dir to be allowlisted when repo_root is Some"
+        );
+        assert!(
+            !without_repo.contains(&git_dir),
+            "expected repo .git dir to be absent when repo_root is None"
+        );
+
+        std::fs::remove_dir_all(&repo_root).unwrap();
+        std::fs::remove_dir_all(&sandbox).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1400,5 +1693,197 @@ mod headless_tests {
         let parsed = parse(&["--verbose", "hello"]).unwrap();
         assert!(parsed.verbose);
         assert_eq!(parsed.prompt().as_deref(), Some("hello"));
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> std::result::Result<PathArgs, clap::Error> {
+        let mut full = vec!["wtclaude-path"];
+        full.extend_from_slice(args);
+        PathArgs::try_parse_from(full)
+    }
+
+    #[test]
+    fn parse_path_args_defaults_are_empty() {
+        let parsed = parse(&["."]).unwrap();
+        assert_eq!(parsed.directory, PathBuf::from("."));
+        assert!(parsed.mode.is_none());
+        assert!(!parsed.no_pull);
+        assert!(parsed.resume.is_none());
+        assert!(!parsed.show_policy);
+        assert!(parsed.test_sbpl_breakage.is_none());
+        assert!(parsed.prompt().is_none());
+    }
+
+    #[test]
+    fn parse_path_args_errors_on_missing_directory() {
+        assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_path_args_captures_no_pull() {
+        let parsed = parse(&["--no-pull", "."]).unwrap();
+        assert!(parsed.no_pull);
+    }
+
+    #[test]
+    fn parse_path_args_joins_interleaved_flags_and_prompt() {
+        let parsed = parse(&[
+            "--mode", "fast", ".", "do", "the", "thing", "--resume", "abc",
+        ])
+        .unwrap();
+        assert_eq!(parsed.mode.as_deref(), Some("fast"));
+        assert_eq!(parsed.directory, PathBuf::from("."));
+        assert_eq!(parsed.prompt().as_deref(), Some("do the thing"));
+        assert_eq!(parsed.resume.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn parse_path_args_accepts_hyphen_leading_prompt_text_after_dash_dash() {
+        let parsed = parse(&[".", "--", "-1 fix this"]).unwrap();
+        assert_eq!(parsed.prompt().as_deref(), Some("-1 fix this"));
+    }
+
+    #[test]
+    fn parse_path_args_accepts_test_sbpl_breakage_values() {
+        let hide = parse(&["--test-sbpl-breakage", "hide", "."]).unwrap();
+        assert!(matches!(hide.test_sbpl_breakage, Some(SbplBreakage::Hide)));
+
+        let missing = parse(&["--test-sbpl-breakage", "missing", "."]).unwrap();
+        assert!(matches!(
+            missing.test_sbpl_breakage,
+            Some(SbplBreakage::Missing)
+        ));
+    }
+
+    #[test]
+    fn parse_path_args_errors_on_unknown_flag() {
+        assert!(parse(&["--nonsense", "."]).is_err());
+    }
+
+    #[test]
+    fn run_path_bails_on_nonexistent_directory() {
+        let missing = std::env::temp_dir().join(format!(
+            "wtclaude-path-test-nonexistent-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+        let args = parse(&[missing.to_str().unwrap()]).unwrap();
+        let err = run_path(args).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "error: {err}");
+    }
+
+    #[test]
+    fn run_path_bails_on_a_regular_file() {
+        let file = std::env::temp_dir().join(format!(
+            "wtclaude-path-test-regular-file-{}",
+            std::process::id()
+        ));
+        std::fs::write(&file, "not a directory").unwrap();
+        let args = parse(&[file.to_str().unwrap()]).unwrap();
+        let err = run_path(args).unwrap_err();
+        assert!(
+            err.to_string().contains("is not a directory"),
+            "error: {err}"
+        );
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
+    fn run_path_bails_on_filesystem_root() {
+        let args = parse(&["/"]).unwrap();
+        let err = run_path(args).unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to sandbox"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_rejects_filesystem_root() {
+        assert!(is_sandbox_nullifying_root(Path::new("/")));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_rejects_home_directory_exactly() {
+        let home = std::env::var("HOME").unwrap();
+        assert!(is_sandbox_nullifying_root(Path::new(&home)));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_allows_a_normal_subdirectory() {
+        let home = std::env::var("HOME").unwrap();
+        let sub = PathBuf::from(home).join("some-project");
+        assert!(!is_sandbox_nullifying_root(&sub));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_rejects_an_ancestor_of_home() {
+        // `~/..` canonicalizes to HOME's parent, e.g. `/Users` — still broad
+        // enough to nullify the sandbox for every user on the machine, not
+        // just the current one, so this must be rejected too.
+        let home = std::env::var("HOME").unwrap();
+        let home_path = Path::new(&home).canonicalize().unwrap();
+        let parent = home_path.parent().expect("HOME should have a parent");
+        assert!(is_sandbox_nullifying_root(parent));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_does_not_reject_a_sibling_of_home() {
+        let home = std::env::var("HOME").unwrap();
+        let home_path = Path::new(&home).canonicalize().unwrap();
+        let parent = home_path.parent().expect("HOME should have a parent");
+        let sibling = parent.join("wtclaude-test-definitely-not-a-real-user-dir");
+        assert!(!is_sandbox_nullifying_root(&sibling));
+    }
+
+    #[test]
+    fn is_sandbox_nullifying_root_rejects_a_case_variant_of_home() {
+        // Regression test: a string comparison (even canonicalized) is
+        // fooled by macOS APFS's default case-insensitive-but-case-
+        // preserving behavior — `/users/x` and `/Users/x` canonicalize to
+        // different strings yet name the identical file. Only meaningful
+        // when the filesystem actually behaves that way; skipped as a
+        // harmless no-op otherwise rather than failing on an unusual setup.
+        let home = std::env::var("HOME").unwrap();
+        let home_path = Path::new(&home).canonicalize().unwrap();
+        let flipped: String = home_path
+            .to_string_lossy()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_uppercase() {
+                    c.to_ascii_lowercase()
+                } else if c.is_ascii_lowercase() {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let flipped_path = PathBuf::from(&flipped);
+        if flipped_path != home_path && std::fs::metadata(&flipped_path).is_ok() {
+            assert!(is_sandbox_nullifying_root(&flipped_path));
+        }
+    }
+
+    #[test]
+    fn directory_label_uses_basename_not_literal_dot() {
+        let dir =
+            std::env::temp_dir().join(format!("wtclaude-path-test-label-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let canonical = dir.canonicalize().unwrap();
+        let expected = canonical.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(directory_label(&canonical), expected);
+        assert_ne!(expected, ".");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn directory_label_falls_back_to_full_path_when_no_file_name() {
+        assert_eq!(directory_label(Path::new("/")), "/");
     }
 }
