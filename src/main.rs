@@ -1,6 +1,7 @@
 mod config;
 mod hook;
 mod launch;
+mod sandbox;
 mod sessions;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -28,6 +29,9 @@ enum Commands {
     Headless(HeadlessArgs),
     /// Sandboxed, interactive run against DIRECTORY (no worktree/branch created)
     Path(PathArgs),
+    /// Run a command confined by this session's sandbox (invoked by the hook)
+    #[cfg(target_os = "linux")]
+    Sandbox(sandbox::SandboxArgs),
     /// Print the worktree name for a session
     SessionWorktree {
         /// Session ID to resolve to a worktree name
@@ -105,6 +109,14 @@ fn main() {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("error: {:#}", e);
+                    std::process::exit(1);
+                }
+            },
+            #[cfg(target_os = "linux")]
+            Commands::Sandbox(parsed) => match sandbox::run_sandbox(parsed) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("wtclaude sandbox: {:#}", e);
                     std::process::exit(1);
                 }
             },
@@ -217,7 +229,7 @@ _wtclaude() {{
     '--mode[operation mode]:MODE:_wtclaude_modes' \
     '--resume[resume a previous session]:SESSION_ID:_wtclaude_sessions' \
     '--no-pull[skip git pull before launch]' \
-    '--test-sbpl-breakage[inject sandbox policy breakage for testing]:TYPE:(hide missing)' \
+    '--test-sandbox-breakage[inject sandbox breakage for testing]:TYPE:(hide missing)' \
     ':WORKTREE_NAME:_wtclaude_worktrees' \
     '*:INITIAL_PROMPT: '
 }}

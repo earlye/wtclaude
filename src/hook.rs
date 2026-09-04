@@ -1,7 +1,9 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+
+use crate::sandbox;
 
 #[derive(Deserialize)]
 struct HookPayload {
@@ -52,7 +54,7 @@ pub fn run() -> Result<()> {
     };
 
     if payload.tool_name == "Bash" {
-        if let Some(response) = wrap_bash_in_sandbox(&payload)? {
+        if let Some(response) = wrap_bash_in_sandbox(&payload, Path::new(&sandbox))? {
             println!("{}", serde_json::to_string(&response)?);
         }
         return Ok(());
@@ -100,7 +102,49 @@ const HEREDOC_DENY_MESSAGE: &str = "heredoc is blocked because of the bug warned
      quote-parsing. Use a temp file instead, e.g. `git commit -F /tmp/msg.txt`, or write \
      multi-line content with the Write tool.";
 
-fn wrap_bash_in_sandbox(payload: &HookPayload) -> Result<Option<HookResponse>> {
+/// Rewrites a Bash command into its sandboxed form, or denies it.
+///
+/// What is forbidden depends on the backend, so that is resolved first: the
+/// heredoc ban belongs to Seatbelt's bash 3.2 and privilege escalation is
+/// impossible only under Landlock.
+fn wrap_bash_in_sandbox(
+    payload: &HookPayload,
+    sandbox_root: &Path,
+) -> Result<Option<HookResponse>> {
+    // Re-resolved on every call rather than trusted from launch: this is the
+    // backstop that catches a backend which has stopped being able to enforce
+    // anything mid-session.
+    let backend = match active_backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            return Ok(Some(deny_bash(&format!(
+                "{e}. Bash is blocked because nothing would constrain it."
+            ))));
+        }
+    };
+
+    let session_dir = match std::env::var("WTCLAUDE_SESSION_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            return Ok(Some(deny_bash(
+                "WTCLAUDE_SESSION_DIR is not set, so this session's sandbox scratch \
+                 directory is unknown. Bash is blocked.",
+            )));
+        }
+    };
+
+    sandboxed_bash_response(payload, backend.as_ref(), &session_dir, sandbox_root)
+}
+
+/// The decision itself, with the backend and session dir already resolved.
+/// Separate from `wrap_bash_in_sandbox` so tests can supply a backend rather
+/// than mutating process-global environment variables.
+fn sandboxed_bash_response(
+    payload: &HookPayload,
+    backend: &dyn sandbox::Backend,
+    session_dir: &Path,
+    sandbox_root: &Path,
+) -> Result<Option<HookResponse>> {
     let command = match payload.tool_input.get("command").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => {
@@ -110,64 +154,114 @@ fn wrap_bash_in_sandbox(payload: &HookPayload) -> Result<Option<HookResponse>> {
         }
     };
 
-    if contains_heredoc(command) {
+    if backend.heredocs_blocked() && contains_heredoc(command) {
         return Ok(Some(deny_bash(HEREDOC_DENY_MESSAGE)));
     }
 
-    let sbpl_path = std::env::var("WTCLAUDE_SBPL").unwrap_or_default();
-    if sbpl_path.is_empty() {
-        return Ok(Some(deny_bash(
-            "WTCLAUDE_SBPL is not set; sandbox policy unavailable. Bash is blocked.",
-        )));
+    if backend.privilege_escalation_blocked()
+        && let Some(name) = privilege_escalation_command(command)
+    {
+        return Ok(Some(deny_bash(&privilege_escalation_deny_message(name))));
     }
-    // Known limitation: this SBPL file is compiled once at `wtclaude` launch
-    // and only regenerated here if it's missing — not on every Bash call.
-    // Its glob rules bake in `config::resolve_glob_prefix`'s output for
-    // whatever the filesystem looked like at that moment, while
-    // `is_within_sandbox` (governing Write/Edit/NotebookEdit) recomputes the
-    // same resolution fresh on every call. A glob's static prefix changing
-    // existence/symlink-ness mid-session (e.g. its target file being created
-    // for the first time) can make the two enforcement paths disagree on
-    // the same allowlist entry for the rest of the session. Regenerating on
-    // every Bash call would close this but adds per-call overhead; treated
-    // as an accepted tradeoff for now rather than silently unnoticed.
-    if !std::path::Path::new(&sbpl_path).exists() {
-        if let Err(e) = regenerate_sbpl_policy(&sbpl_path) {
+
+    let repo_root = std::env::var("WTCLAUDE_REPO_ROOT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
+    // Derived per call, not cached at launch: on Linux a rule needs a path
+    // that already exists, so a cache dir created earlier in the session only
+    // becomes writable if the plan is recomputed. It also means a broken
+    // wtclaude.yml denies Bash rather than silently proceeding.
+    let plan = match sandbox::plan(sandbox_root, repo_root.as_deref()) {
+        Ok(plan) => plan,
+        Err(e) => {
             return Ok(Some(deny_bash(&format!(
-                "Sandbox policy file missing and could not be regenerated ({}): {}. Bash is blocked.",
-                sbpl_path, e
+                "could not work out what this session may write to ({e:#}). Bash is blocked."
             ))));
         }
+    };
+
+    match backend.confine(&plan, command, session_dir) {
+        Ok(wrapped) => Ok(Some(HookResponse {
+            hook_specific_output: HookSpecificOutput {
+                hook_event_name: "PreToolUse".to_string(),
+                permission_decision: None,
+                permission_decision_reason: None,
+                updated_input: Some(serde_json::json!({ "command": wrapped })),
+            },
+        })),
+        Err(e) => Ok(Some(deny_bash(&format!(
+            "could not sandbox this command ({e:#}). Bash is blocked."
+        )))),
     }
-
-    let wrapped = format!(
-        "/usr/bin/sandbox-exec -f {} sh -c {}",
-        sbpl_path,
-        shell_single_quote(command)
-    );
-
-    Ok(Some(HookResponse {
-        hook_specific_output: HookSpecificOutput {
-            hook_event_name: "PreToolUse".to_string(),
-            permission_decision: None,
-            permission_decision_reason: None,
-            updated_input: Some(serde_json::json!({ "command": wrapped })),
-        },
-    }))
 }
 
-fn regenerate_sbpl_policy(sbpl_path: &str) -> anyhow::Result<()> {
-    let sandbox = std::env::var("WTCLAUDE_SANDBOX")
-        .map_err(|_| anyhow::anyhow!("WTCLAUDE_SANDBOX not set"))?;
-    // Absent for `wtclaude path` against a directory outside any git repo.
-    let repo_root = std::env::var("WTCLAUDE_REPO_ROOT").ok();
-    let policy = crate::launch::generate_sbpl_policy(
-        std::path::Path::new(&sandbox),
-        repo_root.as_deref().map(std::path::Path::new),
-    )?;
-    std::fs::write(sbpl_path, policy)
-        .map_err(|e| anyhow::anyhow!("writing regenerated policy: {e}"))?;
-    Ok(())
+/// The backend the launching wtclaude process chose, named in
+/// `WTCLAUDE_BACKEND`.
+///
+/// Deliberately does not fall back to a preference of its own: if the
+/// launcher didn't say, the hook must not guess, or `--test-sandbox-breakage
+/// hide` (and any real bug with the same shape) would silently run commands
+/// unconstrained.
+fn active_backend() -> Result<Box<dyn sandbox::Backend>> {
+    let name = std::env::var("WTCLAUDE_BACKEND").unwrap_or_default();
+    if name.is_empty() {
+        bail!("WTCLAUDE_BACKEND is not set, so the active sandbox backend is unknown");
+    }
+    let (backend, _caveat) = sandbox::select(&name)?;
+    Ok(backend)
+}
+
+const PRIVILEGE_COMMANDS: &[&str] = &["sudo", "doas", "pkexec", "su"];
+
+/// Finds a privilege-escalation command in *command position* — the start of
+/// the line, or straight after a `;`, `&&`, `||`, `|`, `&` or newline —
+/// ignoring `VAR=value` prefixes and any leading path.
+///
+/// Matching command position rather than any occurrence keeps the common
+/// false positive away: `git commit -m "document sudo"` has `echo`/`git` in
+/// command position, so it passes. It is not airtight, since quoting isn't
+/// tracked — `echo "step 1; sudo dnf install x"` does trip it — and the deny
+/// message says so, in the same spirit as `contains_heredoc`.
+fn privilege_escalation_command(command: &str) -> Option<&'static str> {
+    for segment in command.split(['\n', ';', '&', '|']) {
+        let segment =
+            segment.trim_start_matches(|c: char| c.is_whitespace() || c == '(' || c == '{');
+        let Some(word) = segment.split_whitespace().find(|w| !is_env_assignment(w)) else {
+            continue;
+        };
+        let name = word.rsplit('/').next().unwrap_or(word);
+        if let Some(found) = PRIVILEGE_COMMANDS.iter().find(|c| **c == name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Whether `word` is a `VAR=value` prefix rather than the command itself.
+fn is_env_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
+fn privilege_escalation_deny_message(name: &str) -> String {
+    format!(
+        "`{name}` cannot work in this sandbox — as the system prompt said, privilege \
+         escalation is impossible here. The kernel requires the NO_NEW_PRIVS flag before an \
+         unprivileged process may sandbox itself, and that same flag stops setuid binaries \
+         from elevating, so `{name}` would fail no matter how it is invoked. It is refused \
+         here rather than left to fail with a confusing kernel message. If this task needs \
+         root — installing a system package, say — ask the user to do it outside the sandbox. \
+         If `{name}` only appeared inside quoted text, rewrite the command so it isn't the \
+         first word after a `;`, `&&`, `||` or newline."
+    )
 }
 
 fn deny_bash(reason: &str) -> HookResponse {
@@ -179,20 +273,6 @@ fn deny_bash(reason: &str) -> HookResponse {
             updated_input: None,
         },
     }
-}
-
-fn shell_single_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
 }
 
 /// Detects heredoc syntax (`<<`/`<<-`) without tracking shell quoting: a
@@ -399,7 +479,8 @@ fn normalize_path(path: &Path, relative_to: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    use crate::sandbox::tests::run_via_outer_shell;
 
     #[test]
     fn is_within_sandbox_allows_path_within_sandbox() {
@@ -581,141 +662,18 @@ mod tests {
         // Regression test for making target-path resolution consistent with
         // glob-pattern prefix resolution (config::resolve_glob_prefix),
         // independent of the glob machinery: a not-yet-existing path under
-        // /tmp (a symlink to /private/tmp on macOS) must resolve through
-        // that symlink even though the exact target doesn't exist.
+        // /tmp must resolve through whatever /tmp really is — a symlink to
+        // /private/tmp on macOS, a real directory on Linux — even though the
+        // exact target doesn't exist.
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
         let resolved = normalize_path(
             Path::new("/tmp/wtclaude-test-normalize-path-nonexistent-target"),
             Path::new("/"),
         );
         assert_eq!(
             resolved,
-            Path::new("/private/tmp/wtclaude-test-normalize-path-nonexistent-target")
+            tmp.join("wtclaude-test-normalize-path-nonexistent-target")
         );
-    }
-
-    // Runs `command` the way the sandbox wrapper's output is ultimately run: as
-    // the text of an outer `sh -c`. This reproduces the double shell-parse from
-    // production (`sandbox-exec ... sh -c '<escaped>'` invoked as one command
-    // line by the harness), not just a single argv-level exec.
-    fn run_via_outer_shell(command: &str) -> String {
-        eprintln!("--- running via sh -c ---\n{command}\n--- end command ---");
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output()
-            .expect("failed to spawn sh");
-        eprintln!(
-            "--- exit status: {:?} ---\n--- stdout ---\n{}--- stderr ---\n{}--- end output ---",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            output.status.success(),
-            "command failed (status {:?}):\ncommand: {command}\nstderr: {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    }
-
-    #[test]
-    fn shell_single_quote_literal_output_for_known_inputs() {
-        assert_eq!(shell_single_quote("plain"), "'plain'");
-        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
-        assert_eq!(shell_single_quote("''"), "''\\'''\\'''");
-    }
-
-    #[test]
-    fn shell_single_quote_reconstructs_adversarial_bodies_byte_for_byte() {
-        // shell_single_quote() is the only barrier between an arbitrary Bash
-        // command and a second `sh -c` re-parse inside sandbox-exec. Rather
-        // than executing adversarial-looking content directly (risky if a
-        // real escaping bug let something run), assert that the outer
-        // `sh -c '<escaped>'` reconstructs the original bytes exactly via
-        // `printf '%s'`. Exact byte-for-byte reconstruction is what
-        // guarantees the wrapped command behaves identically to running the
-        // original directly — i.e. nothing can "escape" the outer quoting.
-        let adversarial_bodies = [
-            "already just plain text",
-            "leading quote: 'text",
-            "trailing quote: text'",
-            "adjacent quotes: ''",
-            "looks like a breakout attempt: '; echo INJECTED; echo '",
-            "odd count: it's a 'test' of 'quoting",
-        ];
-
-        for original in adversarial_bodies {
-            let escaped = shell_single_quote(original);
-            let probe = format!("printf '%s' {escaped}");
-            let reconstructed = run_via_outer_shell(&probe);
-            assert_eq!(
-                reconstructed, original,
-                "failed to reconstruct: {original:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn shell_single_quote_survives_quoted_heredoc() {
-        // Minimal repro: a heredoc whose quoted delimiter and body both
-        // contain literal single quotes for shell_single_quote() to escape.
-        let original = "cat <<'EOF'\nHello 'World'\nFrom Heredoc\nEOF";
-        let escaped = shell_single_quote(original);
-        let outer_cmd = format!("sh -c {escaped}");
-
-        let stdout = run_via_outer_shell(&outer_cmd);
-
-        assert_eq!(stdout, "Hello 'World'\nFrom Heredoc\n");
-    }
-
-    #[test]
-    fn shell_single_quote_survives_real_world_commit_command() {
-        // Body copied verbatim from the original bug report. Keep the
-        // apostrophe in "run()'s" — it's the one embedded single quote that
-        // makes this test exercise shell_single_quote()'s escaping at all.
-        let body = "Introduce App struct for introduce-app-struct\n\
-\n\
-Moves run()'s pty/reader/writer/emulator/cols/rows locals into an App\n\
-struct, with App::new() owning setup and run_loop() holding the event\n\
-loop, so future state (e.g. a session tree) has somewhere to live.\n\
-Also adds a term_emulator::new_emulator() factory so app.rs no longer\n\
-names the concrete AlacrittyTerminalEmulator type directly.\n\
-\n\
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>\n";
-        let original = format!("cat <<'EOF'\n{body}EOF");
-
-        let escaped = shell_single_quote(&original);
-        let outer_cmd = format!("sh -c {escaped}");
-
-        let stdout = run_via_outer_shell(&outer_cmd);
-
-        assert_eq!(stdout, body);
-    }
-
-    #[test]
-    fn shell_single_quote_survives_command_substitution_around_heredoc() {
-        // Structural shape matches the real failing command — a double-quoted
-        // command substitution wrapping a heredoc with a single-quoted
-        // delimiter: git commit -m "$(cat <<'EOF' ... EOF)". The body
-        // intentionally omits the apostrophe (see
-        // shell_single_quote_survives_real_world_commit_command) that
-        // triggers the separate, unrelated bash 3.2 heredoc-in-$()-in-""
-        // parsing bug (see the issue file) — that bug is not fixable here,
-        // so this test isolates shell_single_quote()'s own correctness from
-        // it. Swap `git commit -m` for `printf '%s\n'` so this runs
-        // standalone without needing a git repo/staged changes.
-        let body = "Introduce App struct for introduce-app-struct\n\
-\n\
-Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
-        let original = format!("printf '%s\\n' \"$(cat <<'EOF'\n{body}\nEOF\n)\"");
-
-        let escaped = shell_single_quote(&original);
-        let outer_cmd = format!("sh -c {escaped}");
-
-        let stdout = run_via_outer_shell(&outer_cmd);
-
-        assert_eq!(stdout, format!("{body}\n"));
     }
 
     #[test]
@@ -764,52 +722,128 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         assert!(contains_heredoc("cat <<-EOF\n\tEOF"));
     }
 
-    #[test]
-    fn wrap_bash_in_sandbox_denies_heredoc_before_touching_sbpl() {
-        // No WTCLAUDE_SBPL set up here on purpose: the heredoc check must
-        // reject the command before wrap_bash_in_sandbox() ever looks at the
-        // sandbox policy.
-        let payload = HookPayload {
+    fn bash_payload(command: &str) -> HookPayload {
+        HookPayload {
             tool_name: "Bash".to_string(),
             cwd: String::new(),
-            tool_input: serde_json::json!({ "command": "cat <<'EOF'\nhi\nEOF" }),
-        };
-
-        let response = wrap_bash_in_sandbox(&payload)
-            .expect("wrap_bash_in_sandbox")
-            .expect("Some(response) denying the command");
-
-        assert_eq!(
-            response.hook_specific_output.permission_decision.as_deref(),
-            Some("deny")
-        );
-        assert_eq!(
-            response
-                .hook_specific_output
-                .permission_decision_reason
-                .as_deref(),
-            Some(HEREDOC_DENY_MESSAGE)
-        );
-        assert!(response.hook_specific_output.updated_input.is_none());
-    }
-
-    // Cleans up the test-only SBPL policy file and WTCLAUDE_SBPL env var on
-    // drop, including on unwind from a failed assertion — otherwise a test
-    // failure would leak the temp file and leave WTCLAUDE_SBPL set for the
-    // rest of the process.
-    struct SbplPolicyGuard {
-        path: PathBuf,
-    }
-
-    impl Drop for SbplPolicyGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-            unsafe {
-                std::env::remove_var("WTCLAUDE_SBPL");
-            }
+            tool_input: serde_json::json!({ "command": command }),
         }
     }
 
+    fn deny_reason(response: Option<HookResponse>) -> String {
+        let out = response.expect("expected a response").hook_specific_output;
+        assert_eq!(out.permission_decision.as_deref(), Some("deny"));
+        assert!(out.updated_input.is_none());
+        out.permission_decision_reason.expect("a reason")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn heredocs_are_denied_under_seatbelt() {
+        // The ban belongs to Apple's bash 3.2, so it is asserted against the
+        // backend that has that shell rather than as a property of the hook.
+        let reason = deny_reason(
+            sandboxed_bash_response(
+                &bash_payload("cat <<'EOF'\nhi\nEOF"),
+                &crate::sandbox::seatbelt::Seatbelt,
+                Path::new("/tmp"),
+                Path::new("/tmp"),
+            )
+            .expect("sandboxed_bash_response"),
+        );
+        assert_eq!(reason, HEREDOC_DENY_MESSAGE);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn heredocs_are_allowed_under_landlock() {
+        // Linux bash parses the shape that breaks bash 3.2, so the same
+        // command must be wrapped rather than refused.
+        let dir =
+            std::env::temp_dir().join(format!("wtclaude-test-heredoc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let response = sandboxed_bash_response(
+            &bash_payload("cat <<'EOF'\nhi\nEOF"),
+            &crate::sandbox::landlock::Landlock,
+            &dir,
+            &dir,
+        )
+        .expect("sandboxed_bash_response")
+        .expect("a response");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(response.hook_specific_output.permission_decision.is_none());
+        assert!(response.hook_specific_output.updated_input.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privilege_escalation_is_denied_with_a_reminder_under_landlock() {
+        let reason = deny_reason(
+            sandboxed_bash_response(
+                &bash_payload("sudo dnf install -y jq"),
+                &crate::sandbox::landlock::Landlock,
+                Path::new("/tmp"),
+                Path::new("/tmp"),
+            )
+            .expect("sandboxed_bash_response"),
+        );
+        assert!(
+            reason.contains("as the system prompt said"),
+            "reason: {reason}"
+        );
+        assert!(reason.contains("NO_NEW_PRIVS"), "reason: {reason}");
+    }
+
+    #[test]
+    fn privilege_escalation_command_matches_only_command_position() {
+        assert_eq!(
+            privilege_escalation_command("sudo dnf install x"),
+            Some("sudo")
+        );
+        assert_eq!(privilege_escalation_command("  sudo -A true"), Some("sudo"));
+        assert_eq!(
+            privilege_escalation_command("/usr/bin/sudo true"),
+            Some("sudo")
+        );
+        assert_eq!(
+            privilege_escalation_command("SUDO_ASKPASS=/x sudo -A true"),
+            Some("sudo")
+        );
+        assert_eq!(
+            privilege_escalation_command("make && sudo make install"),
+            Some("sudo")
+        );
+        assert_eq!(
+            privilege_escalation_command("true; pkexec id"),
+            Some("pkexec")
+        );
+        assert_eq!(privilege_escalation_command("cat f | su -"), Some("su"));
+
+        // The false positive this guards against: `sudo` as an argument or
+        // inside quoted prose, which is ordinary when writing documentation.
+        assert_eq!(
+            privilege_escalation_command("git commit -m 'document sudo'"),
+            None
+        );
+        assert_eq!(
+            privilege_escalation_command("echo 'run sudo dnf install x' > README"),
+            None
+        );
+        assert_eq!(privilege_escalation_command("grep -rn sudo docs/"), None);
+        assert_eq!(privilege_escalation_command("echo pseudonym"), None);
+        assert_eq!(privilege_escalation_command("./sudoku"), None);
+    }
+
+    #[test]
+    fn is_env_assignment_accepts_only_shell_variable_prefixes() {
+        assert!(is_env_assignment("FOO=bar"));
+        assert!(is_env_assignment("_x=1"));
+        assert!(!is_env_assignment("1FOO=bar"));
+        assert!(!is_env_assignment("--flag=value"));
+        assert!(!is_env_assignment("plain"));
+    }
+
+    #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "sandbox-exec cannot nest inside an already-sandboxed process; run from a terminal outside a wtclaude sandbox"]
     fn wrap_bash_in_sandbox_survives_real_sandbox_exec() {
@@ -830,18 +864,9 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
              Run this test from a terminal outside a wtclaude sandbox."
         );
 
-        // WTCLAUDE_SBPL is a process-global env var; this is the only test that
-        // touches it today, so there's no cross-test race, but that'd need
-        // revisiting if a second test starts setting it.
-        let policy_path =
-            std::env::temp_dir().join(format!("wtclaude-test-sbpl-{}.sb", std::process::id()));
-        std::fs::write(&policy_path, "(version 1)\n(allow default)\n").expect("write policy");
-        unsafe {
-            std::env::set_var("WTCLAUDE_SBPL", &policy_path);
-        }
-        let _guard = SbplPolicyGuard {
-            path: policy_path.clone(),
-        };
+        let session_dir =
+            std::env::temp_dir().join(format!("wtclaude-test-session-{}", std::process::id()));
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
 
         // No heredoc here (contains_heredoc() now denies those before this
         // point is ever reached) — nested command substitution inside double
@@ -852,15 +877,14 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         let original = format!("printf '%s\\n' \"$(printf '%s' '{body}')\"");
 
-        let payload = HookPayload {
-            tool_name: "Bash".to_string(),
-            cwd: String::new(),
-            tool_input: serde_json::json!({ "command": original }),
-        };
-
-        let response = wrap_bash_in_sandbox(&payload)
-            .expect("wrap_bash_in_sandbox")
-            .expect("Some(response) for a valid Bash command");
+        let response = sandboxed_bash_response(
+            &bash_payload(&original),
+            &crate::sandbox::seatbelt::Seatbelt,
+            &session_dir,
+            Path::new("/tmp"),
+        )
+        .expect("sandboxed_bash_response")
+        .expect("Some(response) for a valid Bash command");
         let wrapped = response
             .hook_specific_output
             .updated_input
@@ -871,6 +895,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
             .to_string();
 
         let stdout = run_via_outer_shell(&wrapped);
+        let _ = std::fs::remove_dir_all(&session_dir);
 
         assert_eq!(stdout, format!("{body}\n"));
     }

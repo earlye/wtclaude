@@ -44,7 +44,11 @@ Plan and then execs the command.
   before Claude runs the command, so a guard in the hook would delete the
   profile before `sandbox-exec` could open it. Each call writes a uniquely
   named file into the session dir, because Claude issues Bash calls in
-  parallel and a single rewritten path would be truncated mid-read.
+  parallel and a single rewritten path would be truncated mid-read. The dir
+  carries an `owner.lock` held open for the session's lifetime, so a later
+  launch sweeps orphaned dirs (SIGKILLed sessions) without deleting a live
+  session's profile — which judging staleness by age alone would eventually
+  do to any long-running session.
 - **`sudo` cannot work under Landlock.** The kernel requires `NO_NEW_PRIVS`
   before an unprivileged process may restrict itself, so privilege escalation
   is impossible by construction. The Linux system-prompt notice says so, and

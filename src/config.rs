@@ -16,6 +16,24 @@ pub struct UserConfig {
     pub allowlist: Vec<String>,
     #[serde(default)]
     pub socket_allowlist: Vec<String>,
+    /// Which sandbox backend enforces the plan: `auto` (the default) picks
+    /// this platform's preferred available backend, or name one explicitly
+    /// (`seatbelt`, `landlock`).
+    #[serde(rename = "sandbox-backend", default)]
+    pub sandbox_backend: Option<String>,
+}
+
+impl UserConfig {
+    /// What the launcher should ask `sandbox::select` for. Deliberately does
+    /// *not* consult `WTCLAUDE_BACKEND`: that variable is the launcher's
+    /// instruction *to* the hook, and the hook must fail closed when it is
+    /// absent rather than re-deriving a preference of its own.
+    pub fn backend_preference(&self) -> String {
+        self.sandbox_backend
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "auto".to_string())
+    }
 }
 
 #[derive(Deserialize)]
@@ -178,24 +196,32 @@ mod tests {
 
     #[test]
     fn resolve_glob_prefix_resolves_a_symlinked_existing_ancestor() {
-        // wtclaude is macOS-only (Seatbelt/sandbox-exec); /tmp is always a
-        // symlink to /private/tmp there. A pattern rooted at /tmp whose
-        // exact file doesn't exist should still have its existing ancestor
-        // (/tmp itself) canonicalized, not left as the symlink path.
+        // `/tmp` is a symlink to `/private/tmp` on macOS and a real directory
+        // on Linux. Either way, a pattern rooted at /tmp whose exact file
+        // doesn't exist must still have its existing ancestor (/tmp itself)
+        // canonicalized, not left as the unresolved path — so the expectation
+        // is whatever /tmp actually resolves to here, not a hardcoded macOS
+        // path. Hardcoding it made this assert platform-specific while the
+        // function under test was already correct on both.
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
         let resolved = resolve_glob_prefix("/tmp/wtclaude-test-nonexistent-glob-target*");
         assert_eq!(
             resolved,
-            "/private/tmp/wtclaude-test-nonexistent-glob-target*"
+            format!("{}/wtclaude-test-nonexistent-glob-target*", tmp.display())
         );
     }
 
     #[test]
     fn resolve_glob_prefix_walks_up_multiple_nonexistent_levels() {
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
         let resolved =
             resolve_glob_prefix("/tmp/wtclaude-test-a-nonexistent/b-nonexistent/c-nonexistent*");
         assert_eq!(
             resolved,
-            "/private/tmp/wtclaude-test-a-nonexistent/b-nonexistent/c-nonexistent*"
+            format!(
+                "{}/wtclaude-test-a-nonexistent/b-nonexistent/c-nonexistent*",
+                tmp.display()
+            )
         );
     }
 
@@ -219,5 +245,36 @@ mod tests {
             "expected \"..\" to be collapsed, got: {}",
             resolved.display()
         );
+    }
+
+    #[test]
+    fn resolve_existing_prefix_resolves_a_real_symlinked_ancestor() {
+        // The /tmp-based tests above can only observe symlink resolution on a
+        // platform where /tmp *is* a symlink (macOS). On Linux /tmp is a real
+        // directory, so there they'd still pass even if canonicalization were
+        // dropped entirely. Build an actual symlink so the property under test
+        // — a nonexistent target resolving through a symlinked ancestor — is
+        // asserted the same way on every platform. This is the invariant that
+        // keeps the two enforcement layers (policy rules vs. the PreToolUse
+        // path check) agreeing on one path.
+        let base = std::env::temp_dir().join(format!(
+            "wtclaude-test-symlink-ancestor-{}",
+            std::process::id()
+        ));
+        let target = base.join("target");
+        let link = base.join("link");
+        std::fs::create_dir_all(&target).expect("creating target dir");
+        std::os::unix::fs::symlink(&target, &link).expect("creating symlink");
+
+        // Resolve before cleanup, and assert after, so a failure can't leak
+        // the temp tree.
+        let resolved = resolve_existing_prefix(&link.join("not-created-yet"));
+        let expected = target
+            .canonicalize()
+            .expect("canonicalizing target")
+            .join("not-created-yet");
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(resolved, expected);
     }
 }
