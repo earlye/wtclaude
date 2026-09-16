@@ -17,7 +17,10 @@ Plan and then execs the command.
 - **Landlock** (chosen): no external dependency, unprivileged, restricts only
   write-type rights so read/exec/ioctl stay untouched — a near 1:1 match for
   today's deny-all-writes-then-allow-subpaths model. Rulesets also stack, so
-  nested wtclaude sessions work, which `sandbox-exec` cannot do at all.
+  a wrapper run inside an existing sandbox narrows further rather than
+  failing, which `sandbox-exec` cannot do at all. (A whole nested *session*
+  still cannot launch, on either backend: the launcher writes
+  `~/.claude.json` and its scratch dir, both outside the plan by design.)
 - **bubblewrap**: kept in reserve behind the same trait. It's a packaged
   runtime dependency and brings a large behavioral surface (/proc, /dev, /run
   remounts, namespace-visible process tables, EXDEV on cross-bind renames).

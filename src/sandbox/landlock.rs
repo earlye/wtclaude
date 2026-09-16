@@ -42,31 +42,16 @@ impl Backend for Landlock {
     }
 
     fn availability(&self) -> Availability {
-        if !supports(write_rights()) {
-            return Availability::Unavailable(
-                "the kernel has no usable Landlock support. It needs Linux 5.13+ built with \
-                 CONFIG_SECURITY_LANDLOCK and landlock enabled in the active LSM list — check \
-                 /sys/kernel/security/lsm and the kernel's lsm= boot parameter."
-                    .to_string(),
-            );
-        }
-        if !supports(AccessFs::Refer) {
-            return Availability::Unavailable(
-                "this kernel's Landlock is ABI 1, which has no REFER right. The kernel then \
-                 denies every cross-directory rename once a ruleset is enforced, which breaks \
-                 git, cargo and npm. Needs Linux 5.19+ (ABI 2)."
-                    .to_string(),
-            );
-        }
-        if !supports(AccessFs::Truncate) {
-            return Availability::Degraded(
-                "this kernel's Landlock predates the TRUNCATE right (Linux 6.2 / ABI 3), so \
-                 truncate(2) on a path outside the sandbox is not restricted. Writes through \
-                 shell redirection and open(O_TRUNC) are still covered."
-                    .to_string(),
-            );
-        }
-        Availability::Ready
+        // Probed one right at a time, least capable first. `HardRequirement`
+        // errors on a *partially* supported set, so probing the full V4 write
+        // set — which includes TRUNCATE, new in ABI 3 — would fail on every
+        // kernel below Linux 6.2 and report "no Landlock at all" for one that
+        // merely lacks a single right.
+        availability_from(
+            supports(AccessFs::from_write(ABI::V1)),
+            supports(AccessFs::Refer),
+            supports(AccessFs::Truncate),
+        )
     }
 
     fn describe(&self, plan: &Plan) -> String {
@@ -168,6 +153,40 @@ impl Backend for Landlock {
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
+}
+
+/// Maps the three kernel capability probes onto an availability verdict.
+///
+/// Split out from `availability()` so the ordering is testable without a
+/// fake kernel: getting it wrong silently turns a supported-but-degraded
+/// kernel into "refuses to launch", which is what the ABI floor documented
+/// in ADR-0001 is supposed to prevent.
+fn availability_from(has_landlock: bool, has_refer: bool, has_truncate: bool) -> Availability {
+    if !has_landlock {
+        return Availability::Unavailable(
+            "the kernel has no usable Landlock support. It needs Linux 5.13+ built with \
+             CONFIG_SECURITY_LANDLOCK and landlock enabled in the active LSM list — check \
+             /sys/kernel/security/lsm and the kernel's lsm= boot parameter."
+                .to_string(),
+        );
+    }
+    if !has_refer {
+        return Availability::Unavailable(
+            "this kernel's Landlock is ABI 1, which has no REFER right. The kernel then \
+             denies every cross-directory rename once a ruleset is enforced, which breaks \
+             git, cargo and npm. Needs Linux 5.19+ (ABI 2)."
+                .to_string(),
+        );
+    }
+    if !has_truncate {
+        return Availability::Degraded(
+            "this kernel's Landlock predates the TRUNCATE right (Linux 6.2 / ABI 3), so \
+             truncate(2) on a path outside the sandbox is not restricted. Writes through \
+             shell redirection and open(O_TRUNC) are still covered."
+                .to_string(),
+        );
+    }
+    Availability::Ready
 }
 
 /// Asks whether this kernel can govern `access`.
@@ -275,6 +294,38 @@ pub fn run_sandbox(args: SandboxArgs) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_abi_2_kernel_is_degraded_rather_than_unavailable() {
+        // Regression test: the first implementation probed the whole ABI V4
+        // write set under HardRequirement, which errors on a *partially*
+        // supported set. That made every kernel below ABI 3 report "no
+        // Landlock support" and refuse to launch, contradicting the ABI floor
+        // in ADR-0001 and the README, and left the two lower branches
+        // unreachable.
+        assert!(matches!(
+            availability_from(false, false, false),
+            Availability::Unavailable(_)
+        ));
+        assert!(
+            matches!(availability_from(true, false, false), Availability::Unavailable(why) if why.contains("ABI 1"))
+        );
+        assert!(
+            matches!(availability_from(true, true, false), Availability::Degraded(caveat) if caveat.contains("TRUNCATE"))
+        );
+        assert!(matches!(
+            availability_from(true, true, true),
+            Availability::Ready
+        ));
+    }
+
+    #[test]
+    fn each_capability_is_probed_on_its_own_not_as_a_combined_set() {
+        // The V1 write set is supported by every kernel that has Landlock at
+        // all, so this probe must succeed wherever the backend is usable —
+        // unlike the full V4 set, which fails on ABI 1 and ABI 2.
+        assert!(supports(AccessFs::from_write(ABI::V1)));
+    }
 
     #[test]
     fn availability_is_ready_on_a_modern_kernel() {

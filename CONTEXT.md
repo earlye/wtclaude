@@ -98,8 +98,8 @@ before running or merging is the residual control.
 
 - "policy" was used for both the platform-neutral path set and the rendered
   backend-specific text — resolved: **Plan** and **Profile** respectively.
-  The code still says `generate_sbpl_policy` / `WTCLAUDE_SBPL`, which
-  conflates the two and names one dialect; being renamed.
+  `generate_sbpl_policy` and `WTCLAUDE_SBPL` conflated the two and named one
+  dialect; both are gone.
 - "sandbox" was used for both the confinement and the root directory —
   resolved: **Sandbox** and **Sandbox root**.
 - The README described the goal as preventing *accidental* modification,

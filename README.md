@@ -112,6 +112,16 @@ directory but only these names". Such entries are reported at launch
 and grant nothing on Linux. See
 [ADR-0002](docs/adr/0002-glob-allowlist-entries-are-seatbelt-only.md).
 
+**Where you install the binary matters on Linux.** The Landlock wrapper
+re-execs the `wtclaude` binary for every Bash command, and `~/.cargo` is
+in the plan so that builds work — which means a binary installed by
+`cargo install --path .` lands in `~/.cargo/bin`, inside a directory the
+session can write. A session could then replace the very wrapper that
+confines it. Nothing accidental does this, so it is not a concern for the
+primary threat model, but installing to `~/.local/bin` (not in the plan)
+removes the exposure. The same applies to anything else on `PATH` that
+lives under `~/.cargo/bin`.
+
 **Landlock rules need paths that already exist.** A rule is attached to
 an open file descriptor, so an allowlisted cache directory that isn't
 there yet is skipped. The plan is re-derived on every Bash command, so
@@ -119,10 +129,17 @@ such a path becomes writable as soon as something outside the sandbox
 creates it — but a tool cannot create it from inside and then write to
 it in the same command. `--show-policy` lists which paths were skipped.
 
-**Sandboxes nest on Linux.** Landlock rulesets stack, each intersecting
-the last, so a `wtclaude` session inside a `wtclaude` session works and
-cannot widen what the outer one allowed. macOS refuses `sandbox_apply`
-from an already-sandboxed process, so nesting fails there.
+**Landlock enforcement composes; Seatbelt's does not.** Landlock rulesets
+stack, each intersecting the last, so a `wtclaude sandbox` wrapper run
+inside an existing sandbox narrows further and cannot widen what the
+outer one allowed. macOS refuses `sandbox_apply` from an
+already-sandboxed process, so the equivalent fails outright there.
+
+Launching a *whole nested session* still fails on both, by design: the
+launcher writes `~/.claude.json` to accept the trust dialog and creates
+its scratch dir under `~/.local/state`, and neither is in the plan. This
+is the same boundary the sandbox notice describes when it tells a session
+not to create worktrees from inside.
 
 
 ## Requirements

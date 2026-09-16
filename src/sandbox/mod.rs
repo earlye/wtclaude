@@ -569,8 +569,15 @@ pub(crate) mod tests {
         );
     }
 
+    /// `SessionDir::create()` keys the directory on the process id, which
+    /// `cargo test`'s threads all share, so the tests below would otherwise
+    /// delete each other's directory mid-assertion. Production callers are
+    /// separate processes with distinct pids.
+    static SESSION_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn session_dir_is_outside_the_plan_and_removed_on_drop() {
+        let _serialize = SESSION_DIR_LOCK.lock().unwrap();
         // The profile a session runs under must not be writable by that
         // session, so the scratch dir deliberately lives outside every
         // granted subtree.
@@ -596,6 +603,7 @@ pub(crate) mod tests {
 
     #[test]
     fn sweeping_spares_a_live_session_and_removes_an_orphaned_one() {
+        let _serialize = SESSION_DIR_LOCK.lock().unwrap();
         // Regression test: judging staleness by age alone would eventually
         // delete a long-running session's scratch dir while it was still in
         // use, which surfaces as Bash being denied mid-session.
