@@ -1,11 +1,21 @@
 # wtclaude
 
-`wtclaude` is a macOS CLI wrapper for
+`wtclaude` is a CLI wrapper for
 [Claude Code](https://claude.ai/code) that launches an AI coding
-session inside a git worktree with file-write sandboxing. It uses the
-macOS `sandbox-exec` facility and Claude's `PreToolUse` hooks to
-confine all writes to the worktree directory, so Claude cannot
-accidentally modify your main branch or files outside the task scope.
+session inside a git worktree with file-write sandboxing. It combines
+an OS sandbox — macOS Seatbelt, or Linux Landlock — with Claude's
+`PreToolUse` hooks to confine all writes to the worktree directory, so
+a session can run hands-off without the rest of the machine being in
+range.
+
+The primary thing it prevents is *accidental* damage: a session editing
+your main branch, a sibling worktree, or a dotfile because it misread
+the task. Confining writes also shrinks the blast radius of prompt
+injection, but it does not close it — reads and network access are
+unrestricted, so credentials elsewhere on the machine remain readable
+and reachable. And no sandbox can protect you from malicious code
+*inside* the worktree, since that is exactly what a session writes;
+review before running or merging is what covers that.
 
 
 ## How it works
@@ -19,15 +29,15 @@ When you run `wtclaude <name>`, it:
    running `git worktree add` directly — the worktree is managed by
    `wtclaude`, not delegated to `claude`.
 
-3. Writes a temporary SBPL (Sandbox Policy Language) file that allows
-   file writes within the worktree, the repo's `.git` directory, and
-   common package manager cache directories (Cargo, npm, pip, etc.) so
-   that dependency fetching works without leaving the sandbox.
+3. Works out the **plan**: the set of paths this session may write to —
+   the worktree, the repo's `.git` directory, and common package
+   manager cache directories (Cargo, npm, pip, etc.) so that dependency
+   fetching works without leaving the sandbox.
 
 4. Registers a `PreToolUse` hook (itself, via `wtclaude hook`) that
    intercepts every tool call Claude attempts:
 
-   - **Bash**: rewrites the command to run under `sandbox-exec`,
+   - **Bash**: rewrites the command to run under the sandbox backend,
      enforcing write restrictions at the OS level.
 
    - **Write / Edit / NotebookEdit**: checks the target path against
@@ -47,13 +57,98 @@ When you run `wtclaude <name>`, it:
 8. When the Claude session exits, shows an interactive menu to keep or
    remove the worktree.
 
-The SBPL policy file and the settings JSON are written to `/tmp` and
-deleted automatically when the session exits.
+The settings JSON is written to `/tmp` and deleted automatically when
+the session exits. Each session also gets a scratch directory under
+`~/.local/state/wtclaude/sessions/<pid>/`, removed on exit, which holds
+any profile the backend has to write to disk. It deliberately lives
+outside the plan — `/tmp` is writable by the session, so a profile kept
+there could be rewritten by the very session it constrains.
+
+Each scratch directory holds an `owner.lock` that its session keeps open,
+so a later launch can tell an orphaned directory (from a session killed
+with `SIGKILL`) from one still in use, and sweeps only the orphans. Age
+is not used for this: a session running for weeks would otherwise have
+its profile deleted out from under it.
+
+
+## Sandbox backends
+
+| Backend | Platform | Mechanism |
+|---------|----------|-----------|
+| `seatbelt` | macOS | Compiles an SBPL profile, runs each Bash command under `/usr/bin/sandbox-exec`. |
+| `landlock` | Linux 5.19+ | Applies a Landlock ruleset in-process via `wtclaude sandbox`, which then execs the command. |
+| `bubblewrap` | Linux | Reserved, not implemented. Asking for it reports so explicitly. |
+
+Selection is automatic — the platform's preferred available backend —
+and can be pinned with `sandbox-backend` in `~/.config/wtclaude/wtclaude.yml`.
+
+If no backend on the machine can enforce a plan, `wtclaude` refuses to
+launch rather than starting a session that only looks sandboxed.
+
+### Differences between backends
+
+Neither backend is a superset of the other; these are the places where
+the same configuration behaves differently.
+
+**`sudo` cannot work under Landlock.** The kernel requires the
+`NO_NEW_PRIVS` flag before an unprivileged process may sandbox itself,
+and that same flag stops setuid binaries from elevating. So `sudo`,
+`doas`, `pkexec` and `su` fail no matter how they are invoked. The hook
+refuses them in command position with an explanation, rather than
+letting them fail with a confusing kernel message. Install toolchains
+outside the sandbox and let the session use them.
+
+**Heredocs are only restricted under Seatbelt.** Apple's bash 3.2
+miscounts quote nesting for a heredoc inside a `$(...)` inside double
+quotes — the common `git commit -m "$(cat <<'EOF' ... EOF)"` idiom —
+so the hook denies heredocs there outright. Linux bash parses that
+shape correctly, so they are allowed.
+
+**Glob allowlist entries only work under Seatbelt.** An entry like
+`~/.claude.json*` compiles to an anchored SBPL regex on macOS. Landlock
+has no path-pattern matching at all: it grants rights per directory or
+file, and *unions* overlapping rules, so it cannot express "this
+directory but only these names". Such entries are reported at launch
+and grant nothing on Linux. See
+[ADR-0002](docs/adr/0002-glob-allowlist-entries-are-seatbelt-only.md).
+
+**Where you install the binary matters on Linux.** The Landlock wrapper
+re-execs the `wtclaude` binary for every Bash command, and `~/.cargo` is
+in the plan so that builds work — which means a binary installed by
+`cargo install --path .` lands in `~/.cargo/bin`, inside a directory the
+session can write. A session could then replace the very wrapper that
+confines it. Nothing accidental does this, so it is not a concern for the
+primary threat model, but installing to `~/.local/bin` (not in the plan)
+removes the exposure. The same applies to anything else on `PATH` that
+lives under `~/.cargo/bin`.
+
+**Landlock rules need paths that already exist.** A rule is attached to
+an open file descriptor, so an allowlisted cache directory that isn't
+there yet is skipped. The plan is re-derived on every Bash command, so
+such a path becomes writable as soon as something outside the sandbox
+creates it — but a tool cannot create it from inside and then write to
+it in the same command. `--show-policy` lists which paths were skipped.
+
+**Landlock enforcement composes; Seatbelt's does not.** Landlock rulesets
+stack, each intersecting the last, so a `wtclaude sandbox` wrapper run
+inside an existing sandbox narrows further and cannot widen what the
+outer one allowed. macOS refuses `sandbox_apply` from an
+already-sandboxed process, so the equivalent fails outright there.
+
+Launching a *whole nested session* still fails on both, by design: the
+launcher writes `~/.claude.json` to accept the trust dialog and creates
+its scratch dir under `~/.local/state`, and neither is in the plan. This
+is the same boundary the sandbox notice describes when it tells a session
+not to create worktrees from inside.
 
 
 ## Requirements
 
-- macOS (uses `/usr/bin/sandbox-exec`)
+- macOS (uses `/usr/bin/sandbox-exec`), or Linux 5.19+ with Landlock
+  enabled — `CONFIG_SECURITY_LANDLOCK=y` and `landlock` present in
+  `/sys/kernel/security/lsm`. Linux 6.2+ is preferable; before that
+  Landlock has no `TRUNCATE` right, and `wtclaude` warns once that
+  `truncate(2)` on a path outside the sandbox is unrestricted.
 
 - [Claude Code](https://claude.ai/code) CLI (`claude`) on your `PATH`
 
@@ -91,7 +186,7 @@ next word auto-fills the matching worktree name.
 
 ```
 wtclaude [--mode MODE] [--no-pull] [--resume SESSION_ID] \
-         [--show-policy] [--test-sbpl-breakage hide|missing] \
+         [--show-policy] [--test-sandbox-breakage hide|missing] \
          WORKTREE_NAME [INITIAL_PROMPT]
 ```
 
@@ -112,8 +207,8 @@ this"` — otherwise it looks like an unrecognized flag.
 | `--mode MODE` | Operation mode (see Modes). Overrides `WTCLAUDE_DEFAULT_MODE` and config. |
 | `--no-pull` | Skip `git pull` before launching. |
 | `--resume SESSION_ID` | Resume a previous Claude session by ID. |
-| `--show-policy` | Print the generated SBPL policy and pause before launching. |
-| `--test-sbpl-breakage hide\|missing` | Inject a sandbox policy fault for testing (see below). |
+| `--show-policy` | Print the plan the backend would enforce, and pause before launching. |
+| `--test-sandbox-breakage hide\|missing` | Inject a sandbox fault for testing (see below). |
 
 Examples:
 
@@ -187,16 +282,49 @@ modes:
     claude-flags: ["--verbose"]
 ```
 
+### Per-machine configuration
+
+`~/.config/wtclaude/wtclaude.yml` holds settings that belong to the
+machine rather than the binary:
+
+```yaml
+# Which backend enforces the plan: auto (default), seatbelt, landlock.
+sandbox-backend: auto
+
+# Extra paths a session may write to, beyond the worktree, .git and the
+# built-in cache directories. `~` is expanded.
+allowlist:
+  - ~/.gnupg
+  - ~/some/shared/cache
+
+# Unix sockets a session may write to and connect to.
+socket_allowlist:
+  - ~/.colima/default/docker.sock
+```
+
+An `allowlist` entry containing `*` is a glob, which only the Seatbelt
+backend can express (see Differences between backends). An entry whose
+wildcard has no literal path prefix — `*`, `/*`, `*.log` — is rejected
+at startup, since it would match nearly every path and quietly disable
+the sandbox.
+
 
 ## Sandbox enforcement
 
 Two layers of enforcement work together:
 
-**OS layer** — `sandbox-exec` enforces the SBPL policy on every Bash
-command. Writes outside the allowed paths fail with `Operation not
-permitted` at the kernel level. A `PostToolUseFailure` hook injects
-context into Claude's next message so it understands why the write
-failed.
+**OS layer** — the backend enforces the plan on every Bash command.
+Writes outside the allowed paths fail at the kernel level, with
+`Operation not permitted` under Seatbelt or `Permission denied`
+(`EACCES`) under Landlock. A `PostToolUseFailure` hook injects context
+into Claude's next message so it understands why the write failed.
+
+The plan is derived fresh for each Bash command rather than compiled
+once at launch. It costs a few milliseconds against a hook that already
+pays a process spawn, and on Linux it is close to required: a Landlock
+rule needs a path that already exists, so a cache directory created
+part-way through a session would otherwise stay unwritable for the rest
+of it.
 
 The following paths are writable in addition to the worktree and
 `.git`:
@@ -220,12 +348,32 @@ The following paths are writable in addition to the worktree and
 | NuGet | `~/.nuget` |
 | Conan | `~/.conan2` |
 | Docker | `~/.docker` |
-| cargo-xwin | `~/Library/Caches/cargo-xwin` |
+| cargo-xwin | `~/Library/Caches/cargo-xwin` (macOS) |
+| Go build cache | `~/.cache/go-build` (Linux) |
+| gpg | `~/.gnupg` |
+| Keychain | `~/Library/Keychains` (macOS) |
+| Agent sockets | `$XDG_RUNTIME_DIR` (Linux) |
 
-| Temp files | `/tmp`, `/private/tmp`, `/var/folders`, `/private/var/folders`, `$TMPDIR` |
+| Temp files | `/tmp`, `$TMPDIR`, plus `/private/tmp`, `/var/folders`, `/private/var/folders` (macOS) or `/var/tmp` (Linux) |
+| Devices | `/dev/null` (macOS), the whole of `/dev` (Linux) |
 
 Package manager *installers* (e.g. Homebrew) are not allowlisted;
 only caching directories are included.
+
+`~/.gnupg` is included because `commit.gpgsign` makes signing part of
+committing, and gpg takes a lock in the keyring *directory* before it
+will sign — it creates `.#lk<addr>`, links it to `pubring.kbx.lock`,
+and unlinks it afterwards. Without write access there, `git commit`
+fails with `failed to write commit object`, which points nowhere near
+the sandbox. (It writes nothing to `trustdb.gpg` in the process; the
+lock is pessimism against a concurrent gpg rewriting the keybox
+mid-read.)
+
+On Linux the whole of `/dev` is granted rather than an enumerated list.
+Ordinary filesystem permissions still stop a non-root session from
+writing real devices, and the enumeration is long and easy to leave a
+gap in — a missing `/dev/null` alone breaks `git`, `mktemp`, `stty` and
+any script redirecting to it.
 
 **Hook layer** — The `PreToolUse` hook inspects `Write`, `Edit`, and
 `NotebookEdit` tool calls before Claude executes them. Any path
@@ -250,20 +398,27 @@ selecting **keep** leaves the worktree in place.
 
 ## Testing sandbox breakage
 
-The `--test-sbpl-breakage` flag is for development and testing:
+The `--test-sandbox-breakage` flag is for development and testing:
 
-- `hide` — omits `WTCLAUDE_SBPL` from the environment entirely
-  (simulates a missing env var).
+- `hide` — omits `WTCLAUDE_BACKEND` from the environment (simulates the
+  hook being unable to tell which backend is active).
 
-- `missing` — sets `WTCLAUDE_SBPL` to a path that does not exist
-  (simulates a deleted policy file).
+- `missing` — points `WTCLAUDE_SESSION_DIR` at a path that does not
+  exist (simulates the launching process being gone).
 
 In both cases `wtclaude hook` will block all Bash execution and report
-the reason to Claude.
+the reason to Claude. The hook never falls back to picking a backend
+itself, so neither fault can quietly result in an unconstrained
+command.
 
-The `--show-policy` flag prints the generated SBPL policy to stdout
-and pauses (waiting for Enter) before launching Claude. Useful for
-inspecting exactly what write paths are allowlisted.
+The `--show-policy` flag prints the plan to stdout and pauses (waiting
+for Enter) before launching Claude. Useful for inspecting exactly what
+write paths are granted — and, on Linux, which were skipped for not
+existing yet.
+
+`wtclaude sandbox --describe` (Linux) prints the same plan from inside
+the wrapper, reading `WTCLAUDE_SANDBOX` and `WTCLAUDE_REPO_ROOT` from
+the environment the way a real Bash call would.
 
 
 ## License

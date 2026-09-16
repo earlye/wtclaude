@@ -464,14 +464,16 @@ fn path_subcommand_accepts_a_literal_dot_as_the_current_directory() {
 }
 
 #[test]
-fn path_subcommand_sbpl_policy_allowlists_directory_and_repo_git_dir() {
-    // Confirms the *actual generated policy content* for repo-mode `path`,
-    // not just the WTCLAUDE_REPO_ROOT env var wiring: a regression that
-    // accidentally passed `None` instead of `repo_root.as_deref()` into
-    // `write_sbpl_policy` would leave every existing env-var-only test
-    // passing while silently dropping the repo's .git from the allowlist.
-    let repo = git_init_dir("sbpl-policy-repo");
-    let home = unique_temp_dir("sbpl-policy-home");
+fn path_subcommand_plan_grants_the_directory_and_the_repo_git_dir() {
+    // Confirms the *actual plan content* for repo-mode `path`, not just the
+    // WTCLAUDE_REPO_ROOT env var wiring: a regression that passed `None`
+    // instead of `repo_root.as_deref()` would leave every existing
+    // env-var-only test passing while silently dropping the repo's .git.
+    //
+    // Asserted per backend, since the rendering is a backend's own dialect:
+    // Seatbelt emits SBPL, Landlock emits its own listing.
+    let repo = git_init_dir("plan-content-repo");
+    let home = unique_temp_dir("plan-content-home");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
         .args(["path", "--show-policy", repo.to_str().unwrap(), "hello"])
@@ -484,10 +486,10 @@ fn path_subcommand_sbpl_policy_allowlists_directory_and_repo_git_dir() {
         .spawn()
         .expect("failed to spawn wtclaude");
 
-    // --show-policy prints the policy, then blocks on a stdin read waiting
-    // for Enter; closing stdin immediately unblocks it without needing to
-    // press anything, and it then fails to exec `claude` (not on PATH),
-    // which is fine — the policy was already printed by that point.
+    // --show-policy prints the plan, then blocks on a stdin read waiting for
+    // Enter; closing stdin immediately unblocks it without needing to press
+    // anything, and it then fails to exec `claude` (not on PATH), which is
+    // fine — the plan was already printed by that point.
     drop(child.stdin.take());
     let output = child.wait_with_output().expect("wait for wtclaude");
 
@@ -496,20 +498,27 @@ fn path_subcommand_sbpl_policy_allowlists_directory_and_repo_git_dir() {
     std::fs::remove_dir_all(&home).ok();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains(&format!(
-            "(allow file-write* (subpath \"{}\"))",
-            expected_repo_dir.display()
-        )),
-        "policy should allowlist DIRECTORY itself: {stdout}"
-    );
-    assert!(
-        stdout.contains(&format!(
-            "(allow file-write* (subpath \"{}\"))",
-            expected_repo_dir.join(".git").display()
-        )),
-        "policy should allowlist the repo's .git dir: {stdout}"
-    );
+    for expected in expected_grants(&expected_repo_dir) {
+        assert!(
+            stdout.contains(&expected),
+            "plan should contain {expected:?}:\n{stdout}"
+        );
+    }
+}
+
+/// The lines a backend emits for a granted directory and the repo's `.git`.
+fn expected_grants(repo_dir: &std::path::Path) -> Vec<String> {
+    let git_dir = repo_dir.join(".git");
+    #[cfg(target_os = "macos")]
+    return vec![
+        format!("(allow file-write* (subpath \"{}\"))", repo_dir.display()),
+        format!("(allow file-write* (subpath \"{}\"))", git_dir.display()),
+    ];
+    #[cfg(target_os = "linux")]
+    return vec![
+        format!("write-subtree {}", repo_dir.display()),
+        format!("write-subtree {}", git_dir.display()),
+    ];
 }
 
 #[test]
@@ -548,17 +557,14 @@ fn path_subcommand_treats_directory_as_repo_less_regardless_of_locale() {
 }
 
 #[test]
-fn hook_regenerates_missing_sbpl_policy_without_repo_root_when_directory_is_repo_less() {
-    // Directly exercises hook.rs's regenerate_sbpl_policy with
-    // WTCLAUDE_REPO_ROOT unset — the exact scenario `wtclaude path` against
-    // a non-repo DIRECTORY produces, and the code path this diff moved from
-    // a hard `bail!` to tolerating a missing repo root. Runs as its own
-    // subprocess so mutating WTCLAUDE_SANDBOX/WTCLAUDE_SBPL/WTCLAUDE_REPO_ROOT
-    // here can't race with any other test's use of those process-global vars.
-    let dir = unique_temp_dir("hook-regen-dir");
-    // Deliberately does not exist yet: wrap_bash_in_sandbox regenerates a
-    // missing policy file, which is the behavior under test.
-    let sbpl_path = dir.join("missing-policy.sb");
+fn hook_wraps_bash_without_repo_root_when_directory_is_repo_less() {
+    // Directly exercises the hook's per-call plan derivation with
+    // WTCLAUDE_REPO_ROOT unset — the exact scenario `wtclaude path` against a
+    // non-repo DIRECTORY produces. Runs as its own subprocess so setting
+    // WTCLAUDE_SANDBOX/WTCLAUDE_BACKEND/WTCLAUDE_SESSION_DIR here can't race
+    // with any other test's use of those process-global vars.
+    let dir = unique_temp_dir("hook-repo-less-dir");
+    let session_dir = unique_temp_dir("hook-repo-less-session");
     let payload = format!(
         r#"{{"tool_name":"Bash","cwd":"{}","tool_input":{{"command":"echo hi"}}}}"#,
         dir.to_str().unwrap()
@@ -567,7 +573,8 @@ fn hook_regenerates_missing_sbpl_policy_without_repo_root_when_directory_is_repo
     let mut child = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
         .args(["hook"])
         .env("WTCLAUDE_SANDBOX", &dir)
-        .env("WTCLAUDE_SBPL", &sbpl_path)
+        .env("WTCLAUDE_SESSION_DIR", &session_dir)
+        .env("WTCLAUDE_BACKEND", active_backend_name())
         .env_remove("WTCLAUDE_REPO_ROOT")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -584,9 +591,9 @@ fn hook_regenerates_missing_sbpl_policy_without_repo_root_when_directory_is_repo
         .expect("write hook payload");
 
     let output = child.wait_with_output().expect("wait for wtclaude hook");
-    let regenerated = std::fs::read_to_string(&sbpl_path);
 
     std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&session_dir).ok();
 
     assert!(
         output.status.success(),
@@ -602,11 +609,9 @@ fn hook_regenerates_missing_sbpl_policy_without_repo_root_when_directory_is_repo
         !stdout.contains("deny"),
         "hook should not deny the Bash call: stdout: {stdout}"
     );
-    let regenerated = regenerated.expect("policy file should have been regenerated");
-    assert!(
-        !regenerated.contains(".git"),
-        "regenerated policy should have no repo .git allowlisted: {regenerated}"
-    );
+    // That a repo-less plan grants no `.git` is asserted directly by
+    // sandbox::tests::plan_omits_repo_git_dirs_when_repo_root_is_none; there
+    // is no longer a policy file here to inspect for it.
 }
 
 #[test]
@@ -632,4 +637,13 @@ fn path_subcommand_fails_closed_when_home_cannot_be_resolved() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("refusing to sandbox"), "stderr: {stderr}");
+}
+
+/// The backend `auto` resolves to on this platform, as the launcher would
+/// have exported it in `WTCLAUDE_BACKEND`.
+fn active_backend_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    return "seatbelt";
+    #[cfg(target_os = "linux")]
+    return "landlock";
 }
