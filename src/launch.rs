@@ -12,9 +12,96 @@ impl Drop for TempFile {
 }
 
 use crate::config;
+use crate::sandbox;
+
+/// The launcher's side of the sandbox: the chosen backend, plus the session
+/// scratch dir that owns any profile files for the lifetime of the session.
+///
+/// The scratch dir's guard has to live here rather than in the hook, because
+/// the hook is a separate short-lived process that exits before Claude runs
+/// the command it rewrote — a guard there would delete a profile before the
+/// wrapper could open it.
+struct SandboxSession {
+    backend: Box<dyn sandbox::Backend>,
+    dir: sandbox::SessionDir,
+}
+
+impl SandboxSession {
+    /// Picks a backend and reports anything it cannot enforce. Fails if no
+    /// backend on this machine can confine writes at all, rather than
+    /// launching a session that only looks sandboxed.
+    fn start(sandbox_root: &Path, repo_root: Option<&Path>) -> Result<Self> {
+        let preference = config::load_user()?.backend_preference();
+        let (backend, caveat) = sandbox::select(&preference)?;
+        if let Some(caveat) = caveat {
+            eprintln!("wtclaude: warning: {caveat}");
+        }
+        for unhonored in backend.unhonored(&sandbox::plan(sandbox_root, repo_root)?) {
+            eprintln!("wtclaude: warning: {unhonored}");
+        }
+        Ok(Self {
+            backend,
+            dir: sandbox::SessionDir::create()?,
+        })
+    }
+
+    /// What `--show-policy` prints.
+    fn describe(&self, sandbox_root: &Path, repo_root: Option<&Path>) -> Result<String> {
+        Ok(self
+            .backend
+            .describe(&sandbox::plan(sandbox_root, repo_root)?))
+    }
+
+    /// The sandbox notice for `--append-system-prompt`: what is true of every
+    /// backend, plus what this one specifically forbids.
+    fn notice(&self) -> String {
+        format!(
+            "{} {}",
+            sandbox::sandbox_warning_common(),
+            self.backend.notice()
+        )
+    }
+
+    /// Tells the child which sandbox it is in. Every variable is set or
+    /// explicitly cleared, never merely left alone: this process may itself
+    /// be running inside an outer wtclaude sandbox, whose values would
+    /// otherwise leak through by inheritance.
+    fn apply_env(
+        &self,
+        cmd: &mut Command,
+        sandbox_root: &Path,
+        repo_root: Option<&Path>,
+        breakage: Option<SandboxBreakage>,
+    ) {
+        cmd.env("WTCLAUDE_SANDBOX", sandbox_root);
+        match repo_root {
+            Some(repo_root) => cmd.env("WTCLAUDE_REPO_ROOT", repo_root),
+            None => cmd.env_remove("WTCLAUDE_REPO_ROOT"),
+        };
+        match breakage {
+            None => {
+                cmd.env("WTCLAUDE_BACKEND", self.backend.name());
+                cmd.env("WTCLAUDE_SESSION_DIR", self.dir.path());
+            }
+            // Simulates "the hook cannot tell which backend is active", which
+            // must block Bash rather than let the hook pick one itself.
+            Some(SandboxBreakage::Hide) => {
+                cmd.env_remove("WTCLAUDE_BACKEND");
+                cmd.env("WTCLAUDE_SESSION_DIR", self.dir.path());
+            }
+            // Simulates "the launching process is gone": the session dir is
+            // a backend's proof that the launcher is still alive and owns the
+            // cleanup, so a missing one must block Bash too.
+            Some(SandboxBreakage::Missing) => {
+                cmd.env("WTCLAUDE_BACKEND", self.backend.name());
+                cmd.env("WTCLAUDE_SESSION_DIR", self.dir.path().join("gone"));
+            }
+        };
+    }
+}
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum SbplBreakage {
+enum SandboxBreakage {
     Hide,
     Missing,
 }
@@ -38,9 +125,9 @@ pub struct Args {
     /// Print the generated sandbox policy and pause for Enter before launching
     #[arg(long)]
     show_policy: bool,
-    /// Inject sandbox policy breakage for testing
+    /// Inject sandbox breakage for testing
     #[arg(long, value_enum, value_name = "TYPE")]
-    test_sbpl_breakage: Option<SbplBreakage>,
+    test_sandbox_breakage: Option<SandboxBreakage>,
     /// Name of the worktree/branch to launch
     #[arg(value_name = "WORKTREE_NAME")]
     name: String,
@@ -97,7 +184,9 @@ pub fn run(args: Args) -> Result<i32> {
     update_trust(&repo_root)?;
 
     let canonical = if in_place {
-        repo_root.canonicalize().unwrap_or_else(|_| repo_root.clone())
+        repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.clone())
     } else {
         let worktree_path = repo_root
             .join(".claude")
@@ -111,11 +200,10 @@ pub fn run(args: Args) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let _sbpl_policy = write_sbpl_policy(&canonical, Some(&repo_root), &sanitize_name(&args.name))?;
+    let session = SandboxSession::start(&canonical, Some(&repo_root))?;
 
     if args.show_policy {
-        let policy = std::fs::read_to_string(&_sbpl_policy.0).context("reading sbpl policy")?;
-        println!("{}", policy);
+        println!("{}", session.describe(&canonical, Some(&repo_root))?);
         print!("Press Enter to continue...");
         use std::io::{self, BufRead, Write};
         io::stdout().flush()?;
@@ -127,7 +215,7 @@ pub fn run(args: Args) -> Result<i32> {
          You may only write files under: {}. {}",
         args.name,
         canonical.display(),
-        sandbox_warning_common()
+        session.notice()
     );
 
     let mut cmd = Command::new("claude");
@@ -140,20 +228,12 @@ pub fn run(args: Args) -> Result<i32> {
     }
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
-    cmd.env("WTCLAUDE_SANDBOX", &canonical);
-    cmd.env("WTCLAUDE_REPO_ROOT", &repo_root);
-    match args.test_sbpl_breakage {
-        None => {
-            cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
-        }
-        Some(SbplBreakage::Hide) => {}
-        Some(SbplBreakage::Missing) => {
-            cmd.env(
-                "WTCLAUDE_SBPL",
-                format!("/tmp/wtclaude-sbpl-missing-{}.sb", std::process::id()),
-            );
-        }
-    }
+    session.apply_env(
+        &mut cmd,
+        &canonical,
+        Some(&repo_root),
+        args.test_sandbox_breakage,
+    );
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -172,24 +252,6 @@ pub fn run(args: Args) -> Result<i32> {
     }
 
     Ok(exit_code)
-}
-
-fn sandbox_warning_common() -> &'static str {
-    "Do not attempt to create new worktrees (e.g. via `git worktree add`, `wtclaude new`, \
-     or an EnterWorktree/spawn-agent-in-worktree tool) from within this sandbox: creating a \
-     worktree requires writing to the main repository's `.git` directory, which is outside \
-     this sandbox and will be rejected. \
-     Avoid heredocs (e.g. `cat <<'EOF' ... EOF`) nested inside a `$(...)` command \
-     substitution inside double quotes — the common `git commit -m \"$(cat <<'EOF' ... \
-     EOF)\"` idiom included. Apple's bash 3.2 (which backs both /bin/sh and /bin/bash on \
-     macOS, and is what this sandbox's `sh -c` wrapper runs) has a real parsing bug there: \
-     depending on the exact single-quote/backslash content of the heredoc body, it can \
-     miscount quote nesting and fail with 'unexpected EOF while looking for matching' or a \
-     syntax error, even though the same text is valid POSIX shell and works fine in zsh. \
-     This is unrelated to sandboxing and reproduces with no sandbox involved at all. Prefer \
-     writing multi-line content (like a commit message) to a temp file and using it \
-     directly, e.g. `git commit -F /tmp/msg.txt`, instead of the heredoc-in-command-\
-     substitution pattern."
 }
 
 // Note: when used as the `Commands::Headless` subcommand variant in
@@ -260,13 +322,12 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let _sbpl_policy = write_sbpl_policy(&canonical, Some(&repo_root), "headless")?;
+    let session = SandboxSession::start(&canonical, Some(&repo_root))?;
 
     if args.show_policy {
         // Printed to stderr, not stdout, so it never mixes into `claude
         // --print`'s own stdout output (headless mode's passthrough result).
-        let policy = std::fs::read_to_string(&_sbpl_policy.0).context("reading sbpl policy")?;
-        eprintln!("{}", policy);
+        eprintln!("{}", session.describe(&canonical, Some(&repo_root))?);
     }
 
     let sandbox_notice = format!(
@@ -274,7 +335,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
          You may only write files under that directory (plus the repo's .git and a few \
          package-manager cache dirs). {}",
         canonical.display(),
-        sandbox_warning_common()
+        session.notice()
     );
 
     let mut cmd = Command::new("claude");
@@ -297,9 +358,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     }
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
-    cmd.env("WTCLAUDE_SANDBOX", &canonical);
-    cmd.env("WTCLAUDE_REPO_ROOT", &repo_root);
-    cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
+    session.apply_env(&mut cmd, &canonical, Some(&repo_root), None);
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -342,9 +401,9 @@ pub struct PathArgs {
     /// Print the generated sandbox policy and pause for Enter before launching
     #[arg(long)]
     show_policy: bool,
-    /// Inject sandbox policy breakage for testing
+    /// Inject sandbox breakage for testing
     #[arg(long, value_enum, value_name = "TYPE")]
-    test_sbpl_breakage: Option<SbplBreakage>,
+    test_sandbox_breakage: Option<SandboxBreakage>,
     /// Directory to sandbox against and launch claude in (use `.` for the current directory)
     #[arg(value_name = "DIRECTORY")]
     directory: PathBuf,
@@ -425,11 +484,10 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let _sbpl_policy = write_sbpl_policy(&canonical, repo_root.as_deref(), "path")?;
+    let session = SandboxSession::start(&canonical, repo_root.as_deref())?;
 
     if args.show_policy {
-        let policy = std::fs::read_to_string(&_sbpl_policy.0).context("reading sbpl policy")?;
-        println!("{}", policy);
+        println!("{}", session.describe(&canonical, repo_root.as_deref())?);
         print!("Press Enter to continue...");
         use std::io::{self, BufRead, Write};
         io::stdout().flush()?;
@@ -445,7 +503,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         } else {
             ""
         },
-        sandbox_warning_common()
+        session.notice()
     );
 
     let mut cmd = Command::new("claude");
@@ -458,33 +516,12 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
     }
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
-    cmd.env("WTCLAUDE_SANDBOX", &canonical);
-    // Explicitly cleared (not just left unset) when there's no repo: this
-    // process may itself be running inside another wtclaude sandbox, whose
-    // own WTCLAUDE_REPO_ROOT would otherwise leak through to the child via
-    // ambient env inheritance.
-    match &repo_root {
-        Some(repo_root) => cmd.env("WTCLAUDE_REPO_ROOT", repo_root),
-        None => cmd.env_remove("WTCLAUDE_REPO_ROOT"),
-    };
-    match args.test_sbpl_breakage {
-        None => {
-            cmd.env("WTCLAUDE_SBPL", &_sbpl_policy.0);
-        }
-        // Cleared, not just left unset, for the same ambient-leak reason as
-        // WTCLAUDE_REPO_ROOT above: this simulates "policy unavailable",
-        // which an inherited WTCLAUDE_SBPL from an outer wtclaude sandbox
-        // would otherwise quietly defeat.
-        Some(SbplBreakage::Hide) => {
-            cmd.env_remove("WTCLAUDE_SBPL");
-        }
-        Some(SbplBreakage::Missing) => {
-            cmd.env(
-                "WTCLAUDE_SBPL",
-                format!("/tmp/wtclaude-sbpl-missing-{}.sb", std::process::id()),
-            );
-        }
-    }
+    session.apply_env(
+        &mut cmd,
+        &canonical,
+        repo_root.as_deref(),
+        args.test_sandbox_breakage,
+    );
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -1039,22 +1076,8 @@ fn update_trust(repo_root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Resolve a literal allowlist/sandbox path for the SBPL `subpath` rule it
-/// becomes. Delegates to `config::resolve_existing_prefix`, which is a
-/// strict superset of a plain `canonicalize().unwrap_or(p)`: identical
-/// result when `p` exists in full, but also walks up to the longest
-/// existing ancestor and canonicalizes *that* when it doesn't — e.g. a
-/// literal entry for a not-yet-created directory under `/tmp` (symlinked to
-/// `/private/tmp` on macOS) still resolves through the symlink instead of
-/// silently compiling into a `subpath` rule that can never match the
-/// kernel-resolved path. Keeps literal-entry resolution consistent with
-/// `resolve_glob_prefix` and `hook.rs`'s `normalize_path`.
-fn resolve(p: PathBuf) -> PathBuf {
-    config::resolve_existing_prefix(&p)
-}
-
-/// Resolves the git directories that need to be writable for sandbox-policy
-/// purposes: the per-worktree git-dir (`HEAD`, `index`, `FETCH_HEAD`,
+/// Resolves the git directories that need to be writable for the sandbox
+/// plan: the per-worktree git-dir (`HEAD`, `index`, `FETCH_HEAD`,
 /// `MERGE_HEAD`, ...) and the git-common-dir shared across worktrees
 /// (`objects`, `packed-refs`, `config`, ...). For a normal checkout these
 /// are both `<repo_root>/.git`. For a linked worktree (`git worktree add`),
@@ -1062,7 +1085,7 @@ fn resolve(p: PathBuf) -> PathBuf {
 /// directories live under the main repository's `.git` and
 /// `.git/worktrees/<name>/` — asking git itself (rather than re-parsing the
 /// `gitdir:`/`commondir` indirection by hand) follows both correctly.
-fn git_dirs(repo_root: &Path) -> Vec<PathBuf> {
+pub(crate) fn git_dirs(repo_root: &Path) -> Vec<PathBuf> {
     let fallback = || vec![repo_root.join(".git")];
     let Ok(output) = Command::new("git")
         .args(["rev-parse", "--git-dir", "--git-common-dir"])
@@ -1087,163 +1110,6 @@ fn git_dirs(repo_root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Translate a shell-style glob (`*` only, usable anywhere in the pattern)
-/// into a whole-string-anchored SBPL regex. `subpath` matches by path
-/// component, not by glob/wildcard, so it can't express `.tmpXXXX`-style
-/// siblings of a file — entries like `~/.claude.json*` need `regex` instead.
-fn glob_to_regex(pattern: &str) -> String {
-    let mut out = String::from("^");
-    for ch in pattern.chars() {
-        match ch {
-            '*' => out.push_str(".*"),
-            '.' | '^' | '$' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
-                out.push('\\');
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out.push('$');
-    out
-}
-
-/// Escapes a string for embedding inside an SBPL `#"..."` string literal.
-/// `glob_to_regex`'s output can itself contain backslashes (from escaping
-/// regex metacharacters); those and any literal `"` both need escaping here
-/// so the emitted profile stays valid SBPL rather than truncating the
-/// string literal or failing to parse.
-fn sbpl_string_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Splits `allowlist` into entries containing a `*` glob and plain literal
-/// entries, expanding `~` to `home` in both. Pure and parameterized by
-/// `home` (rather than reading `$HOME` itself) so it's directly unit
-/// testable without mutating global process state.
-fn partition_allowlist(allowlist: &[String], home: &str) -> (Vec<String>, Vec<String>) {
-    allowlist
-        .iter()
-        .map(|p| p.replace('~', home))
-        .partition(|p| p.contains('*'))
-}
-
-pub(crate) fn generate_sbpl_policy(sandbox: &Path, repo_root: Option<&Path>) -> Result<String> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-
-    // Package manager cache/data dirs — caching only, not installers (no homebrew etc.)
-    let pkg_cache_dirs = [
-        ".cargo",
-        ".rustup",
-        ".npm",
-        ".pnpm-store",
-        ".local/share/pnpm",
-        ".yarn",
-        ".cache/yarn",
-        ".cache/pip",
-        ".cache/uv",
-        ".cache/pypoetry",
-        ".gem",
-        ".bundle",
-        ".m2",
-        ".gradle",
-        "go/pkg/mod",
-        ".composer",
-        ".nuget",
-        ".conan2",
-        ".docker",
-        "Library/Caches/cargo-xwin",
-    ];
-
-    let user_config = config::load_user()?;
-
-    // Entries containing `*` are globs (e.g. `~/.claude.json*` covering the
-    // file plus its atomic-write tmp siblings) — `canonicalize`/`subpath`
-    // can't express those, since no real path literally contains a `*`.
-    // Route them to a separate `regex` rule instead of the subpath pipeline.
-    let (glob_allow, literal_allow) = partition_allowlist(&user_config.allowlist, &home);
-
-    let raw: Vec<PathBuf> = [
-        sandbox.to_path_buf(),
-        PathBuf::from("/tmp"),
-        PathBuf::from("/private/tmp"),
-        PathBuf::from("/var/folders"),
-        PathBuf::from("/private/var/folders"),
-        PathBuf::from(&tmpdir),
-    ]
-    .into_iter()
-    .chain(repo_root.map(git_dirs).unwrap_or_default())
-    .chain(pkg_cache_dirs.iter().map(|d| PathBuf::from(&home).join(d)))
-    .chain(literal_allow.into_iter().map(PathBuf::from))
-    .collect();
-
-    let mut seen = std::collections::HashSet::new();
-    let allow_paths: Vec<PathBuf> = raw
-        .into_iter()
-        .map(resolve)
-        .filter(|p| seen.insert(p.clone()))
-        .collect();
-
-    let socket_paths: Vec<PathBuf> = user_config
-        .socket_allowlist
-        .iter()
-        .map(|p| resolve(PathBuf::from(p.replace("~", &home))))
-        .collect();
-
-    let mut lines = vec![
-        "(version 1)".to_string(),
-        "(allow default)".to_string(),
-        "(deny file-write* (subpath \"/\"))".to_string(),
-        "(allow file-write* (literal \"/dev/null\"))".to_string(),
-        // Keychain: allow writes so tools like saml2aws can store tokens
-        format!("(allow file-write* (subpath \"{}/Library/Keychains\"))", home),
-        // osascript / AppleEvents support
-        "(allow process-exec* (literal \"/usr/bin/osascript\"))".to_string(),
-        "(allow appleevent-send)".to_string(),
-    ];
-
-    for p in &allow_paths {
-        lines.push(format!(
-            "(allow file-write* (subpath \"{}\"))",
-            p.to_string_lossy()
-        ));
-    }
-
-    for pattern in &glob_allow {
-        // Resolve the pattern's static prefix the same way literal entries
-        // are resolved (line ~717 above): Seatbelt evaluates rules against
-        // the kernel-resolved, symlink-free path, so a glob rooted under a
-        // symlinked prefix (e.g. anything under /tmp) would otherwise
-        // compile into a regex that can never match — silently permitting
-        // nothing, the exact bug class this glob support exists to fix.
-        let resolved_pattern = config::resolve_glob_prefix(pattern);
-        lines.push(format!(
-            "(allow file-write* (regex #\"{}\"))",
-            sbpl_string_escape(&glob_to_regex(&resolved_pattern))
-        ));
-    }
-
-    for p in &socket_paths {
-        let s = p.to_string_lossy();
-        lines.push(format!("(allow file-write* (subpath \"{s}\"))"));
-        lines.push(format!("(allow network-outbound (subpath \"{s}\"))"));
-        lines.push(format!("(allow network-bind    (subpath \"{s}\"))"));
-    }
-
-    Ok(lines.join("\n") + "\n")
-}
-
-fn write_sbpl_policy(
-    sandbox: &Path,
-    repo_root: Option<&Path>,
-    _worktree_name: &str,
-) -> Result<TempFile> {
-    let policy = generate_sbpl_policy(sandbox, repo_root)?;
-    let path = PathBuf::from(format!("/tmp/wtclaude-sbpl-{}.sb", std::process::id()));
-    std::fs::write(&path, policy).context("writing sbpl policy")?;
-    Ok(TempFile(path))
-}
-
 fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
     let binary = binary_path.to_string_lossy();
     let settings = serde_json::json!({
@@ -1265,7 +1131,11 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUseFailure\",\"additionalContext\":\"Note: Bash commands in this session are wrapped in sandbox-exec. File writes are restricted to: %s. Commands writing outside this path fail with Operation not permitted.\"}}\n' \"$WTCLAUDE_SANDBOX\""
+                            // Deliberately names neither backend nor a specific
+                            // errno: Seatbelt reports "Operation not permitted"
+                            // and Landlock "Permission denied", and this string
+                            // is baked into the settings file at launch.
+                            "command": "printf '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUseFailure\",\"additionalContext\":\"Note: Bash commands in this session run inside a filesystem sandbox (%s). File writes are restricted to: %s. Commands writing outside this path fail with a permission error from the kernel.\"}}\n' \"$WTCLAUDE_BACKEND\" \"$WTCLAUDE_SANDBOX\""
                         }
                     ]
                 }
@@ -1282,73 +1152,6 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resolve_resolves_a_symlinked_existing_ancestor_for_a_nonexistent_literal_entry() {
-        // Regression test: a literal (non-glob) allowlist entry for a path
-        // that doesn't exist yet under /tmp (symlinked to /private/tmp on
-        // macOS) must still resolve through that symlink — otherwise the
-        // emitted SBPL `subpath` rule can never match the kernel-resolved
-        // path, silently denying Bash writes that Write/Edit/NotebookEdit
-        // (via hook.rs's normalize_path) would allow for the same entry.
-        let resolved = resolve(PathBuf::from(
-            "/tmp/wtclaude-test-nonexistent-literal-entry",
-        ));
-        assert_eq!(
-            resolved,
-            PathBuf::from("/private/tmp/wtclaude-test-nonexistent-literal-entry")
-        );
-    }
-
-    #[test]
-    fn glob_to_regex_translates_trailing_star_to_anchored_dotstar() {
-        // Regression test: `~/.claude.json*` in wtclaude.yml must produce a
-        // regex that matches the base file, not just literal-`*` paths that
-        // never exist (the bug that made the entry a silent no-op).
-        assert_eq!(
-            glob_to_regex("/Users/earlye/.claude.json*"),
-            r"^/Users/earlye/\.claude\.json.*$"
-        );
-    }
-
-    #[test]
-    fn glob_to_regex_escapes_regex_metacharacters() {
-        assert_eq!(glob_to_regex("/a/b.c*"), r"^/a/b\.c.*$");
-    }
-
-    #[test]
-    fn glob_to_regex_escapes_every_listed_metacharacter() {
-        assert_eq!(
-            glob_to_regex(r"a.b^c$d+e?f(g)h[i]j{k}l|m\n"),
-            r"^a\.b\^c\$d\+e\?f\(g\)h\[i\]j\{k\}l\|m\\n$"
-        );
-    }
-
-    #[test]
-    fn glob_to_regex_handles_leading_and_middle_wildcards() {
-        assert_eq!(glob_to_regex("*.log"), r"^.*\.log$");
-        assert_eq!(glob_to_regex("/a/foo*bar"), r"^/a/foo.*bar$");
-    }
-
-    #[test]
-    fn sbpl_string_escape_escapes_backslash_and_quote() {
-        assert_eq!(sbpl_string_escape(r#"a\b"c"#), r#"a\\b\"c"#);
-    }
-
-    #[test]
-    fn partition_allowlist_splits_glob_from_literal_and_expands_tilde() {
-        let allowlist = vec![
-            "~/.claude.json*".to_string(),
-            "~/.cargo".to_string(),
-            "/tmp/plain".to_string(),
-        ];
-        let (glob, literal) = partition_allowlist(&allowlist, "/Users/x");
-        assert_eq!(glob, vec!["/Users/x/.claude.json*".to_string()]);
-        assert_eq!(
-            literal,
-            vec!["/Users/x/.cargo".to_string(), "/tmp/plain".to_string()]
-        );
-    }
 
     // git canonicalizes symlinked ancestors (e.g. macOS's /tmp -> /private/tmp)
     // in its own `rev-parse` output, so test dirs must be canonicalized too —
@@ -1493,36 +1296,6 @@ mod tests {
         ]);
         std::fs::remove_dir_all(&main_repo).unwrap();
     }
-
-    #[test]
-    fn generate_sbpl_policy_omits_repo_git_dirs_when_repo_root_is_none() {
-        let repo_root = unique_test_dir("generate-sbpl-no-repo-root");
-        assert!(
-            Command::new("git")
-                .args(["init", "-q"])
-                .current_dir(&repo_root)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sandbox = unique_test_dir("generate-sbpl-no-repo-root-sandbox");
-
-        let with_repo = generate_sbpl_policy(&sandbox, Some(&repo_root)).unwrap();
-        let without_repo = generate_sbpl_policy(&sandbox, None).unwrap();
-
-        let git_dir = repo_root.join(".git").to_string_lossy().to_string();
-        assert!(
-            with_repo.contains(&git_dir),
-            "expected repo .git dir to be allowlisted when repo_root is Some"
-        );
-        assert!(
-            !without_repo.contains(&git_dir),
-            "expected repo .git dir to be absent when repo_root is None"
-        );
-
-        std::fs::remove_dir_all(&repo_root).unwrap();
-        std::fs::remove_dir_all(&sandbox).unwrap();
-    }
 }
 
 #[cfg(test)]
@@ -1543,7 +1316,7 @@ mod launch_tests {
         assert!(!parsed.no_pull);
         assert!(parsed.resume.is_none());
         assert!(!parsed.show_policy);
-        assert!(parsed.test_sbpl_breakage.is_none());
+        assert!(parsed.test_sandbox_breakage.is_none());
         assert!(parsed.prompt().is_none());
     }
 
@@ -1584,20 +1357,23 @@ mod launch_tests {
     }
 
     #[test]
-    fn parse_args_accepts_test_sbpl_breakage_values() {
-        let hide = parse(&["--test-sbpl-breakage", "hide", "myworktree"]).unwrap();
-        assert!(matches!(hide.test_sbpl_breakage, Some(SbplBreakage::Hide)));
-
-        let missing = parse(&["--test-sbpl-breakage", "missing", "myworktree"]).unwrap();
+    fn parse_args_accepts_test_sandbox_breakage_values() {
+        let hide = parse(&["--test-sandbox-breakage", "hide", "myworktree"]).unwrap();
         assert!(matches!(
-            missing.test_sbpl_breakage,
-            Some(SbplBreakage::Missing)
+            hide.test_sandbox_breakage,
+            Some(SandboxBreakage::Hide)
+        ));
+
+        let missing = parse(&["--test-sandbox-breakage", "missing", "myworktree"]).unwrap();
+        assert!(matches!(
+            missing.test_sandbox_breakage,
+            Some(SandboxBreakage::Missing)
         ));
     }
 
     #[test]
-    fn parse_args_rejects_invalid_test_sbpl_breakage_value() {
-        assert!(parse(&["--test-sbpl-breakage", "bogus", "myworktree"]).is_err());
+    fn parse_args_rejects_invalid_test_sandbox_breakage_value() {
+        assert!(parse(&["--test-sandbox-breakage", "bogus", "myworktree"]).is_err());
     }
 
     #[test]
@@ -1714,7 +1490,7 @@ mod path_tests {
         assert!(!parsed.no_pull);
         assert!(parsed.resume.is_none());
         assert!(!parsed.show_policy);
-        assert!(parsed.test_sbpl_breakage.is_none());
+        assert!(parsed.test_sandbox_breakage.is_none());
         assert!(parsed.prompt().is_none());
     }
 
@@ -1748,14 +1524,17 @@ mod path_tests {
     }
 
     #[test]
-    fn parse_path_args_accepts_test_sbpl_breakage_values() {
-        let hide = parse(&["--test-sbpl-breakage", "hide", "."]).unwrap();
-        assert!(matches!(hide.test_sbpl_breakage, Some(SbplBreakage::Hide)));
-
-        let missing = parse(&["--test-sbpl-breakage", "missing", "."]).unwrap();
+    fn parse_path_args_accepts_test_sandbox_breakage_values() {
+        let hide = parse(&["--test-sandbox-breakage", "hide", "."]).unwrap();
         assert!(matches!(
-            missing.test_sbpl_breakage,
-            Some(SbplBreakage::Missing)
+            hide.test_sandbox_breakage,
+            Some(SandboxBreakage::Hide)
+        ));
+
+        let missing = parse(&["--test-sandbox-breakage", "missing", "."]).unwrap();
+        assert!(matches!(
+            missing.test_sandbox_breakage,
+            Some(SandboxBreakage::Missing)
         ));
     }
 
