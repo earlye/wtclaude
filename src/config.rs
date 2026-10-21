@@ -12,15 +12,11 @@ pub struct Config {
     pub modes: HashMap<String, Mode>,
 }
 
+/// The per-machine config's sandbox settings. Its `default-mode` and `modes`
+/// are read separately, as `ModeOverrides`, so a mistake there can't break
+/// the sandbox of a running session.
 #[derive(Deserialize, Default)]
 pub struct UserConfig {
-    /// Overrides the binary-adjacent (or built-in) `default-mode`.
-    #[serde(rename = "default-mode", default)]
-    pub default_mode: Option<String>,
-    /// Merged over the binary-adjacent (or built-in) modes by name; a mode
-    /// named here replaces that whole entry.
-    #[serde(default)]
-    pub modes: HashMap<String, Mode>,
     #[serde(default)]
     pub allowlist: Vec<String>,
     #[serde(default)]
@@ -43,6 +39,16 @@ impl UserConfig {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "auto".to_string())
     }
+}
+
+/// The per-machine config's `default-mode` and `modes`, overlaid on the
+/// binary-adjacent (or built-in) config by `merge`.
+#[derive(Deserialize, Default)]
+struct ModeOverrides {
+    #[serde(rename = "default-mode", default)]
+    default_mode: Option<String>,
+    #[serde(default)]
+    modes: HashMap<String, Mode>,
 }
 
 #[derive(Deserialize)]
@@ -68,7 +74,7 @@ const MODE_KEYS: &[&str] = &["claude-flags"];
 /// reports them instead.
 pub fn load_user() -> Result<UserConfig> {
     let (home, path) = user_config_path()?;
-    let (config, _unknown) = read_user(&path)?;
+    let (config, _unknown): (UserConfig, _) = read_user(&path)?;
     validate_allowlist(&config.allowlist, &home)?;
     Ok(config)
 }
@@ -79,13 +85,13 @@ fn user_config_path() -> Result<(String, PathBuf)> {
     Ok((home, path))
 }
 
-/// Reads the per-machine config, returning it along with any keys it doesn't
-/// recognise. A missing file is an empty config.
-fn read_user(path: &Path) -> Result<(UserConfig, Vec<String>)> {
+/// Reads the per-machine config as `T`, returning it along with any keys the
+/// file has that it doesn't recognise. A missing file is an empty config.
+fn read_user<T: DeserializeOwned + Default>(path: &Path) -> Result<(T, Vec<String>)> {
     match std::fs::read_to_string(path) {
         Ok(s) => parse_checked(&s, USER_CONFIG_KEYS)
             .with_context(|| format!("parsing {}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((UserConfig::default(), vec![])),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((T::default(), vec![])),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
 }
@@ -94,14 +100,17 @@ fn read_user(path: &Path) -> Result<(UserConfig, Vec<String>)> {
 /// ignore: top-level keys not in `known`, and keys inside a `modes` entry
 /// other than `claude-flags`, as dotted paths (`modes.safe.flags`).
 fn parse_checked<T: DeserializeOwned>(content: &str, known: &[&str]) -> Result<(T, Vec<String>)> {
-    let mut value: Value = serde_yaml::from_str(content)?;
-    // An empty file parses as null; treat it as an empty mapping so structs
-    // whose fields all have defaults still deserialize.
-    if value.is_null() {
-        value = Value::Mapping(Default::default());
-    }
+    let value: Value = serde_yaml::from_str(content)?;
     let unknown = unknown_keys(&value, known);
-    Ok((serde_yaml::from_value(value)?, unknown))
+    // Deserialize from the text rather than `value`: only that keeps the field
+    // path and line/column in type errors. An empty file parses as null; read
+    // it as an empty mapping so structs whose fields all default deserialize.
+    let config = if value.is_null() {
+        serde_yaml::from_str("{}")?
+    } else {
+        serde_yaml::from_str(content)?
+    };
+    Ok((config, unknown))
 }
 
 fn unknown_keys(value: &Value, known: &[&str]) -> Vec<String> {
@@ -236,8 +245,12 @@ pub fn load() -> Result<Config> {
         .parent()
         .context("executable has no parent directory")?
         .join("wtclaude.yml");
+    let (_, user_path) = user_config_path()?;
+    load_from(&path, &user_path)
+}
 
-    let base: Config = match std::fs::read_to_string(&path) {
+fn load_from(path: &Path, user_path: &Path) -> Result<Config> {
+    let base: Config = match std::fs::read_to_string(path) {
         Ok(s) => {
             let (config, unknown) = parse_checked(&s, CONFIG_KEYS)
                 .with_context(|| format!("parsing {}", path.display()))?;
@@ -250,8 +263,7 @@ pub fn load() -> Result<Config> {
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
-    let (_, user_path) = user_config_path()?;
-    let (user, unknown) = read_user(&user_path)?;
+    let (user, unknown) = read_user(user_path)?;
     warn_unknown_keys(&user_path.display().to_string(), &unknown);
     Ok(merge(base, user))
 }
@@ -259,7 +271,7 @@ pub fn load() -> Result<Config> {
 /// Overlays the per-machine config on the base config: its `default-mode`
 /// replaces the base one if set, and each mode it names replaces the base
 /// mode of that name whole (`claude-flags` are not concatenated).
-fn merge(mut base: Config, user: UserConfig) -> Config {
+fn merge(mut base: Config, user: ModeOverrides) -> Config {
     if let Some(mode) = user.default_mode {
         base.default_mode = mode;
     }
@@ -281,7 +293,7 @@ mod tests {
 
     #[test]
     fn merge_without_user_settings_keeps_the_base() {
-        let merged = merge(base_config(), UserConfig::default());
+        let merged = merge(base_config(), ModeOverrides::default());
         assert_eq!(merged.default_mode, "safe");
         assert_eq!(
             flags(&merged, "dangerous"),
@@ -292,14 +304,14 @@ mod tests {
 
     #[test]
     fn merge_user_default_mode_wins() {
-        let (user, _): (UserConfig, _) =
+        let (user, _): (ModeOverrides, _) =
             parse_checked("default-mode: dangerous", USER_CONFIG_KEYS).unwrap();
         assert_eq!(merge(base_config(), user).default_mode, "dangerous");
     }
 
     #[test]
     fn merge_user_mode_replaces_the_whole_entry_and_keeps_the_others() {
-        let (user, _): (UserConfig, _) = parse_checked(
+        let (user, _): (ModeOverrides, _) = parse_checked(
             "modes:\n  dangerous:\n    claude-flags: [a, b]\n  verbose:\n    claude-flags: [--verbose]\n",
             USER_CONFIG_KEYS,
         )
@@ -344,10 +356,103 @@ mod tests {
 
     #[test]
     fn parse_checked_accepts_an_empty_user_file() {
-        let (config, unknown): (UserConfig, _) = parse_checked("", USER_CONFIG_KEYS).unwrap();
+        let (config, unknown): (ModeOverrides, _) = parse_checked("", USER_CONFIG_KEYS).unwrap();
         assert!(config.default_mode.is_none());
         assert!(config.modes.is_empty());
         assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_checked_type_errors_name_the_field_and_position() {
+        let err = parse_checked::<ModeOverrides>(
+            "modes:\n  safe:\n    claude-flags: 5\n",
+            USER_CONFIG_KEYS,
+        )
+        .err()
+        .expect("a number is not a flag list");
+        let message = format!("{err:#}");
+        assert!(message.contains("modes.safe.claude-flags"), "{message}");
+        assert!(message.contains("line 3"), "{message}");
+    }
+
+    #[test]
+    fn user_sandbox_settings_survive_a_broken_mode() {
+        let (config, _): (UserConfig, _) = parse_checked(
+            "allowlist: [/x]\nmodes:\n  safe:\n    claude-flags: --verbose\n",
+            USER_CONFIG_KEYS,
+        )
+        .unwrap();
+        assert_eq!(config.allowlist, ["/x"]);
+    }
+
+    /// A fresh directory for one `load_from` test; removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "wtclaude-test-load-{}-{}",
+                label,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("creating temp dir");
+            TempDir(dir)
+        }
+
+        fn file(&self, name: &str, content: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, content).expect("writing config file");
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn load_from_without_either_file_uses_the_built_in_default() {
+        let dir = TempDir::new("absent");
+        let config = load_from(&dir.0.join("base.yml"), &dir.0.join("user.yml")).unwrap();
+        assert_eq!(config.default_mode, "safe");
+        assert_eq!(
+            flags(&config, "dangerous"),
+            ["--dangerously-skip-permissions"]
+        );
+    }
+
+    #[test]
+    fn load_from_overlays_the_user_file_on_the_binary_adjacent_file() {
+        let dir = TempDir::new("overlay");
+        let base = dir.file(
+            "base.yml",
+            "default-mode: a\nmodes:\n  a:\n    claude-flags: [x]\n  b:\n    claude-flags: [y]\nallowlist: [/z]\n",
+        );
+        let user = dir.file(
+            "user.yml",
+            "default-mode: b\nmodes:\n  b:\n    claude-flags: [w]\n",
+        );
+        let config = load_from(&base, &user).unwrap();
+        assert_eq!(config.default_mode, "b");
+        assert_eq!(flags(&config, "a"), ["x"]);
+        assert_eq!(flags(&config, "b"), ["w"]);
+        assert!(!config.modes.contains_key("safe"));
+    }
+
+    #[test]
+    fn load_from_names_a_malformed_user_file() {
+        let dir = TempDir::new("malformed");
+        let user = dir.file("user.yml", "modes: [x]\n");
+        let err = load_from(&dir.0.join("base.yml"), &user)
+            .err()
+            .expect("a list is not a modes map");
+        assert!(
+            format!("{err:#}").contains(&user.display().to_string()),
+            "{err:#}"
+        );
     }
 
     #[test]
