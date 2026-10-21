@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_yaml::Value;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -12,6 +14,13 @@ pub struct Config {
 
 #[derive(Deserialize, Default)]
 pub struct UserConfig {
+    /// Overrides the binary-adjacent (or built-in) `default-mode`.
+    #[serde(rename = "default-mode", default)]
+    pub default_mode: Option<String>,
+    /// Merged over the binary-adjacent (or built-in) modes by name; a mode
+    /// named here replaces that whole entry.
+    #[serde(default)]
+    pub modes: HashMap<String, Mode>,
     #[serde(default)]
     pub allowlist: Vec<String>,
     #[serde(default)]
@@ -44,16 +53,99 @@ pub struct Mode {
 
 const DEFAULT_CONFIG: &str = include_str!("default_config.yml");
 
+const CONFIG_KEYS: &[&str] = &["default-mode", "modes"];
+const USER_CONFIG_KEYS: &[&str] = &[
+    "default-mode",
+    "modes",
+    "allowlist",
+    "socket_allowlist",
+    "sandbox-backend",
+];
+const MODE_KEYS: &[&str] = &["claude-flags"];
+
+/// Unknown keys are not reported here: the hook calls this on every tool
+/// call and would repeat them each time. `load`, which every launch runs,
+/// reports them instead.
 pub fn load_user() -> Result<UserConfig> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let path = PathBuf::from(&home).join(".config/wtclaude/wtclaude.yml");
-    let config: UserConfig = match std::fs::read_to_string(&path) {
-        Ok(s) => serde_yaml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => UserConfig::default(),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
+    let (home, path) = user_config_path()?;
+    let (config, _unknown) = read_user(&path)?;
     validate_allowlist(&config.allowlist, &home)?;
     Ok(config)
+}
+
+fn user_config_path() -> Result<(String, PathBuf)> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let path = PathBuf::from(&home).join(".config/wtclaude/wtclaude.yml");
+    Ok((home, path))
+}
+
+/// Reads the per-machine config, returning it along with any keys it doesn't
+/// recognise. A missing file is an empty config.
+fn read_user(path: &Path) -> Result<(UserConfig, Vec<String>)> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => parse_checked(&s, USER_CONFIG_KEYS)
+            .with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((UserConfig::default(), vec![])),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Parses `content` as `T`, also returning the keys serde would silently
+/// ignore: top-level keys not in `known`, and keys inside a `modes` entry
+/// other than `claude-flags`, as dotted paths (`modes.safe.flags`).
+fn parse_checked<T: DeserializeOwned>(content: &str, known: &[&str]) -> Result<(T, Vec<String>)> {
+    let mut value: Value = serde_yaml::from_str(content)?;
+    // An empty file parses as null; treat it as an empty mapping so structs
+    // whose fields all have defaults still deserialize.
+    if value.is_null() {
+        value = Value::Mapping(Default::default());
+    }
+    let unknown = unknown_keys(&value, known);
+    Ok((serde_yaml::from_value(value)?, unknown))
+}
+
+fn unknown_keys(value: &Value, known: &[&str]) -> Vec<String> {
+    let mut unknown = Vec::new();
+    let Some(map) = value.as_mapping() else {
+        return unknown;
+    };
+    for (key, val) in map {
+        let key = key_name(key);
+        if !known.contains(&key.as_str()) {
+            unknown.push(key);
+            continue;
+        }
+        if key == "modes"
+            && let Some(modes) = val.as_mapping()
+        {
+            for (name, mode) in modes {
+                let Some(mode) = mode.as_mapping() else {
+                    continue;
+                };
+                for mode_key in mode.keys().map(key_name) {
+                    if !MODE_KEYS.contains(&mode_key.as_str()) {
+                        unknown.push(format!("modes.{}.{}", key_name(name), mode_key));
+                    }
+                }
+            }
+        }
+    }
+    unknown
+}
+
+fn key_name(key: &Value) -> String {
+    match key {
+        Value::String(s) => s.clone(),
+        other => serde_yaml::to_string(other)
+            .map(|s| s.trim_end().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+fn warn_unknown_keys(source: &str, unknown: &[String]) {
+    for key in unknown {
+        eprintln!("wtclaude: warning: {source}: ignoring unknown key `{key}`");
+    }
 }
 
 /// Rejects allowlist entries with no real literal path prefix before their
@@ -134,6 +226,10 @@ pub fn resolve_glob_prefix(pattern: &str) -> String {
     }
 }
 
+/// The binary-adjacent `wtclaude.yml` (or the built-in default) with the
+/// per-machine config's `default-mode` and `modes` overlaid on it. The
+/// binary-adjacent file only accepts `default-mode` and `modes`: sessions can
+/// write to `~/.cargo/bin`, so the sandbox settings must not come from there.
 pub fn load() -> Result<Config> {
     let exe = std::env::current_exe().context("resolving executable path")?;
     let path = exe
@@ -141,17 +237,118 @@ pub fn load() -> Result<Config> {
         .context("executable has no parent directory")?
         .join("wtclaude.yml");
 
-    let content = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.to_string(),
+    let base: Config = match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let (config, unknown) = parse_checked(&s, CONFIG_KEYS)
+                .with_context(|| format!("parsing {}", path.display()))?;
+            warn_unknown_keys(&path.display().to_string(), &unknown);
+            config
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_yaml::from_str(DEFAULT_CONFIG).context("parsing built-in default config")?
+        }
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    serde_yaml::from_str(&content).context("parsing config")
+
+    let (_, user_path) = user_config_path()?;
+    let (user, unknown) = read_user(&user_path)?;
+    warn_unknown_keys(&user_path.display().to_string(), &unknown);
+    Ok(merge(base, user))
+}
+
+/// Overlays the per-machine config on the base config: its `default-mode`
+/// replaces the base one if set, and each mode it names replaces the base
+/// mode of that name whole (`claude-flags` are not concatenated).
+fn merge(mut base: Config, user: UserConfig) -> Config {
+    if let Some(mode) = user.default_mode {
+        base.default_mode = mode;
+    }
+    base.modes.extend(user.modes);
+    base
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn base_config() -> Config {
+        serde_yaml::from_str(DEFAULT_CONFIG).unwrap()
+    }
+
+    fn flags(config: &Config, mode: &str) -> Vec<String> {
+        config.modes[mode].claude_flags.clone()
+    }
+
+    #[test]
+    fn merge_without_user_settings_keeps_the_base() {
+        let merged = merge(base_config(), UserConfig::default());
+        assert_eq!(merged.default_mode, "safe");
+        assert_eq!(
+            flags(&merged, "dangerous"),
+            ["--dangerously-skip-permissions"]
+        );
+        assert!(flags(&merged, "safe").is_empty());
+    }
+
+    #[test]
+    fn merge_user_default_mode_wins() {
+        let (user, _): (UserConfig, _) =
+            parse_checked("default-mode: dangerous", USER_CONFIG_KEYS).unwrap();
+        assert_eq!(merge(base_config(), user).default_mode, "dangerous");
+    }
+
+    #[test]
+    fn merge_user_mode_replaces_the_whole_entry_and_keeps_the_others() {
+        let (user, _): (UserConfig, _) = parse_checked(
+            "modes:\n  dangerous:\n    claude-flags: [a, b]\n  verbose:\n    claude-flags: [--verbose]\n",
+            USER_CONFIG_KEYS,
+        )
+        .unwrap();
+        let merged = merge(base_config(), user);
+        // Replaced, not concatenated with `--dangerously-skip-permissions`.
+        assert_eq!(flags(&merged, "dangerous"), ["a", "b"]);
+        assert_eq!(flags(&merged, "verbose"), ["--verbose"]);
+        assert!(flags(&merged, "safe").is_empty());
+        assert_eq!(merged.default_mode, "safe");
+    }
+
+    #[test]
+    fn built_in_default_config_has_no_unknown_keys() {
+        let (_, unknown): (Config, _) = parse_checked(DEFAULT_CONFIG, CONFIG_KEYS).unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    #[test]
+    fn parse_checked_reports_unknown_top_level_and_mode_keys() {
+        let (_, unknown): (UserConfig, _) = parse_checked(
+            "default-mode: safe\nbogus: 1\nmodes:\n  safe:\n    claude-flag: []\n",
+            USER_CONFIG_KEYS,
+        )
+        .unwrap();
+        assert_eq!(unknown, ["bogus", "modes.safe.claude-flag"]);
+    }
+
+    #[test]
+    fn parse_checked_treats_sandbox_settings_as_unknown_in_the_binary_adjacent_file() {
+        let (config, unknown): (Config, _) = parse_checked(
+            "default-mode: safe\nmodes: {}\nallowlist: [/x]\nsocket_allowlist: [/y]\nsandbox-backend: auto\n",
+            CONFIG_KEYS,
+        )
+        .unwrap();
+        assert_eq!(config.default_mode, "safe");
+        assert_eq!(
+            unknown,
+            ["allowlist", "socket_allowlist", "sandbox-backend"]
+        );
+    }
+
+    #[test]
+    fn parse_checked_accepts_an_empty_user_file() {
+        let (config, unknown): (UserConfig, _) = parse_checked("", USER_CONFIG_KEYS).unwrap();
+        assert!(config.default_mode.is_none());
+        assert!(config.modes.is_empty());
+        assert!(unknown.is_empty());
+    }
 
     #[test]
     fn validate_allowlist_rejects_bare_wildcard() {

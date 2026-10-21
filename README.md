@@ -242,8 +242,9 @@ The mode is resolved in priority order:
 
 1. `--mode MODE` flag (highest priority)
 2. `WTCLAUDE_DEFAULT_MODE` environment variable
-3. `default-mode` in `wtclaude.yml`
-4. Built-in default (`safe`)
+3. `default-mode` in `~/.config/wtclaude/wtclaude.yml`
+4. `default-mode` in the `wtclaude.yml` next to the binary
+5. Built-in default (`safe`)
 
 Set `WTCLAUDE_DEFAULT_MODE` in your shell profile to change the default
 without editing config files:
@@ -285,9 +286,20 @@ modes:
 ### Per-machine configuration
 
 `~/.config/wtclaude/wtclaude.yml` holds settings that belong to the
-machine rather than the binary:
+machine rather than the binary. It also accepts `default-mode` and
+`modes`, which take priority over the file next to the binary (or the
+built-in defaults): its `default-mode` replaces the other one, and each
+mode it names replaces that mode's whole entry (`claude-flags` lists are
+not combined). Modes it doesn't name are kept.
 
 ```yaml
+default-mode: dangerous
+
+# Replaces the built-in `dangerous` mode; `safe` is kept as is.
+modes:
+  dangerous:
+    claude-flags: ["--dangerously-skip-permissions", "--verbose"]
+
 # Which backend enforces the plan: auto (default), seatbelt, landlock.
 sandbox-backend: auto
 
@@ -307,6 +319,14 @@ backend can express (see Differences between backends). An entry whose
 wildcard has no literal path prefix — `*`, `/*`, `*.log` — is rejected
 at startup, since it would match nearly every path and quietly disable
 the sandbox.
+
+The sandbox settings (`allowlist`, `socket_allowlist`,
+`sandbox-backend`) are read only from this file, never from the
+`wtclaude.yml` next to the binary: a standard `cargo install` puts the
+binary in `~/.cargo/bin`, which sessions can write to.
+
+An unknown key in either file — including one inside a mode — prints a
+warning naming the file and the key, and is otherwise ignored.
 
 
 ## Sandbox enforcement
