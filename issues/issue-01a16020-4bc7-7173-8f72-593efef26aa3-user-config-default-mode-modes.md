@@ -53,3 +53,9 @@ These have not been decided yet:
   binary file's map, or be merged into it mode by mode?
 - Should `UserConfig` also reject keys it still doesn't recognise, so a
   misplaced key is an error at startup rather than ignored?
+
+## Grill Log
+
+### 2026-10-21
+
+- Q: If both files define `modes`, does the user file's map replace the binary file's map, or merge? — A: Merge by mode name. `modes.{key}` in the user file replaces `modes.{key}` from the binary-adjacent file (or built-in default) as a whole entry; `claude-flags` lists are not concatenated. Modes the user file doesn't name are kept. E.g. user `modes.dangerous = {a,b}` over binary `modes.dangerous = {c,d}` yields `{a,b}`.
