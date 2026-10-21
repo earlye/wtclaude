@@ -45,17 +45,26 @@ has the same shape.
 - `README.md:254` — the Configuration section, which documents the two
   files separately
 
-## Open questions
+## Decisions
 
-These have not been decided yet:
-
-- If both files define `modes`, should the user file's map replace the
-  binary file's map, or be merged into it mode by mode?
-- Should `UserConfig` also reject keys it still doesn't recognise, so a
-  misplaced key is an error at startup rather than ignored?
+- `default-mode` and `modes` are also read from
+  `~/.config/wtclaude/wtclaude.yml`. The user file wins over the
+  binary-adjacent `wtclaude.yml` (or the built-in default).
+- `default-mode`: the user file's value, if set, replaces the other.
+- `modes`: merged by mode name. A mode the user file names replaces that
+  mode's whole entry; `claude-flags` lists are not concatenated. Modes the
+  user file doesn't name are kept.
+- Unknown keys in either file produce a warning on stderr (naming the
+  file and key) and are otherwise ignored; they are not a startup error.
+- The binary-adjacent file still only accepts `default-mode` and `modes`.
+  `allowlist`, `socket_allowlist` and `sandbox-backend` there are unknown
+  keys (warned, not applied), since sessions can write to `~/.cargo/bin`.
+- Update `README.md` (mode selection order and the Configuration section)
+  to match.
 
 ## Grill Log
 
 ### 2026-10-21
 
 - Q: If both files define `modes`, does the user file's map replace the binary file's map, or merge? — A: Merge by mode name. `modes.{key}` in the user file replaces `modes.{key}` from the binary-adjacent file (or built-in default) as a whole entry; `claude-flags` lists are not concatenated. Modes the user file doesn't name are kept. E.g. user `modes.dangerous = {a,b}` over binary `modes.dangerous = {c,d}` yields `{a,b}`.
+- Q: Should unknown keys be rejected at startup? — A: No; warn on stderr and continue. Applies to both files (assumed for the binary-adjacent file).
