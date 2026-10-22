@@ -48,8 +48,10 @@ When you run `wtclaude <name>`, it:
    so Claude's trust dialog is bypassed automatically.
 
 6. Launches `claude` with the hook settings, `--append-system-prompt`
-   (informing Claude of the sandbox boundary), and the working directory
-   set to the worktree.
+   (informing Claude of the sandbox boundary), `--name <name>` (so the
+   session is recognizable in `/resume`; omitted when resuming, so a
+   resumed session keeps its name), and the working directory set to the
+   worktree.
 
 7. If running inside tmux, renames the current window to `<name>` for
    easy navigation (and restores the original name on exit).
@@ -192,10 +194,7 @@ wtclaude [--mode MODE] [--no-pull] [--resume SESSION_ID] \
 
 `WORKTREE_NAME` is the name for the git worktree. `wtclaude` creates
 it at `.claude/worktrees/<name>` inside your repo. Slashes in the name
-are replaced with `+` to match Claude's own directory naming. The
-Claude session is named after `WORKTREE_NAME` (via `claude --name`), so
-it is recognizable in `/resume`; a resumed session keeps its existing
-name.
+are replaced with `+` to match Claude's own directory naming.
 
 `INITIAL_PROMPT` (optional) is passed as the opening prompt to Claude.
 If it contains spaces, quote it or pass it as multiple trailing
