@@ -76,3 +76,9 @@ If that is right, no landlock rule change will fix this. Some options:
   writable-PATH hole)? — A: Warn at launch, don't refuse. wtclaude is a
   hallucination safety net, not a security boundary (`CONTEXT.md` threat
   model: accidental writes primary, injection best-effort).
+- Q: What should the hook do when a command still resolves to `/snap/bin/*`?
+  — A: Deny under landlock (beside the `sudo` check). Read `meta/snap.yaml`:
+  for a classic snap, name the direct payload path and suggest a
+  `path-prepend` entry; for a strict snap, say it can't run and to install a
+  non-snap build. Giving the direct path is fine — omitting `gh` from
+  `path-prepend` is about convenience, not keeping the agent away from it.
