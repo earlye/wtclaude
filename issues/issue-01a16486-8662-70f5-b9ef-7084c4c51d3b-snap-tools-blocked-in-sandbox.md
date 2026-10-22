@@ -46,3 +46,29 @@ If that is right, no landlock rule change will fix this. Some options:
   take effect for sandboxed commands
 - `src/sandbox/landlock.rs:115`: the sandbox notice explaining NO_NEW_PRIVS
 - `src/hook.rs:257`: hook text about privilege escalation being impossible
+
+## Grill Log
+
+### 2026-10-22
+
+- Q: Is the NO_NEW_PRIVS hypothesis right? — A: Confirmed in a landlock
+  session: `NoNewPrivs: 1`, `gh --version` prints the snap-confine refusal.
+  snap-confine is a privileged (setuid/file-caps) helper that builds a mount
+  namespace, switches AppArmor profile, and moves the process into a
+  `snap.<name>.<app>` cgroup; NNP neuters all of that and it refuses.
+- Q: Can the snap payload run without snap-confine? — A: Yes for classic
+  snaps. `gh` and `just` are both `confinement: classic`, and
+  `/snap/gh/current/gh --version` and `/snap/just/current/bin/just --version`
+  both work inside the sandbox (`gh auth status` too). For classic snaps
+  snap-confine buys only refresh-awareness bookkeeping and a uniform launch
+  path. Strict snaps depend on their base-snap mount namespace and are out of
+  scope.
+- Q: Relay snap commands through the unsandboxed launcher? — A: Rejected.
+  It is a general escape hatch (`gh api`, extensions, aliases) out of the
+  filesystem sandbox, and no relay channel exists to build on.
+- Q: Generate per-session shims from `meta/snap.yaml`? — A: Rejected as more
+  machinery than the problem needs.
+- Q: Which approach? — A: A per-mode `path-prepend` list in `wtclaude.yml`,
+  so a mode opts in per tool (e.g. `dangerous` prepends just's dir but not
+  gh's). Plus a hook deny for commands resolving to `/snap/bin/*` with an
+  actionable message instead of snap-confine's.
