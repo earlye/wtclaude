@@ -223,9 +223,11 @@ pub fn run(args: Args) -> Result<i32> {
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
     }
-    if let Some(session_id) = args.resume {
-        cmd.arg("--resume").arg(session_id);
-    }
+    // A resumed session keeps its existing name (including any `/rename`).
+    match args.resume {
+        Some(session_id) => cmd.arg("--resume").arg(session_id),
+        None => cmd.arg("--name").arg(&args.name),
+    };
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(
@@ -479,7 +481,8 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         git_pull(repo_root)?;
     }
 
-    let _window_name = TmuxWindowName::rename(&directory_label(&canonical));
+    let label = directory_label(&canonical);
+    let _window_name = TmuxWindowName::rename(&label);
     update_trust(repo_root.as_deref().unwrap_or(&canonical))?;
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
@@ -511,9 +514,11 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
     }
-    if let Some(session_id) = args.resume {
-        cmd.arg("--resume").arg(session_id);
-    }
+    // A resumed session keeps its existing name (including any `/rename`).
+    match args.resume {
+        Some(session_id) => cmd.arg("--resume").arg(session_id),
+        None => cmd.arg("--name").arg(&label),
+    };
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(
@@ -583,9 +588,10 @@ fn is_sandbox_nullifying_root(canonical: &Path) -> bool {
     false
 }
 
-/// The tmux window title for `path` mode: the canonicalized directory's
-/// basename, not whatever string the user actually typed (e.g. `path .`
-/// labels the window with the real directory name, not `.`).
+/// The tmux window title and Claude session name for `path` mode: the
+/// canonicalized directory's basename, not whatever string the user actually
+/// typed (e.g. `path .` labels the window with the real directory name, not
+/// `.`).
 fn directory_label(canonical: &Path) -> String {
     canonical
         .file_name()

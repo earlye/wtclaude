@@ -23,3 +23,10 @@ The installed `claude --help` doesn't list a flag for setting a session name or 
 
 - Which mechanism does Claude Code support for setting a session name at launch?
 - With `--resume`, should wtclaude keep the resumed session's existing name or rename it?
+
+## Resolution
+
+- Mechanism: Claude Code 2.1.308 has `-n, --name <name>` ("Set a display name for this session (shown in the prompt box, /resume picker, and terminal title)"). wtclaude passes `--name`.
+- Worktree mode passes the branch name as given (with `/`, not the sanitized directory form); path mode passes `directory_label`.
+- With `--resume`, `--name` is omitted so the resumed session keeps its existing name.
+- Headless sessions stay unnamed (no branch or selected path to name them after).
