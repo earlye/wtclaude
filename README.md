@@ -192,7 +192,10 @@ wtclaude [--mode MODE] [--no-pull] [--resume SESSION_ID] \
 
 `WORKTREE_NAME` is the name for the git worktree. `wtclaude` creates
 it at `.claude/worktrees/<name>` inside your repo. Slashes in the name
-are replaced with `+` to match Claude's own directory naming.
+are replaced with `+` to match Claude's own directory naming. The
+Claude session is named after `WORKTREE_NAME` (via `claude --name`), so
+it is recognizable in `/resume`; a resumed session keeps its existing
+name.
 
 `INITIAL_PROMPT` (optional) is passed as the opening prompt to Claude.
 If it contains spaces, quote it or pass it as multiple trailing
