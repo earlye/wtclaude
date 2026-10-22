@@ -72,3 +72,7 @@ If that is right, no landlock rule change will fix this. Some options:
   so a mode opts in per tool (e.g. `dangerous` prepends just's dir but not
   gh's). Plus a hook deny for commands resolving to `/snap/bin/*` with an
   actionable message instead of snap-confine's.
+- Q: What if a `path-prepend` entry is inside a writable subtree (the
+  writable-PATH hole)? — A: Warn at launch, don't refuse. wtclaude is a
+  hallucination safety net, not a security boundary (`CONTEXT.md` threat
+  model: accidental writes primary, injection best-effort).
