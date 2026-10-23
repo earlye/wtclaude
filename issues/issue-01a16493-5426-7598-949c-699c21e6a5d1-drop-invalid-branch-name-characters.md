@@ -58,3 +58,14 @@ The only change wtclaude makes to the name today is for the worktree
 - `src/launch.rs:132`: `Args.name`, the `WORKTREE_NAME` positional
 - `src/launch.rs:183`, `src/launch.rs:229`: the tmux window name and
   `claude --name`, which also use `args.name`
+
+## Grill Log
+
+### 2026-10-22
+
+- Q: Drop or replace invalid characters? — A: Split rule. Whitespace runs
+  become a single `-` (`fix the bug` → `fix-the-bug`). Other forbidden
+  characters (`~ ^ : ? * [ \`, control characters) are deleted. Multi-character
+  problems collapse: `..` → `.`, `//` → `/`, `@{` removed, leading `-`/`.`/`/`
+  and trailing `.`/`/`/`.lock` trimmed (`trailing.` → `trailing`). Repeat until
+  the name stops changing.
