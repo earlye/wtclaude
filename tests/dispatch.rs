@@ -146,8 +146,12 @@ fn completion_scripts_parse() {
 
 /// Sources the bash script in a shell whose `wtclaude` on PATH is a fake
 /// that records the handoff path it was given, writes a resume command to
-/// it, and exits 3. Returns the shell's stdout and the recorded path.
-fn run_bash_wrapper(dir: &std::path::Path, state_home: &std::path::Path) -> (String, String) {
+/// it, and exits 3. Returns the shell's stdout and stderr, and the recorded
+/// path.
+fn run_bash_wrapper(
+    dir: &std::path::Path,
+    state_home: &std::path::Path,
+) -> (String, String, String) {
     let script = completion_script(dir, "bash");
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("create bin dir");
@@ -190,14 +194,18 @@ fn run_bash_wrapper(dir: &std::path::Path, state_home: &std::path::Path) -> (Str
         String::from_utf8_lossy(&output.stderr)
     );
     let seen = std::fs::read_to_string(&seen_log).expect("reading seen log");
-    (String::from_utf8_lossy(&output.stdout).into_owned(), seen)
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        seen,
+    )
 }
 
 #[test]
 fn bash_wrapper_pushes_the_resume_command_onto_history() {
     let dir = unique_temp_dir("bash-wrapper");
     let state_home = dir.join("state");
-    let (stdout, handoff) = run_bash_wrapper(&dir, &state_home);
+    let (stdout, stderr, handoff) = run_bash_wrapper(&dir, &state_home);
     let handoff_left = std::path::Path::new(&handoff).exists();
     std::fs::remove_dir_all(&dir).ok();
 
@@ -211,6 +219,7 @@ fn bash_wrapper_pushes_the_resume_command_onto_history() {
         "handoff file should live under XDG_STATE_HOME, got {handoff}"
     );
     assert!(!handoff_left, "the wrapper should delete {handoff}");
+    assert!(stderr.is_empty(), "stderr: {stderr}");
 }
 
 #[test]
@@ -219,10 +228,18 @@ fn bash_wrapper_still_runs_wtclaude_when_it_cannot_make_a_handoff_file() {
     // A regular file where the state dir should be makes mkdir fail.
     let state_home = dir.join("state");
     std::fs::write(&state_home, "").expect("create blocking file");
-    let (stdout, handoff) = run_bash_wrapper(&dir, &state_home);
+    let (stdout, stderr, handoff) = run_bash_wrapper(&dir, &state_home);
     std::fs::remove_dir_all(&dir).ok();
 
     assert!(stdout.contains("rc=3\n"), "stdout: {stdout}");
     assert_eq!(handoff, "unset");
+    assert!(
+        stderr.contains(&format!(
+            "wtclaude: warning: cannot create a handoff file in {}/wtclaude; \
+             the resume command will not be added to history",
+            state_home.display()
+        )),
+        "stderr: {stderr}"
+    );
     assert!(!stdout.contains("--resume"), "stdout: {stdout}");
 }

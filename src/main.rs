@@ -186,24 +186,27 @@ fn build_after_help() -> String {
 /// and the wrapper reads, deletes, and injects it.
 ///
 /// The file lives under `$XDG_STATE_HOME/wtclaude` (default
-/// `~/.local/state`), which no sandbox plan grants, rather than `/tmp`,
-/// which every plan does: a session that could plant or symlink the file
-/// could inject a command into history or have the unsandboxed binary
-/// overwrite an arbitrary file.
+/// `~/.local/state`), which no sandbox plan grants by default, rather than
+/// `/tmp`, which every plan does: a session that could plant or symlink the
+/// file could inject a command into history or have the unsandboxed binary
+/// overwrite an arbitrary file. That holds unless a sandbox root or
+/// allowlist entry covers the state directory, in which case the binary
+/// refuses to write the file.
 fn print_history_wrapper(push_history: &str) {
     print!(
         r#"
 wtclaude() {{
   local _wt_dir="${{XDG_STATE_HOME:-$HOME/.local/state}}/wtclaude" _wt_file _wt_resume rc
-  if ! mkdir -p -m 700 -- "$_wt_dir" 2>/dev/null ||
-    ! _wt_file="$(mktemp "$_wt_dir/last-session.XXXXXX" 2>/dev/null)"; then
+  if ! mkdir -p -m 700 -- "$_wt_dir" ||
+    ! _wt_file="$(mktemp "$_wt_dir/last-session.XXXXXX")"; then
+    echo "wtclaude: warning: cannot create a handoff file in $_wt_dir; the resume command will not be added to history" >&2
     command wtclaude "$@"
     return $?
   fi
   WTCLAUDE_RESUME_FILE="$_wt_file" command wtclaude "$@"
   rc=$?
   _wt_resume="$(cat -- "$_wt_file" 2>/dev/null)"
-  rm -f -- "$_wt_file"
+  rm -f -- "$_wt_file" || echo "wtclaude: warning: could not remove $_wt_file" >&2
   [[ -n $_wt_resume ]] && {push_history} "$_wt_resume"
   return $rc
 }}

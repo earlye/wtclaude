@@ -73,6 +73,10 @@ impl SandboxSession {
         repo_root: Option<&Path>,
         breakage: Option<SandboxBreakage>,
     ) {
+        // Hides the shell wrapper's handoff file, so neither the session nor
+        // a nested wtclaude learns its path. That alone doesn't stop writes:
+        // `record_resume_command` also refuses a file the plan can reach.
+        cmd.env_remove(RESUME_FILE_ENV);
         cmd.env("WTCLAUDE_SANDBOX", sandbox_root);
         match repo_root {
             Some(repo_root) => cmd.env("WTCLAUDE_REPO_ROOT", repo_root),
@@ -311,10 +315,15 @@ pub fn run(args: Args) -> Result<i32> {
 
     let status = cmd.status().context("launching claude")?;
     let exit_code = status.code().unwrap_or(1);
-    record_resume_command(
-        &session_id,
-        &resume_command(None, explicit_mode.as_deref(), &session_id, &args.name),
-    );
+    if let Some(handoff) = resume_handoff_file() {
+        record_resume_command(
+            &handoff,
+            &session_id,
+            &resume_command(None, explicit_mode.as_deref(), &session_id, &args.name),
+            &canonical,
+            Some(&repo_root),
+        );
+    }
 
     if !in_place {
         let worktree_path = repo_root
@@ -604,24 +613,27 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
     }
 
     let status = cmd.status().context("launching claude")?;
-    record_resume_command(
-        &session_id,
-        &resume_command(
-            Some("path"),
-            explicit_mode.as_deref(),
-            &session_id,
-            &canonical.to_string_lossy(),
-        ),
-    );
+    if let Some(handoff) = resume_handoff_file() {
+        match canonical.to_str() {
+            Some(target) => record_resume_command(
+                &handoff,
+                &session_id,
+                &resume_command(Some("path"), explicit_mode.as_deref(), &session_id, target),
+                &canonical,
+                repo_root.as_deref(),
+            ),
+            None => eprintln!(
+                "wtclaude: warning: {} is not valid UTF-8, so no resume command was added to history",
+                canonical.display()
+            ),
+        }
+    }
     Ok(status.code().unwrap_or(1))
 }
 
 /// Adds `--resume RESUME`, or `--session-id` (freshly generated) plus
-/// `--name NAME`, to `cmd`, returning the session id either way. Also hides
-/// the shell wrapper's handoff file from the session, so neither it nor a
-/// nested wtclaude can write the command the wrapper injects into history.
+/// `--name NAME`, to `cmd`, returning the session id either way.
 fn add_session_args(cmd: &mut Command, resume: Option<String>, name: &str) -> Result<String> {
-    cmd.env_remove(RESUME_FILE_ENV);
     // A resumed session keeps its existing name (including any `/rename`).
     match resume {
         Some(session_id) => {
@@ -685,8 +697,11 @@ fn resume_command(
         .join(" ")
 }
 
+/// Leaves `word` bare when no shell would split or expand it. A leading `=`
+/// or `%` is quoted: zsh expands `=cmd` to a path, and `%` names a job.
 fn shell_quote(word: &str) -> String {
     let safe = !word.is_empty()
+        && !word.starts_with(['=', '%'])
         && word
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "_-./:+@%=,".contains(c));
@@ -697,14 +712,29 @@ fn shell_quote(word: &str) -> String {
     }
 }
 
-/// Hands the resume command to the shell wrapper, which injects it into
-/// history. Does nothing outside the wrapper (no `WTCLAUDE_RESUME_FILE`), or
-/// when the session was exited before any message created its transcript —
-/// there would be nothing to resume.
-fn record_resume_command(session_id: &str, command: &str) {
-    let Some(path) = std::env::var_os(RESUME_FILE_ENV).filter(|p| !p.is_empty()) else {
-        return;
-    };
+/// The handoff file the shell wrapper passed, if wtclaude runs under it.
+fn resume_handoff_file() -> Option<PathBuf> {
+    std::env::var_os(RESUME_FILE_ENV)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Hands the resume command to the shell wrapper through `handoff`, which
+/// the wrapper then injects into history. Does nothing when the session was
+/// exited before any message created its transcript — there would be
+/// nothing to resume. Warns on stderr, and writes nothing, when the
+/// transcript lookup fails, when `handoff` isn't an existing regular file
+/// (a symlink is refused rather than followed), when the session's plan
+/// (recomputed from `sandbox_root` and `repo_root`, allowlist included, as
+/// the hook does for every Bash call) could have written or replaced it, or
+/// when the write itself fails.
+fn record_resume_command(
+    handoff: &Path,
+    session_id: &str,
+    command: &str,
+    sandbox_root: &Path,
+    repo_root: Option<&Path>,
+) {
     match crate::sessions::session_exists(session_id) {
         Ok(true) => {}
         Ok(false) => return,
@@ -713,12 +743,56 @@ fn record_resume_command(session_id: &str, command: &str) {
             return;
         }
     }
-    if let Err(e) = std::fs::write(&path, format!("{command}\n")) {
+    if let Err(e) = write_handoff(handoff, command, sandbox_root, repo_root) {
         eprintln!(
-            "wtclaude: warning: writing {}: {e}",
-            std::path::Path::new(&path).display()
+            "wtclaude: warning: not adding the resume command to history: {}: {e:#}",
+            handoff.display()
         );
     }
+}
+
+/// Writes `command` into the existing regular file `handoff`. `libc` isn't
+/// a dependency, so there's no `O_NOFOLLOW`: instead the file is checked
+/// with `symlink_metadata`, opened without creating or truncating it, and
+/// only written if the opened file is the one that was checked.
+fn write_handoff(
+    handoff: &Path,
+    command: &str,
+    sandbox_root: &Path,
+    repo_root: Option<&Path>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = handoff
+        .parent()
+        .context("has no parent directory")?
+        .canonicalize()
+        .context("resolving its directory")?;
+    let file = parent.join(handoff.file_name().context("has no file name")?);
+    let plan = sandbox::plan(sandbox_root, repo_root).context("computing the session's plan")?;
+    if plan.grants_write(&parent) || plan.grants_write(&file) {
+        bail!(
+            "the session could write {}, so its contents can't be trusted",
+            parent.display()
+        );
+    }
+    let checked = std::fs::symlink_metadata(&file).context("checking it")?;
+    if !checked.file_type().is_file() {
+        bail!("not a regular file");
+    }
+    let mut opened = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .context("opening it")?;
+    let meta = opened.metadata().context("checking it")?;
+    if (meta.dev(), meta.ino()) != (checked.dev(), checked.ino()) {
+        bail!("replaced while being opened");
+    }
+    opened.set_len(0).context("truncating it")?;
+    opened
+        .write_all(format!("{command}\n").as_bytes())
+        .context("writing it")
 }
 
 /// Rejects a canonicalized DIRECTORY that would make the sandbox a no-op:
@@ -1377,6 +1451,9 @@ mod tests {
             r"wtclaude path --resume abc '/tmp/my dir/it'\''s $HOME'"
         );
         assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("=ls"), "'=ls'");
+        assert_eq!(shell_quote("%1"), "'%1'");
+        assert_eq!(shell_quote("a=b%c"), "a=b%c");
     }
 
     #[test]
@@ -1559,8 +1636,7 @@ mod tests {
             "the-branch",
         ]);
 
-        let err =
-            ensure_worktree(&new_worktree, "the-branch", &main_repo).unwrap_err();
+        let err = ensure_worktree(&new_worktree, "the-branch", &main_repo).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains(&existing_worktree.to_string_lossy().to_string()),

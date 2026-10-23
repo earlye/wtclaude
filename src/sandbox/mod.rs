@@ -45,6 +45,46 @@ pub struct Plan {
     pub sockets: Vec<PathBuf>,
 }
 
+impl Plan {
+    /// Whether any entry lets a session write `path` (already resolved).
+    /// Globs are checked the way Seatbelt compiles them — `*` matches any run
+    /// of characters, `/` included — even on backends that cannot honor them,
+    /// so the answer errs towards "writable".
+    pub fn grants_write(&self, path: &Path) -> bool {
+        self.write_subtrees
+            .iter()
+            .chain(&self.sockets)
+            .any(|p| path.starts_with(p))
+            || (!self.write_globs.is_empty()
+                && path.to_str().is_none_or(|s| {
+                    self.write_globs
+                        .iter()
+                        .any(|g| glob_matches(&config::resolve_glob_prefix(g), s))
+                }))
+    }
+}
+
+/// Whole-string match of `text` against `pattern`, where `*` matches any
+/// (possibly empty) run of characters.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = text.strip_prefix(first) else {
+        return false;
+    };
+    let mut parts: Vec<&str> = parts.collect();
+    let Some(last) = parts.pop() else {
+        return rest.is_empty();
+    };
+    for part in parts {
+        match rest.find(part) {
+            Some(i) => rest = &rest[i + part.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
+}
+
 /// Whether a backend can enforce a plan on this machine right now.
 pub enum Availability {
     Ready,
@@ -435,6 +475,32 @@ fn sweep_orphaned(base: &Path) {
 pub(crate) mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn glob_matches_lets_a_star_span_path_separators() {
+        assert!(glob_matches("/h/.claude.json*", "/h/.claude.json"));
+        assert!(glob_matches("/h/.claude.json*", "/h/.claude.json.tmp1"));
+        assert!(glob_matches("/h/*/x", "/h/a/b/x"));
+        assert!(glob_matches("*", "/anything"));
+        assert!(!glob_matches("/h/.claude.json*", "/h/.local/state/f"));
+        assert!(!glob_matches("/h/*/x", "/h/x"));
+        assert!(!glob_matches("/h/a", "/h/ab"));
+    }
+
+    #[test]
+    fn grants_write_covers_subtrees_sockets_and_globs() {
+        let plan = Plan {
+            sandbox_root: PathBuf::from("/w"),
+            write_subtrees: vec![PathBuf::from("/w")],
+            write_globs: vec!["/nonexistent-wt/.claude.json*".to_string()],
+            sockets: vec![PathBuf::from("/run/sock")],
+        };
+        assert!(plan.grants_write(Path::new("/w/a/b")));
+        assert!(plan.grants_write(Path::new("/run/sock")));
+        assert!(plan.grants_write(Path::new("/nonexistent-wt/.claude.json.bak")));
+        assert!(!plan.grants_write(Path::new("/wx")));
+        assert!(!plan.grants_write(Path::new("/nonexistent-wt/.local/state/wtclaude")));
+    }
 
     #[test]
     fn resolve_resolves_a_symlinked_existing_ancestor_for_a_nonexistent_literal_entry() {

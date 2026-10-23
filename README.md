@@ -206,11 +206,12 @@ onto your shell history, so pressing up-arrow offers e.g.
 <session-id> <dir>` for path mode). Run a branch-mode line from the same
 repository it was launched in. Only an explicit `--mode` carries over;
 other flags (e.g. `--no-pull`) and initial-prompt words are left out.
-Nothing is added if the session ended before any message was sent. The
-function creates a private handoff file with `mktemp` under
-`${XDG_STATE_HOME:-~/.local/state}/wtclaude/`, a directory sessions
-cannot write, passes it to the binary as `WTCLAUDE_RESUME_FILE`, and
-deletes it after reading it.
+Nothing is added if the session ended before any message was sent. It
+hands the command over through a temporary file under
+`${XDG_STATE_HOME:-~/.local/state}/wtclaude/`, which sessions can't
+write, and deletes the file afterwards. If a sandbox root or allowlist
+entry covers that directory, wtclaude refuses to write the file and warns
+instead.
 
 
 ## Usage
