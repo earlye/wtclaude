@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 struct TempFile(PathBuf);
 
@@ -229,6 +229,7 @@ pub fn run(args: Args) -> Result<i32> {
         .modes
         .get(&mode)
         .with_context(|| format!("unknown mode: {}", mode))?;
+    let name = branch_name(&args.name)?;
 
     let repo_root = match repo_root() {
         Ok(r) => r,
@@ -242,16 +243,12 @@ pub fn run(args: Args) -> Result<i32> {
     };
 
     let fresh = is_fresh_repo(&repo_root);
-    let in_place = fresh
-        || current_branch()
-            .ok()
-            .map(|b| b == args.name)
-            .unwrap_or(false);
+    let in_place = fresh || current_branch().ok().map(|b| b == name).unwrap_or(false);
 
     if !args.no_pull {
         git_pull(&repo_root)?;
     }
-    let _window_name = TmuxWindowName::rename(&args.name);
+    let _window_name = TmuxWindowName::rename(&name);
     update_trust(&repo_root)?;
 
     let canonical = if in_place {
@@ -262,8 +259,8 @@ pub fn run(args: Args) -> Result<i32> {
         let worktree_path = repo_root
             .join(".claude")
             .join("worktrees")
-            .join(sanitize_name(&args.name));
-        ensure_worktree(&worktree_path, &args.name, &repo_root)?;
+            .join(sanitize_name(&name));
+        ensure_worktree(&worktree_path, &name, &repo_root)?;
         worktree_path
             .canonicalize()
             .unwrap_or_else(|_| worktree_path.clone())
@@ -284,7 +281,7 @@ pub fn run(args: Args) -> Result<i32> {
     let sandbox_notice = format!(
         "You are running in a git worktree sandbox for branch '{}'. \
          You may only write files under: {}. {}",
-        args.name,
+        name,
         canonical.display(),
         session.notice()
     );
@@ -297,7 +294,7 @@ pub fn run(args: Args) -> Result<i32> {
     // A resumed session keeps its existing name (including any `/rename`).
     match args.resume {
         Some(session_id) => cmd.arg("--resume").arg(session_id),
-        None => cmd.arg("--name").arg(&args.name),
+        None => cmd.arg("--name").arg(&name),
     };
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
@@ -319,8 +316,8 @@ pub fn run(args: Args) -> Result<i32> {
         let worktree_path = repo_root
             .join(".claude")
             .join("worktrees")
-            .join(sanitize_name(&args.name));
-        if let Err(e) = post_exit_menu(&args.name, &worktree_path, &repo_root) {
+            .join(sanitize_name(&name));
+        if let Err(e) = post_exit_menu(&name, &worktree_path, &repo_root) {
             eprintln!("wtclaude: warning: post-exit menu: {e}");
         }
     }
@@ -676,6 +673,72 @@ fn directory_label(canonical: &Path) -> String {
 fn sanitize_name(name: &str) -> String {
     // claude replaces '/' with '+' in worktree directory names
     name.replace('/', "+")
+}
+
+/// Cleans `raw` into a branch name git accepts, announcing any change on
+/// stderr, and bails if nothing usable is left. Runs before any git
+/// mutation so a bad name never half-creates a worktree.
+fn branch_name(raw: &str) -> Result<String> {
+    let clean = sanitize_branch_name(raw);
+    let valid = !clean.is_empty()
+        && Command::new("git")
+            .args(["check-ref-format", "--branch", &clean])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("running git check-ref-format")?
+            .success();
+    if !valid {
+        bail!("'{raw}' has no characters usable in a branch name");
+    }
+    if clean != raw {
+        eprintln!("wtclaude: using branch '{clean}' (from '{raw}')");
+    }
+    Ok(clean)
+}
+
+/// Drops or rewrites the parts of `raw` that `git check-ref-format` rejects:
+/// whitespace runs become `-`, forbidden characters are deleted, and `..`,
+/// `@{`, empty path components, a component's leading `.` or trailing
+/// `.lock`, a leading `-` and a trailing `.` are removed. Repeats until
+/// stable, since one removal can expose another (`a.lock.` -> `a.lock`).
+fn sanitize_branch_name(raw: &str) -> String {
+    let mut name = raw.to_string();
+    loop {
+        let mut next = String::with_capacity(name.len());
+        let mut in_space = false;
+        for c in name.chars() {
+            if c.is_whitespace() {
+                if !in_space {
+                    next.push('-');
+                }
+                in_space = true;
+                continue;
+            }
+            in_space = false;
+            if !c.is_control() && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
+                next.push(c);
+            }
+        }
+        let next = next.replace("..", ".").replace("@{", "");
+        let next = next
+            .split('/')
+            .map(|part| {
+                let part = part.trim_start_matches('.');
+                part.strip_suffix(".lock").unwrap_or(part)
+            })
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        let next = next
+            .trim_start_matches('-')
+            .trim_end_matches('.')
+            .to_string();
+        if next == name {
+            return name;
+        }
+        name = next;
+    }
 }
 
 fn offer_git_init(dir: &Path) -> Result<bool> {
@@ -1114,7 +1177,13 @@ impl Drop for TmuxWindowName {
         match &state.restore {
             TmuxRestore::AutoRename => {
                 if let Err(e) = Command::new("tmux")
-                    .args(["set-window-option", "-t", &state.pane, "automatic-rename", "on"])
+                    .args([
+                        "set-window-option",
+                        "-t",
+                        &state.pane,
+                        "automatic-rename",
+                        "on",
+                    ])
                     .status()
                 {
                     eprintln!("wtclaude: warning: tmux set automatic-rename on: {e}");
@@ -1232,6 +1301,62 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_branch_name_cleans_names_git_rejects() {
+        let cases = [
+            ("fix the bug", "fix-the-bug"),
+            ("fix \t the  bug", "fix-the-bug"),
+            ("a..b", "a.b"),
+            ("a:b", "ab"),
+            ("a~b", "ab"),
+            ("a^b", "ab"),
+            ("a?b", "ab"),
+            ("a*b", "ab"),
+            ("a[b", "ab"),
+            ("a\\b", "ab"),
+            ("a\u{7}b", "ab"),
+            ("a@{b", "ab"),
+            ("a//b", "a/b"),
+            ("a/", "a"),
+            ("/a", "a"),
+            (".a", "a"),
+            ("a.", "a"),
+            ("trailing...", "trailing"),
+            ("a.lock", "a"),
+            ("a.lock.", "a"),
+            ("a/.b", "a/b"),
+            ("a.lock/b", "a/b"),
+            ("-a", "a"),
+            ("--.a", "a"),
+            ("???", ""),
+            ("~^:?*[\\", ""),
+            ("../..", ""),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(sanitize_branch_name(raw), want, "input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_branch_name_leaves_valid_names_alone() {
+        for name in [
+            "earlye/699c21e6a5d1/foo",
+            "main",
+            "fix-the-bug",
+            "v1.2",
+            "a@b",
+        ] {
+            assert_eq!(sanitize_branch_name(name), name);
+        }
+    }
+
+    #[test]
+    fn branch_name_bails_when_nothing_usable_is_left() {
+        let err = branch_name("???").unwrap_err().to_string();
+        assert_eq!(err, "'???' has no characters usable in a branch name");
+        assert_eq!(branch_name("fix the bug").unwrap(), "fix-the-bug");
+    }
 
     #[test]
     fn prepend_to_path_puts_entries_first_in_order() {
@@ -1400,8 +1525,7 @@ mod tests {
             "the-branch",
         ]);
 
-        let err =
-            ensure_worktree(&new_worktree, "the-branch", &main_repo).unwrap_err();
+        let err = ensure_worktree(&new_worktree, "the-branch", &main_repo).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains(&existing_worktree.to_string_lossy().to_string()),
