@@ -1,4 +1,4 @@
-# Issue: Inject --resume command into zsh history on exit
+# Issue: Inject --resume command into zsh and bash history on exit
 
 ## Desired behaviour
 
@@ -69,9 +69,57 @@ shell's memory), so the feature requires two parts:
   `wtclaude --completions zsh` alongside the existing completion function, so
   users get it automatically by sourcing the completions output.
 
+## Scope expansion: bash (2026-10-22)
+
+The user asked to cover bash as well as zsh. bash's equivalent of
+`print -s` is `history -s <string>`, which appends to the current shell's
+in-memory history list. The binary side (the session-ID temp file keyed by
+the shell's PID) is shared. Only the wrapper is shell-specific:
+
+```bash
+wtclaude() {
+  WTCLAUDE_PPID=$$ command wtclaude "$@"
+  local rc=$? _wt_session _wt_file="/tmp/wtclaude-last-session-$$"
+  _wt_session="$(cat "$_wt_file" 2>/dev/null)"
+  rm -f "$_wt_file"
+  [[ -n $_wt_session ]] && history -s "wtclaude --resume $_wt_session <target>"
+  return $rc
+}
+```
+
+Notes for bash:
+
+- **Last argument:** `${@[-1]}` is zsh-only. bash uses `"${!#}"` or
+  `"${@: -1}"`.
+- **Order in history:** `history -s` adds the entry *after* the
+  `wtclaude ...` line the user typed, so up-arrow lands on the resume
+  command first. That matches the zsh behaviour.
+- **Distribution:** `--completions` only accepts `zsh` today
+  (`src/main.rs:47`), so a bash wrapper needs either a `--completions bash`
+  (or similar `--shell-init bash`) output or documented rc-file
+  instructions.
+- **Exit status:** both wrappers should keep `wtclaude`'s exit status, as
+  `return $rc` does above. The zsh sketch above doesn't do this yet.
+
+## Choosing what to resume (applies to both shells)
+
+The binary knows exactly what it launched, so it should write the full
+resume command line to the temp file, not just the session ID. Then the
+wrapper wouldn't have to guess the target from the last argument. Two cases
+make that guess wrong:
+
+- **Initial prompt:** `wtclaude branch do the thing` has positional prompt
+  words *after* the branch, so the last argument is `thing`, not the
+  branch.
+- **Path mode:** `wtclaude path <dir>` resumes as
+  `wtclaude path --resume <id> <dir>`, not `wtclaude --resume <id> <dir>`.
+
+If the wrapper reads a complete command line from the file, the binary is
+the only place that has to get the command right.
+
 ## Version note
 
-Crate is at `v0.0.11` on `main` after PR #19. Per `CLAUDE.md`, bump patch
+The crate is at `0.1.15` on `main`. Per `CLAUDE.md`, bump the patch version
 once per branch.
 
 ## Suggested skills
