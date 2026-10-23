@@ -73,9 +73,10 @@ impl SandboxSession {
         repo_root: Option<&Path>,
         breakage: Option<SandboxBreakage>,
     ) {
-        // Hides the shell wrapper's handoff file, so neither the session nor
-        // a nested wtclaude learns its path. That alone doesn't stop writes:
-        // `record_resume_command` also refuses a file the plan can reach.
+        // Not passed on, so the session and any nested wtclaude aren't handed
+        // the shell wrapper's handoff file. The path is no secret — it shows
+        // in /proc and in a listing of its directory — so what protects the
+        // file is `record_resume_command` refusing one the plan can reach.
         cmd.env_remove(RESUME_FILE_ENV);
         cmd.env("WTCLAUDE_SANDBOX", sandbox_root);
         match repo_root {
@@ -622,10 +623,13 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
                 &canonical,
                 repo_root.as_deref(),
             ),
-            None => eprintln!(
-                "wtclaude: warning: {} is not valid UTF-8, so no resume command was added to history",
-                canonical.display()
-            ),
+            None => {
+                eprintln!(
+                    "wtclaude: warning: {} is not valid UTF-8, so no resume command was added to history",
+                    canonical.display()
+                );
+                discard_handoff(&handoff);
+            }
         }
     }
     Ok(status.code().unwrap_or(1))
@@ -727,7 +731,12 @@ fn resume_handoff_file() -> Option<PathBuf> {
 /// (a symlink is refused rather than followed), when the session's plan
 /// (recomputed from `sandbox_root` and `repo_root`, allowlist included, as
 /// the hook does for every Bash call) could have written or replaced it, or
-/// when the write itself fails.
+/// when the write itself fails. On any of those but the lookup, `handoff`
+/// is also deleted, so the wrapper finds nothing a session may have planted
+/// there. That leaves a race when the state directory is inside the
+/// session's sandbox: a sandboxed background process outliving the session
+/// could recreate the file after the deletion, before the wrapper reads it.
+/// Keep the state directory outside the sandbox root and allowlist.
 fn record_resume_command(
     handoff: &Path,
     session_id: &str,
@@ -746,6 +755,20 @@ fn record_resume_command(
     if let Err(e) = write_handoff(handoff, command, sandbox_root, repo_root) {
         eprintln!(
             "wtclaude: warning: not adding the resume command to history: {}: {e:#}",
+            handoff.display()
+        );
+        discard_handoff(handoff);
+    }
+}
+
+/// Deletes `handoff` (unlinking a symlink rather than following it), so the
+/// wrapper finds nothing to inject. Warns if it can't.
+fn discard_handoff(handoff: &Path) {
+    if let Err(e) = std::fs::remove_file(handoff)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "wtclaude: warning: could not remove {}: {e}",
             handoff.display()
         );
     }
@@ -769,11 +792,18 @@ fn write_handoff(
         .context("has no parent directory")?
         .canonicalize()
         .context("resolving its directory")?;
+    if parent.to_str().is_none() {
+        bail!(
+            "{} is not valid UTF-8, so the session's plan can't be checked against it",
+            parent.display()
+        );
+    }
     let file = parent.join(handoff.file_name().context("has no file name")?);
     let plan = sandbox::plan(sandbox_root, repo_root).context("computing the session's plan")?;
-    if plan.grants_write(&parent) || plan.grants_write(&file) {
+    if plan.grants_write(&file) {
         bail!(
-            "the session could write {}, so its contents can't be trusted",
+            "the session could write {}, so its contents can't be trusted; set \
+             XDG_STATE_HOME to a directory outside the sandbox root and allowlist",
             parent.display()
         );
     }

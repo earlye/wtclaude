@@ -144,13 +144,16 @@ fn completion_scripts_parse() {
     }
 }
 
+/// A fake `wtclaude` that writes a resume command to the handoff file.
+const WRITES_RESUME_COMMAND: &str = "[ -n \"$WTCLAUDE_RESUME_FILE\" ] && echo 'wtclaude --resume abc feat/x' > \"$WTCLAUDE_RESUME_FILE\"\n";
+
 /// Sources the bash script in a shell whose `wtclaude` on PATH is a fake
-/// that records the handoff path it was given, writes a resume command to
-/// it, and exits 3. Returns the shell's stdout and stderr, and the recorded
-/// path.
+/// that records the handoff path it was given, runs `body`, and exits 3.
+/// Returns the shell's stdout and stderr, and the recorded path.
 fn run_bash_wrapper(
     dir: &std::path::Path,
     state_home: &std::path::Path,
+    body: &str,
 ) -> (String, String, String) {
     let script = completion_script(dir, "bash");
     let bin = dir.join("bin");
@@ -158,10 +161,12 @@ fn run_bash_wrapper(
     let fake = bin.join("wtclaude");
     std::fs::write(
         &fake,
-        "#!/bin/sh\n\
-         printf '%s' \"${WTCLAUDE_RESUME_FILE-unset}\" > \"$SEEN_LOG_PATH\"\n\
-         [ -n \"$WTCLAUDE_RESUME_FILE\" ] && echo 'wtclaude --resume abc feat/x' > \"$WTCLAUDE_RESUME_FILE\"\n\
-         exit 3\n",
+        format!(
+            "#!/bin/sh\n\
+             printf '%s' \"${{WTCLAUDE_RESUME_FILE-unset}}\" > \"$SEEN_LOG_PATH\"\n\
+             {body}\
+             exit 3\n"
+        ),
     )
     .expect("write fake wtclaude");
     use std::os::unix::fs::PermissionsExt;
@@ -205,7 +210,7 @@ fn run_bash_wrapper(
 fn bash_wrapper_pushes_the_resume_command_onto_history() {
     let dir = unique_temp_dir("bash-wrapper");
     let state_home = dir.join("state");
-    let (stdout, stderr, handoff) = run_bash_wrapper(&dir, &state_home);
+    let (stdout, stderr, handoff) = run_bash_wrapper(&dir, &state_home, WRITES_RESUME_COMMAND);
     let handoff_left = std::path::Path::new(&handoff).exists();
     std::fs::remove_dir_all(&dir).ok();
 
@@ -228,7 +233,7 @@ fn bash_wrapper_still_runs_wtclaude_when_it_cannot_make_a_handoff_file() {
     // A regular file where the state dir should be makes mkdir fail.
     let state_home = dir.join("state");
     std::fs::write(&state_home, "").expect("create blocking file");
-    let (stdout, stderr, handoff) = run_bash_wrapper(&dir, &state_home);
+    let (stdout, stderr, handoff) = run_bash_wrapper(&dir, &state_home, WRITES_RESUME_COMMAND);
     std::fs::remove_dir_all(&dir).ok();
 
     assert!(stdout.contains("rc=3\n"), "stdout: {stdout}");
@@ -242,4 +247,61 @@ fn bash_wrapper_still_runs_wtclaude_when_it_cannot_make_a_handoff_file() {
         "stderr: {stderr}"
     );
     assert!(!stdout.contains("--resume"), "stdout: {stdout}");
+}
+
+#[test]
+fn bash_wrapper_does_not_follow_a_symlinked_handoff_file() {
+    let dir = unique_temp_dir("bash-wrapper-symlink");
+    let state_home = dir.join("state");
+    let target = dir.join("planted");
+    std::fs::write(&target, "echo pwned\n").expect("create symlink target");
+    let (stdout, _stderr, handoff) = run_bash_wrapper(
+        &dir,
+        &state_home,
+        &format!(
+            "rm -f \"$WTCLAUDE_RESUME_FILE\" && ln -s '{}' \"$WTCLAUDE_RESUME_FILE\"\n",
+            target.display()
+        ),
+    );
+    let link_left = std::fs::symlink_metadata(&handoff).is_ok();
+    let target_after = std::fs::read_to_string(&target).expect("reading symlink target");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(stdout.contains("rc=3\n"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("pwned"),
+        "a symlinked handoff file must not be injected: {stdout}"
+    );
+    assert_eq!(target_after, "echo pwned\n");
+    assert!(
+        !link_left,
+        "the wrapper should delete the symlink {handoff}"
+    );
+}
+
+#[test]
+fn bash_wrapper_sweeps_day_old_handoff_files() {
+    let dir = unique_temp_dir("bash-wrapper-sweep");
+    let state_home = dir.join("state");
+    let wt_dir = state_home.join("wtclaude");
+    std::fs::create_dir_all(&wt_dir).expect("create state dir");
+    let stale = wt_dir.join("last-session.stale1");
+    let fresh = wt_dir.join("last-session.fresh1");
+    std::fs::write(&stale, "").expect("create stale file");
+    std::fs::write(&fresh, "").expect("create fresh file");
+    let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .and_then(|f| f.set_modified(two_days_ago))
+        .expect("backdate stale file");
+    run_bash_wrapper(&dir, &state_home, WRITES_RESUME_COMMAND);
+    let (stale_left, fresh_left) = (stale.exists(), fresh.exists());
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(!stale_left, "a day-old handoff file should be swept");
+    assert!(
+        fresh_left,
+        "a recent handoff file may belong to a live wrapper"
+    );
 }

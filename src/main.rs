@@ -191,7 +191,14 @@ fn build_after_help() -> String {
 /// file could inject a command into history or have the unsandboxed binary
 /// overwrite an arbitrary file. That holds unless a sandbox root or
 /// allowlist entry covers the state directory, in which case the binary
-/// refuses to write the file.
+/// refuses to write the file and deletes it, so nothing is added — though a
+/// sandboxed background process outliving the session could still race a
+/// file back in before the wrapper reads it. Keep the state directory
+/// outside the sandbox root and allowlist. The wrapper reads only a regular
+/// file, never a symlink (or a FIFO, which would hang `cat`).
+///
+/// Handoff files left by an interrupted wrapper (e.g. Ctrl-C) are swept
+/// once they are a day old.
 fn print_history_wrapper(push_history: &str) {
     print!(
         r#"
@@ -203,9 +210,12 @@ wtclaude() {{
     command wtclaude "$@"
     return $?
   fi
+  find "$_wt_dir" -maxdepth 1 -name 'last-session.*' -mmin +1440 -delete 2>/dev/null
   WTCLAUDE_RESUME_FILE="$_wt_file" command wtclaude "$@"
   rc=$?
-  _wt_resume="$(cat -- "$_wt_file" 2>/dev/null)"
+  if [[ -f $_wt_file && ! -L $_wt_file ]]; then
+    _wt_resume="$(cat -- "$_wt_file")" || echo "wtclaude: warning: could not read $_wt_file" >&2
+  fi
   rm -f -- "$_wt_file" || echo "wtclaude: warning: could not remove $_wt_file" >&2
   [[ -n $_wt_resume ]] && {push_history} "$_wt_resume"
   return $rc

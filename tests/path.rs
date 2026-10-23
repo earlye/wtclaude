@@ -673,7 +673,8 @@ struct ResumeRun {
     argv: Vec<String>,
     /// `WTCLAUDE_RESUME_FILE` as claude saw it, or "unset".
     claude_saw_resume_file: String,
-    /// The handoff file's contents, or `None` if the run was given none.
+    /// The handoff file's contents, or `None` if the run was given none or
+    /// it was gone afterwards.
     handoff: Option<String>,
     /// Files under the test's HOME afterwards, excluding `.claude`.
     home_files: Vec<PathBuf>,
@@ -742,10 +743,11 @@ fn run_with_resume_stub(
         .map(str::to_string)
         .collect();
     let claude_saw_resume_file = std::fs::read_to_string(&env_log).expect("reading env log");
-    let handoff = handoff.map(|path| {
+    let handoff = handoff.and_then(|path| {
+        std::fs::symlink_metadata(path).ok()?;
         let contents = std::fs::read_to_string(path).expect("reading handoff file");
         std::fs::remove_file(path).ok();
-        contents
+        Some(contents)
     });
     let mut home_files = Vec::new();
     let mut pending = vec![home.clone()];
@@ -964,10 +966,14 @@ fn path_subcommand_refuses_a_handoff_file_the_session_could_write() {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(handoff.parent().unwrap()).ok();
 
-    assert_eq!(run.handoff.as_deref(), Some(""));
+    assert_eq!(
+        run.handoff, None,
+        "a refused handoff file should be deleted"
+    );
     let stderr = String::from_utf8_lossy(&run.output.stderr);
     assert!(
-        stderr.contains("the session could write"),
+        stderr.contains("the session could write")
+            && stderr.contains("set XDG_STATE_HOME to a directory outside the sandbox root"),
         "stderr: {stderr}"
     );
 }
@@ -993,6 +999,7 @@ fn path_subcommand_does_not_write_through_a_symlinked_handoff_file() {
     std::fs::remove_file(&victim).ok();
 
     assert_eq!(victim_after, "precious\n");
+    assert_eq!(run.handoff, None, "the symlink should be deleted");
     let stderr = String::from_utf8_lossy(&run.output.stderr);
     assert!(stderr.contains("not a regular file"), "stderr: {stderr}");
 }

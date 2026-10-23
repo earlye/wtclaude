@@ -568,38 +568,11 @@ fn is_within_sandbox(file_path: &str, cwd: &str, sandbox: &str, allowlist: &[Str
             // silently never match, the same failure mode this glob support
             // exists to fix.
             let resolved_pattern = crate::config::resolve_glob_prefix(&expanded);
-            return glob_match(&resolved_pattern, &normalized.to_string_lossy());
+            return sandbox::glob_matches(&resolved_pattern, &normalized.to_string_lossy());
         }
         let allowed = normalize_path(Path::new(&expanded), Path::new("/"));
         normalized.starts_with(&allowed)
     })
-}
-
-// Simple shell-style glob match supporting only the `*` wildcard (matches
-// any run of characters, including none). Used for allowlist entries like
-// `~/.claude.json*` that can't be expressed as a literal path component.
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    let mut pos = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            if !text[pos..].starts_with(part) {
-                return false;
-            }
-            pos += part.len();
-        } else if i == parts.len() - 1 {
-            return text[pos..].ends_with(part);
-        } else {
-            match text[pos..].find(part) {
-                Some(idx) => pos += idx + part.len(),
-                None => return false,
-            }
-        }
-    }
-    true
 }
 
 // Lexical path normalization that doesn't require paths to exist.
@@ -787,31 +760,6 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         assert!(result);
-    }
-
-    #[test]
-    fn glob_match_matches_prefix_and_siblings() {
-        assert!(glob_match("/a/.claude.json*", "/a/.claude.json"));
-        assert!(glob_match("/a/.claude.json*", "/a/.claude.json.tmp1234"));
-        assert!(!glob_match("/a/.claude.json*", "/a/.claude-other"));
-    }
-
-    #[test]
-    fn glob_match_matches_wildcard_in_the_middle() {
-        assert!(glob_match("/a/foo*bar", "/a/fooXXbar"));
-        assert!(!glob_match("/a/foo*bar", "/a/fooXXbaz"));
-    }
-
-    #[test]
-    fn glob_match_matches_leading_wildcard() {
-        assert!(glob_match("*.log", "/a/b/app.log"));
-        assert!(!glob_match("*.log", "/a/b/app.txt"));
-    }
-
-    #[test]
-    fn glob_match_matches_multiple_wildcards() {
-        assert!(glob_match("/a/*/b*c", "/a/x/bYYc"));
-        assert!(!glob_match("/a/*/b*c", "/a/x/bYYd"));
     }
 
     #[test]

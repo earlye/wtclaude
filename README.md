@@ -209,9 +209,13 @@ other flags (e.g. `--no-pull`) and initial-prompt words are left out.
 Nothing is added if the session ended before any message was sent. It
 hands the command over through a temporary file under
 `${XDG_STATE_HOME:-~/.local/state}/wtclaude/`, which sessions can't
-write, and deletes the file afterwards. If a sandbox root or allowlist
-entry covers that directory, wtclaude refuses to write the file and warns
-instead.
+write, and deletes the file afterwards (one left behind by an
+interrupted wrapper is swept once it is a day old). If a sandbox root or
+allowlist entry covers that directory, wtclaude refuses to write the
+file, deletes it, and warns, so nothing is added — but a sandboxed
+background process that outlives the session could still race a command
+into the file before the wrapper reads it. Keep the state directory
+outside the sandbox root and allowlist.
 
 
 ## Usage
