@@ -1,0 +1,49 @@
+# Stamps Cargo.toml with 0.1.<commit count> and tags v0.1.<count> on every
+# merge to main, so `cargo install --git ... --tag v0.1.N` pins a build and
+# Cargo's own version (cargo install, .crates2.json, cargo pkgid) is real.
+# The release commit counts too, so versions step by about 2 per merge.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          n=$(git rev-list --count HEAD)
+          version="0.1.$n"
+          current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "$version" ] || git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stamp, commit, and tag
+        if: steps.version.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
+          # --workspace re-resolves only wtclaude's own Cargo.lock entry.
+          cargo update --workspace
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: release $VERSION [skip ci]"
+          git tag "v$VERSION"
+          git push origin HEAD:main "v$VERSION"

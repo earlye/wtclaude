@@ -8,7 +8,11 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use launch::{Args as LaunchArgs, HeadlessArgs, PathArgs};
 
 #[derive(Parser)]
-#[command(name = "wtclaude", disable_help_subcommand = true)]
+#[command(
+    name = "wtclaude",
+    version = env!("WTCLAUDE_VERSION"),
+    disable_help_subcommand = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -68,7 +72,8 @@ fn main() {
     // with `enum Commands`. Deliberately excludes --help/-h: those fall
     // through to LaunchArgs so `wtclaude --help` documents the primary,
     // most-frequently-used invocation form (see Args's after_help for the
-    // rest of the command surface).
+    // rest of the command surface). --version/-V fall through the same way
+    // and are answered by Args's clap `version`.
     let known_subcommand = Cli::command()
         .get_subcommands()
         .any(|c| first == Some(c.get_name()));
@@ -273,6 +278,7 @@ _wtclaude() {{
 
   _arguments -s -S \
     '(--help -h)'{{--help,-h}}'[show usage]' \
+    '(--version -V)'{{--version,-V}}'[show version]' \
     '--mode[operation mode]:MODE:_wtclaude_modes' \
     '--resume[resume a previous session]:SESSION_ID:_wtclaude_sessions' \
     '--no-pull[skip git pull before launch]' \

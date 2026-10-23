@@ -89,6 +89,21 @@ fn no_arg_subcommand_rejects_trailing_arguments() {
 }
 
 #[test]
+fn version_flag_falls_through_to_launch_args_and_prints_version() {
+    // "--version" isn't a subcommand keyword, so it reaches LaunchArgs,
+    // whose clap `version` must answer it rather than reject it.
+    for flag in ["--version", "-V"] {
+        let output = run(&[flag]);
+        assert!(output.status.success(), "{flag} failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with(&format!("wtclaude {}", env!("CARGO_PKG_VERSION"))),
+            "stdout: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn completions_rejects_an_unsupported_shell_and_lists_the_supported_ones() {
     let output = run(&["--completions", "fish"]);
     assert_eq!(output.status.code(), Some(1));
