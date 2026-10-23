@@ -313,6 +313,9 @@ modes:
     claude-flags: ["--dangerously-skip-permissions", "--verbose"]
     # Directories put in front of PATH for this mode's sessions, in order.
     path-prepend: ["/snap/just/current/bin"]
+    # Added to the top-level allowlist while this mode is active.
+    allowlist:
+      - ~/.cache/some-tool
 
 # Which backend enforces the plan: auto (default), seatbelt, landlock.
 sandbox-backend: auto
@@ -337,14 +340,20 @@ would let a session plant commands on its own `PATH`), prints a warning
 at launch but is still used. The built-in modes set no `path-prepend`:
 which tools need it depends on the machine.
 
+A mode's `allowlist` entries are added to the top-level `allowlist` for
+sessions launched in that mode, so a path only one mode needs isn't
+writable in every mode. They are checked and treated exactly like
+top-level entries, below. The launcher passes the mode to the sandbox as
+`WTCLAUDE_MODE`.
+
 An `allowlist` entry containing `*` is a glob, which only the Seatbelt
 backend can express (see Differences between backends). An entry whose
 wildcard has no literal path prefix — `*`, `/*`, `*.log` — is rejected
 at startup, since it would match nearly every path and quietly disable
 the sandbox.
 
-The sandbox settings (`allowlist`, `socket_allowlist`,
-`sandbox-backend`) are read only from this file, never from the
+The sandbox settings (`allowlist`, a mode's `allowlist`,
+`socket_allowlist`, `sandbox-backend`) are read only from this file, never from the
 `wtclaude.yml` next to the binary: a standard `cargo install` puts the
 binary in `~/.cargo/bin`, which sessions can write to.
 

@@ -178,12 +178,15 @@ fn sandboxed_bash_response(
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    let mode = std::env::var("WTCLAUDE_MODE")
+        .ok()
+        .filter(|s| !s.is_empty());
 
     // Derived per call, not cached at launch: on Linux a rule needs a path
     // that already exists, so a cache dir created earlier in the session only
     // becomes writable if the plan is recomputed. It also means a broken
     // wtclaude.yml denies Bash rather than silently proceeding.
-    let plan = match sandbox::plan(sandbox_root, repo_root.as_deref()) {
+    let plan = match sandbox::plan(sandbox_root, repo_root.as_deref(), mode.as_deref()) {
         Ok(plan) => plan,
         Err(e) => {
             return Ok(Some(deny_bash(&format!(

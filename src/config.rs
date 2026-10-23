@@ -12,13 +12,17 @@ pub struct Config {
     pub modes: HashMap<String, Mode>,
 }
 
-/// The per-machine config's sandbox settings. Its `default-mode` and `modes`
-/// are read separately, as `ModeOverrides`, so a mistake there can't break
-/// the sandbox of a running session.
+/// The per-machine config's sandbox settings. Its `default-mode` and the rest
+/// of `modes` are read separately, as `ModeOverrides`, so a mistake there
+/// can't break the sandbox of a running session.
 #[derive(Deserialize, Default)]
 pub struct UserConfig {
     #[serde(default)]
     pub allowlist: Vec<String>,
+    /// Each mode's sandbox settings. Read only from the per-machine config:
+    /// the binary-adjacent file is writable by sessions (see `load`).
+    #[serde(default)]
+    pub modes: HashMap<String, ModeSandbox>,
     #[serde(default)]
     pub socket_allowlist: Vec<String>,
     /// Which sandbox backend enforces the plan: `auto` (the default) picks
@@ -28,7 +32,26 @@ pub struct UserConfig {
     pub sandbox_backend: Option<String>,
 }
 
+/// The sandbox settings of one mode in the per-machine config.
+#[derive(Deserialize, Default)]
+pub struct ModeSandbox {
+    /// Added to the top-level `allowlist` while this mode is active.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+}
+
 impl UserConfig {
+    /// The top-level `allowlist`, plus `mode`'s own when one is active. A
+    /// mode the per-machine config doesn't name (a built-in one, say) adds
+    /// nothing.
+    pub fn allowlist_for(&self, mode: Option<&str>) -> Vec<String> {
+        let mode_entries = mode
+            .and_then(|m| self.modes.get(m))
+            .map(|m| m.allowlist.as_slice())
+            .unwrap_or_default();
+        self.allowlist.iter().chain(mode_entries).cloned().collect()
+    }
+
     /// What the launcher should ask `sandbox::select` for. Deliberately does
     /// *not* consult `WTCLAUDE_BACKEND`: that variable is the launcher's
     /// instruction *to* the hook, and the hook must fail closed when it is
@@ -90,6 +113,9 @@ const USER_CONFIG_KEYS: &[&str] = &[
     "sandbox-backend",
 ];
 const MODE_KEYS: &[&str] = &["claude-flags", "path-prepend"];
+/// `allowlist` is a sandbox setting, so like the top-level one it is only
+/// accepted in the per-machine config.
+const USER_MODE_KEYS: &[&str] = &["claude-flags", "path-prepend", "allowlist"];
 
 /// Unknown keys are not reported here: the hook calls this on every tool
 /// call and would repeat them each time. `load`, which every launch runs,
@@ -97,8 +123,17 @@ const MODE_KEYS: &[&str] = &["claude-flags", "path-prepend"];
 pub fn load_user() -> Result<UserConfig> {
     let (home, path) = user_config_path()?;
     let (config, _unknown): (UserConfig, _) = read_user(&path)?;
-    validate_allowlist(&config.allowlist, &home)?;
+    validate_user(&config, &home)?;
     Ok(config)
+}
+
+fn validate_user(config: &UserConfig, home: &str) -> Result<()> {
+    validate_allowlist(&config.allowlist, home)?;
+    for (name, mode) in &config.modes {
+        validate_allowlist(&mode.allowlist, home)
+            .with_context(|| format!("in modes.{name}.allowlist"))?;
+    }
+    Ok(())
 }
 
 fn user_config_path() -> Result<(String, PathBuf)> {
@@ -111,7 +146,7 @@ fn user_config_path() -> Result<(String, PathBuf)> {
 /// file has that it doesn't recognise. A missing file is an empty config.
 fn read_user<T: DeserializeOwned + Default>(path: &Path) -> Result<(T, Vec<String>)> {
     match std::fs::read_to_string(path) {
-        Ok(s) => parse_checked(&s, USER_CONFIG_KEYS)
+        Ok(s) => parse_checked(&s, USER_CONFIG_KEYS, USER_MODE_KEYS)
             .with_context(|| format!("parsing {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((T::default(), vec![])),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -120,10 +155,14 @@ fn read_user<T: DeserializeOwned + Default>(path: &Path) -> Result<(T, Vec<Strin
 
 /// Parses `content` as `T`, also returning the keys serde would silently
 /// ignore: top-level keys not in `known`, and keys inside a `modes` entry
-/// other than those in `MODE_KEYS`, as dotted paths (`modes.safe.flags`).
-fn parse_checked<T: DeserializeOwned>(content: &str, known: &[&str]) -> Result<(T, Vec<String>)> {
+/// other than those in `mode_keys`, as dotted paths (`modes.safe.flags`).
+fn parse_checked<T: DeserializeOwned>(
+    content: &str,
+    known: &[&str],
+    mode_keys: &[&str],
+) -> Result<(T, Vec<String>)> {
     let value: Value = serde_yaml::from_str(content)?;
-    let unknown = unknown_keys(&value, known);
+    let unknown = unknown_keys(&value, known, mode_keys);
     // Deserialize from the text rather than `value`: only that keeps the field
     // path and line/column in type errors. An empty file parses as null; read
     // it as an empty mapping so structs whose fields all default deserialize.
@@ -135,7 +174,7 @@ fn parse_checked<T: DeserializeOwned>(content: &str, known: &[&str]) -> Result<(
     Ok((config, unknown))
 }
 
-fn unknown_keys(value: &Value, known: &[&str]) -> Vec<String> {
+fn unknown_keys(value: &Value, known: &[&str], mode_keys: &[&str]) -> Vec<String> {
     let mut unknown = Vec::new();
     let Some(map) = value.as_mapping() else {
         return unknown;
@@ -154,7 +193,7 @@ fn unknown_keys(value: &Value, known: &[&str]) -> Vec<String> {
                     continue;
                 };
                 for mode_key in mode.keys().map(key_name) {
-                    if !MODE_KEYS.contains(&mode_key.as_str()) {
+                    if !mode_keys.contains(&mode_key.as_str()) {
                         unknown.push(format!("modes.{}.{}", key_name(name), mode_key));
                     }
                 }
@@ -274,7 +313,7 @@ pub fn load() -> Result<Config> {
 fn load_from(path: &Path, user_path: &Path) -> Result<Config> {
     let base: Config = match std::fs::read_to_string(path) {
         Ok(s) => {
-            let (config, unknown) = parse_checked(&s, CONFIG_KEYS)
+            let (config, unknown) = parse_checked(&s, CONFIG_KEYS, MODE_KEYS)
                 .with_context(|| format!("parsing {}", path.display()))?;
             warn_unknown_keys(&path.display().to_string(), &unknown);
             config
@@ -327,7 +366,7 @@ mod tests {
     #[test]
     fn merge_user_default_mode_wins() {
         let (user, _): (ModeOverrides, _) =
-            parse_checked("default-mode: dangerous", USER_CONFIG_KEYS).unwrap();
+            parse_checked("default-mode: dangerous", USER_CONFIG_KEYS, USER_MODE_KEYS).unwrap();
         assert_eq!(merge(base_config(), user).default_mode, "dangerous");
     }
 
@@ -336,6 +375,7 @@ mod tests {
         let (user, _): (ModeOverrides, _) = parse_checked(
             "modes:\n  dangerous:\n    claude-flags: [a, b]\n  verbose:\n    claude-flags: [--verbose]\n",
             USER_CONFIG_KEYS,
+            USER_MODE_KEYS,
         )
         .unwrap();
         let merged = merge(base_config(), user);
@@ -351,6 +391,7 @@ mod tests {
         let (user, unknown): (ModeOverrides, _) = parse_checked(
             "modes:\n  dangerous:\n    path-prepend: [/snap/just/current/bin, ~/bin]\n",
             USER_CONFIG_KEYS,
+            USER_MODE_KEYS,
         )
         .unwrap();
         assert!(unknown.is_empty(), "{unknown:?}");
@@ -366,6 +407,7 @@ mod tests {
         let (user, _): (ModeOverrides, _) = parse_checked(
             "modes:\n  m:\n    path-prepend: [~/bin, ~, /a/~/b, ~other/bin, $HOME/bin]\n",
             USER_CONFIG_KEYS,
+            USER_MODE_KEYS,
         )
         .unwrap();
         assert_eq!(
@@ -382,7 +424,8 @@ mod tests {
 
     #[test]
     fn built_in_default_config_has_no_unknown_keys() {
-        let (_, unknown): (Config, _) = parse_checked(DEFAULT_CONFIG, CONFIG_KEYS).unwrap();
+        let (_, unknown): (Config, _) =
+            parse_checked(DEFAULT_CONFIG, CONFIG_KEYS, MODE_KEYS).unwrap();
         assert!(unknown.is_empty(), "{unknown:?}");
     }
 
@@ -391,6 +434,7 @@ mod tests {
         let (_, unknown): (UserConfig, _) = parse_checked(
             "default-mode: safe\nbogus: 1\nmodes:\n  safe:\n    claude-flag: []\n",
             USER_CONFIG_KEYS,
+            USER_MODE_KEYS,
         )
         .unwrap();
         assert_eq!(unknown, ["bogus", "modes.safe.claude-flag"]);
@@ -401,6 +445,7 @@ mod tests {
         let (config, unknown): (Config, _) = parse_checked(
             "default-mode: safe\nmodes: {}\nallowlist: [/x]\nsocket_allowlist: [/y]\nsandbox-backend: auto\n",
             CONFIG_KEYS,
+            MODE_KEYS,
         )
         .unwrap();
         assert_eq!(config.default_mode, "safe");
@@ -411,8 +456,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_checked_accepts_a_mode_allowlist_in_the_user_file() {
+        let (config, unknown): (UserConfig, _) = parse_checked(
+            "allowlist: [/x]\nmodes:\n  review:\n    claude-flags: [a]\n    allowlist: [~/.cache/review]\n",
+            USER_CONFIG_KEYS,
+            USER_MODE_KEYS,
+        )
+        .unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(config.modes["review"].allowlist, ["~/.cache/review"]);
+    }
+
+    #[test]
+    fn parse_checked_treats_a_mode_allowlist_as_unknown_in_the_binary_adjacent_file() {
+        let (_, unknown): (Config, _) = parse_checked(
+            "default-mode: safe\nmodes:\n  safe:\n    allowlist: [/x]\n",
+            CONFIG_KEYS,
+            MODE_KEYS,
+        )
+        .unwrap();
+        assert_eq!(unknown, ["modes.safe.allowlist"]);
+    }
+
+    #[test]
+    fn allowlist_for_adds_only_the_active_modes_entries() {
+        let (config, _): (UserConfig, _) = parse_checked(
+            "allowlist: [/x]\nmodes:\n  a:\n    allowlist: [/a]\n  b:\n    allowlist: [/b]\n",
+            USER_CONFIG_KEYS,
+            USER_MODE_KEYS,
+        )
+        .unwrap();
+        assert_eq!(config.allowlist_for(Some("a")), ["/x", "/a"]);
+        assert_eq!(config.allowlist_for(None), ["/x"]);
+        // A mode only the binary-adjacent file or built-in config defines.
+        assert_eq!(config.allowlist_for(Some("safe")), ["/x"]);
+    }
+
+    #[test]
+    fn validate_user_rejects_a_bad_mode_allowlist_entry_and_names_the_mode() {
+        let dir = TempDir::new("mode-allowlist");
+        let user = dir.file("user.yml", "modes:\n  review:\n    allowlist: ['/*']\n");
+        let (config, _): (UserConfig, _) = read_user(&user).unwrap();
+        let err = validate_user(&config, "/home/x")
+            .expect_err("a root-anchored wildcard must be rejected");
+        let message = format!("{err:#}");
+        assert!(message.contains("modes.review.allowlist"), "{message}");
+        assert!(message.contains("/*"), "{message}");
+    }
+
+    #[test]
     fn parse_checked_accepts_an_empty_user_file() {
-        let (config, unknown): (ModeOverrides, _) = parse_checked("", USER_CONFIG_KEYS).unwrap();
+        let (config, unknown): (ModeOverrides, _) =
+            parse_checked("", USER_CONFIG_KEYS, USER_MODE_KEYS).unwrap();
         assert!(config.default_mode.is_none());
         assert!(config.modes.is_empty());
         assert!(unknown.is_empty());
@@ -423,6 +518,7 @@ mod tests {
         let err = parse_checked::<ModeOverrides>(
             "modes:\n  safe:\n    claude-flags: 5\n",
             USER_CONFIG_KEYS,
+            USER_MODE_KEYS,
         )
         .err()
         .expect("a number is not a flag list");
@@ -436,6 +532,7 @@ mod tests {
         let (config, _): (UserConfig, _) = parse_checked(
             "allowlist: [/x]\nmodes:\n  safe:\n    claude-flags: --verbose\n",
             USER_CONFIG_KEYS,
+            USER_MODE_KEYS,
         )
         .unwrap();
         assert_eq!(config.allowlist, ["/x"]);
