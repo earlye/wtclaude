@@ -683,6 +683,7 @@ fn branch_name(raw: &str) -> Result<String> {
     if clean.is_empty() {
         bail!("'{raw}' has no characters usable in a branch name");
     }
+    // git's stderr only repeats "'<name>' is not a valid branch name".
     let output = Command::new("git")
         .args(["check-ref-format", "--branch", &clean])
         .output()
@@ -693,10 +694,7 @@ fn branch_name(raw: &str) -> Result<String> {
         } else {
             format!(" (from '{raw}')")
         };
-        bail!(
-            "'{clean}'{from} is not a valid branch name: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("'{clean}'{from} is not a valid branch name");
     }
     if clean != raw {
         eprintln!("wtclaude: using branch '{clean}' (from '{raw}')");
