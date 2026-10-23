@@ -102,3 +102,8 @@ leaving the session to find out when it pushes.
   `wtclaude` directly, and the tmux server still has `-SSH_AUTH_SOCK`, so
   sessions opened with `/md-issue-tmux` still have no agent until that skill
   launches through `startish`. That's a skill change, outside this repository.
+- Q: Does `/md-issue-tmux` launch through `startish` now? — A: Yes. The updated
+  skill runs `tmux new-window … "<abs path to startish> --history … -- wtclaude
+  --no-pull <branch> /md-issue-fix <id>"`, so the window's interactive shell
+  runs `~/.bashrc`, which starts an agent before `wtclaude` runs. The tmux path
+  no longer depends on the tmux server's `SSH_AUTH_SOCK`.
