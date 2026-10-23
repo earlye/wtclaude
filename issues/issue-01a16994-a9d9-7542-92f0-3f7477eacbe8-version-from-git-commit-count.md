@@ -26,64 +26,74 @@ Current state:
 `CARGO_PKG_VERSION`, `cargo install`'s "Replacing ... vX" line, and
 `.crates2.json` all come from `Cargo.toml` itself. `build.rs` runs after
 Cargo has read that version and can't change it. What `build.rs` *can* do
-is emit `cargo:rustc-env=WTCLAUDE_VERSION=0.1.<count>+<hash>`, which the
+is emit `cargo:rustc-env=WTCLAUDE_VERSION=<version>+<hash>`, which the
 binary reads with `env!` and shows in `--version`.
 
-Some options:
+## Decision
 
-1. **Version only in the binary:** `build.rs` computes `0.1.<count>+<hash>`
-   for `wtclaude --version`, and `Cargo.toml` stays at a fixed `0.1.0`.
-   Drop the per-branch bump rule from `CLAUDE.md`. The cost is that
-   `cargo install` output and `cargo pkgid` show the fixed number. That
-   doesn't matter for a binary installed from a path.
-2. **Version stamped into `Cargo.toml`:** a `just` recipe or git hook
-   rewrites `Cargo.toml` before building or at merge time. This keeps
-   Cargo's own version accurate, but it's back to managing a file and adds
-   churn in the diff.
-3. **Option 1 plus a bump-check:** fixes the version shown, but keeps the
-   problem this issue is trying to remove.
+Cargo's own version must be real (`cargo install` output, `.crates2.json`,
+`cargo pkgid`), so builds can be pinned with
+`cargo install --git <repo> --tag v0.1.N`. So the version goes into
+`Cargo.toml`, written by CI rather than by hand:
 
-Option 1 looks closest to what was asked. This needs a decision.
+1. **CI writes the version on merge.** `.github/workflows/release.yml` runs
+   on push to `main`: it sets `Cargo.toml` to `0.1.<git rev-list --count
+   HEAD>`, updates wtclaude's own `Cargo.lock` entry with
+   `cargo update --workspace`, commits as `github-actions[bot]` with
+   `chore: release 0.1.N [skip ci]`, tags `v0.1.N`, and pushes both. A
+   `concurrency` group stops two releases racing; `[skip ci]` plus a
+   "version already 0.1.N or tag exists" check stops it looping on its own
+   commit. The release commit itself adds 1 to the count, so versions step
+   by about 2 per merge; only monotonic matters.
+2. **`build.rs` adds build metadata** for `wtclaude --version`:
+   `{CARGO_PKG_VERSION}+{short-hash}`, plus `.dirty` with uncommitted
+   changes, exposed as `WTCLAUDE_VERSION`.
+3. **`--version`** on `Cli` and `Args`.
+4. **`CLAUDE.md`** drops the hand-bump rule.
+
+If `main` is protected, the Actions bot may need a ruleset bypass to push
+the release commit and tag. We don't know this repo's protection setup.
 
 ## Full semver
 
 Semver 2.0 build metadata (`+hash`) is valid in `Cargo.toml` and accepted
-by clap's `version`. Under option 1 it's a string we write, so nothing
-stops us. Precedence rules ignore build metadata, which is fine because the
-commit count already orders builds.
+by clap's `version`. Here it is only in the `--version` string `build.rs`
+writes; `Cargo.toml` carries plain `0.1.N`. Precedence rules ignore build
+metadata, which is fine because the commit count already orders builds.
 
 ## Details to settle
 
-- **Which count:** `git rev-list --count HEAD` counts commits on the
-  current branch, so a feature branch with 5 commits shows more than `main`
-  will after the squash-merge. `--first-parent` makes no difference for
-  this repo's squash merges. Builds from different branches may not sort
-  in order, which seems acceptable.
-- **Dirty tree:** consider `+<hash>.dirty` when there are uncommitted
-  changes, because `cargo install --path .` from a worktree with
+- **Which count:** CI counts `git rev-list --count HEAD` on `main` only,
+  so feature-branch commit counts never reach the version. Builds from a
+  branch report the last version merged into it, plus their own hash.
+- **Dirty tree:** append `.dirty` (`+<hash>.dirty`) when
+  `git status --porcelain` is non-empty, because `cargo install --path .` from a worktree with
   uncommitted changes is exactly how the 0.1.16 confusion happened.
-- **Rebuild triggers:** emit `cargo:rerun-if-changed` for `HEAD` and the
-  ref it points to. In a linked worktree `.git` is a file, not a directory,
-  so find the paths with `git rev-parse --git-dir` and `--git-common-dir`
-  rather than hardcoding `.git/HEAD`. If this is missing, the version stays
-  stale until the next real rebuild.
+- **Rebuild triggers:** emit `cargo:rerun-if-changed` for `HEAD`, the ref
+  it points to, `packed-refs`, and the index. In a linked worktree `.git` is
+  a file, not a directory, so find the paths with `git rev-parse --git-path`
+  rather than hardcoding `.git/HEAD`. Once any rerun-if-changed is emitted
+  Cargo only reruns `build.rs` on those paths, so also list `src` and
+  `Cargo.toml`, or `.dirty` goes stale after a source edit.
 - **No git available:** a source tarball, or a build where `git` isn't on
-  PATH, needs a fallback such as `0.1.0+unknown`, not a build failure.
+  PATH, falls back to plain `CARGO_PKG_VERSION`, not a build failure.
 - **Sandbox:** inside a wtclaude session, `build.rs` runs `git` under
-  Landlock. Reading is unrestricted, so this should work, but confirm it.
+  Landlock. Reading is unrestricted, and this was confirmed to work.
 - **Add `--version`:** add clap's `version = env!("WTCLAUDE_VERSION")` to
-  `Args`, and to the `Cli` in `src/main.rs:11`, so the stamped version is
-  visible. The custom argv routing in `main.rs` (`--completions` is
-  special-cased at `src/main.rs:47`) may need to handle `--version` before
-  it falls back to treating the argument as a worktree name.
-- **`CLAUDE.md`:** update or remove its "Versioning" section to match the
-  chosen option.
+  `Args` and to the `Cli`. `--version`/`-V` aren't subcommand keywords, so
+  main.rs's argv routing passes them to `Args`, whose clap `version`
+  answers them; no extra special case is needed.
+- **`CLAUDE.md`:** replace the per-branch bump rule with "don't edit the
+  version by hand; CI sets `0.1.<count>` and tags it on merge; minor/major
+  bumps need an explicit decision and a change to the workflow's `0.1`
+  prefix".
 
 ## Relevant files
 
-- `Cargo.toml:3`: the hand-maintained `version`
-- `CLAUDE.md`: the per-branch patch bump rule
-- `src/main.rs:11`, `src/main.rs:47`: the top-level `Cli` and argv routing,
-  where `--version` would need to be added
-- `src/launch.rs:113`: `Args` (`#[command(name = "wtclaude")]`, no
-  `version`)
+- `.github/workflows/release.yml` (new): stamps and tags on merge to `main`
+- `build.rs` (new): `WTCLAUDE_VERSION` with `+hash[.dirty]`
+- `Cargo.toml:3`: the `version`, now written by CI
+- `CLAUDE.md`: the "Versioning" rule
+- `src/main.rs:16`, `src/main.rs:51`: the top-level `Cli` and argv routing
+- `src/launch.rs:191`: `Args`
+- `tests/dispatch.rs`: `--version`/`-V` dispatch test

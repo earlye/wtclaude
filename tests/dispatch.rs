@@ -87,3 +87,18 @@ fn no_arg_subcommand_rejects_trailing_arguments() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unexpected argument"), "stderr: {stderr}");
 }
+
+#[test]
+fn version_flag_falls_through_to_launch_args_and_prints_version() {
+    // "--version" isn't a subcommand keyword, so it reaches LaunchArgs,
+    // whose clap `version` must answer it rather than reject it.
+    for flag in ["--version", "-V"] {
+        let output = run(&[flag]);
+        assert!(output.status.success(), "{flag} failed: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with(&format!("wtclaude {}", env!("CARGO_PKG_VERSION"))),
+            "stdout: {stdout}"
+        );
+    }
+}

@@ -187,7 +187,7 @@ enum SandboxBreakage {
 // documents the full command surface without hand-duplicating it here.
 /// Launch a sandboxed Claude session in a worktree for WORKTREE_NAME.
 #[derive(Parser)]
-#[command(name = "wtclaude")]
+#[command(name = "wtclaude", version = env!("WTCLAUDE_VERSION"))]
 pub struct Args {
     /// Operation mode (see wtclaude.yml)
     #[arg(long)]
