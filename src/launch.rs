@@ -295,19 +295,7 @@ pub fn run(args: Args) -> Result<i32> {
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
     }
-    // A resumed session keeps its existing name (including any `/rename`).
-    let session_id = match args.resume {
-        Some(session_id) => {
-            cmd.arg("--resume").arg(&session_id);
-            session_id
-        }
-        None => {
-            let session_id = new_session_id()?;
-            cmd.arg("--session-id").arg(&session_id);
-            cmd.arg("--name").arg(&args.name);
-            session_id
-        }
-    };
+    let session_id = add_session_args(&mut cmd, args.resume, &args.name)?;
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(
@@ -601,19 +589,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
     }
-    // A resumed session keeps its existing name (including any `/rename`).
-    let session_id = match args.resume {
-        Some(session_id) => {
-            cmd.arg("--resume").arg(&session_id);
-            session_id
-        }
-        None => {
-            let session_id = new_session_id()?;
-            cmd.arg("--session-id").arg(&session_id);
-            cmd.arg("--name").arg(&label);
-            session_id
-        }
-    };
+    let session_id = add_session_args(&mut cmd, args.resume, &label)?;
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(
@@ -640,10 +616,30 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
     Ok(status.code().unwrap_or(1))
 }
 
-/// Where the shell wrapper (see `wtclaude --completions`) looks for the
-/// resume command line; keyed by the wrapper's own PID, which it passes in
-/// as `WTCLAUDE_PPID`.
-pub(crate) const RESUME_FILE_PREFIX: &str = "/tmp/wtclaude-last-session-";
+/// Adds `--resume RESUME`, or `--session-id` (freshly generated) plus
+/// `--name NAME`, to `cmd`, returning the session id either way. Also hides
+/// the shell wrapper's handoff file from the session, so neither it nor a
+/// nested wtclaude can write the command the wrapper injects into history.
+fn add_session_args(cmd: &mut Command, resume: Option<String>, name: &str) -> Result<String> {
+    cmd.env_remove(RESUME_FILE_ENV);
+    // A resumed session keeps its existing name (including any `/rename`).
+    match resume {
+        Some(session_id) => {
+            cmd.arg("--resume").arg(&session_id);
+            Ok(session_id)
+        }
+        None => {
+            let session_id = new_session_id()?;
+            cmd.arg("--session-id").arg(&session_id);
+            cmd.arg("--name").arg(name);
+            Ok(session_id)
+        }
+    }
+}
+
+/// Names the file the shell wrapper (see `wtclaude --completions`) created
+/// with `mktemp` for the resume command line.
+const RESUME_FILE_ENV: &str = "WTCLAUDE_RESUME_FILE";
 
 /// A random (v4) UUID for `claude --session-id`, so the resume command is
 /// known up front instead of guessed from session-file mtimes afterwards.
@@ -667,8 +663,9 @@ fn new_session_id() -> Result<String> {
 }
 
 /// The command line that resumes `session_id` against `target` (a branch,
-/// or a directory under `subcommand` `path`). Initial-prompt words are
-/// deliberately absent: a resumed session doesn't need them.
+/// or a directory under `subcommand` `path`). Only an explicit `--mode`
+/// carries over; other flags (e.g. `--no-pull`) and initial-prompt words are
+/// left out.
 fn resume_command(
     subcommand: Option<&str>,
     mode: Option<&str>,
@@ -696,27 +693,31 @@ fn shell_quote(word: &str) -> String {
     if safe {
         word.to_string()
     } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
+        crate::sandbox::shell_single_quote(word)
     }
 }
 
 /// Hands the resume command to the shell wrapper, which injects it into
-/// history. Does nothing outside the wrapper (no `WTCLAUDE_PPID`), or when
-/// the session was exited before any message created its transcript —
+/// history. Does nothing outside the wrapper (no `WTCLAUDE_RESUME_FILE`), or
+/// when the session was exited before any message created its transcript —
 /// there would be nothing to resume.
 fn record_resume_command(session_id: &str, command: &str) {
-    let Ok(ppid) = std::env::var("WTCLAUDE_PPID") else {
+    let Some(path) = std::env::var_os(RESUME_FILE_ENV).filter(|p| !p.is_empty()) else {
         return;
     };
-    if ppid.is_empty() || !ppid.chars().all(|c| c.is_ascii_digit()) {
-        return;
+    match crate::sessions::session_exists(session_id) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            eprintln!("wtclaude: warning: looking for session {session_id}: {e:#}");
+            return;
+        }
     }
-    if !crate::sessions::session_exists(session_id) {
-        return;
-    }
-    let path = format!("{RESUME_FILE_PREFIX}{ppid}");
     if let Err(e) = std::fs::write(&path, format!("{command}\n")) {
-        eprintln!("wtclaude: warning: writing {path}: {e}");
+        eprintln!(
+            "wtclaude: warning: writing {}: {e}",
+            std::path::Path::new(&path).display()
+        );
     }
 }
 
@@ -1361,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_command_drops_the_initial_prompt() {
+    fn resume_target_is_the_branch_without_the_prompt_words() {
         let parsed = Args::try_parse_from(["wtclaude", "feat/x", "do", "the", "thing"]).unwrap();
         assert_eq!(
             resume_command(None, None, "abc-123", &parsed.name),

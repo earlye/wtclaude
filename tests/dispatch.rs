@@ -67,7 +67,7 @@ fn top_level_help_documents_the_full_command_surface() {
     // ...plus the rest of the command surface via after_help.
     assert!(stdout.contains("wtclaude headless"), "stdout: {stdout}");
     assert!(
-        stdout.contains("wtclaude --completions zsh"),
+        stdout.contains("wtclaude --completions zsh|bash"),
         "stdout: {stdout}"
     );
     // Regression guard: the after_help wiring note in src/launch.rs must
@@ -86,4 +86,143 @@ fn no_arg_subcommand_rejects_trailing_arguments() {
     assert_eq!(output.status.code(), Some(2), "clap usage errors exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unexpected argument"), "stderr: {stderr}");
+}
+
+#[test]
+fn completions_rejects_an_unsupported_shell_and_lists_the_supported_ones() {
+    let output = run(&["--completions", "fish"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Supported: zsh, bash"), "stderr: {stderr}");
+}
+
+/// Writes `wtclaude --completions SHELL` to a file under `dir`.
+fn completion_script(dir: &std::path::Path, shell: &str) -> std::path::PathBuf {
+    let output = run(&["--completions", shell]);
+    assert!(output.status.success());
+    let path = dir.join(format!("completions.{shell}"));
+    std::fs::write(&path, &output.stdout).expect("write completion script");
+    path
+}
+
+fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "wtclaude-integration-test-dispatch-{}-{}",
+        std::process::id(),
+        label
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+#[test]
+fn completion_scripts_parse() {
+    let dir = unique_temp_dir("syntax");
+    let bash = completion_script(&dir, "bash");
+    let zsh = completion_script(&dir, "zsh");
+    let bash_check = Command::new("bash").arg("-n").arg(&bash).output();
+    let zsh_check = Command::new("zsh").arg("-n").arg(&zsh).output();
+    std::fs::remove_dir_all(&dir).ok();
+
+    let bash_check = bash_check.expect("spawning bash");
+    assert!(
+        bash_check.status.success(),
+        "bash -n: {}",
+        String::from_utf8_lossy(&bash_check.stderr)
+    );
+    match zsh_check {
+        Ok(out) => assert!(
+            out.status.success(),
+            "zsh -n: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping zsh -n: zsh is not installed");
+        }
+        Err(e) => panic!("spawning zsh: {e}"),
+    }
+}
+
+/// Sources the bash script in a shell whose `wtclaude` on PATH is a fake
+/// that records the handoff path it was given, writes a resume command to
+/// it, and exits 3. Returns the shell's stdout and the recorded path.
+fn run_bash_wrapper(dir: &std::path::Path, state_home: &std::path::Path) -> (String, String) {
+    let script = completion_script(dir, "bash");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("create bin dir");
+    let fake = bin.join("wtclaude");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\n\
+         printf '%s' \"${WTCLAUDE_RESUME_FILE-unset}\" > \"$SEEN_LOG_PATH\"\n\
+         [ -n \"$WTCLAUDE_RESUME_FILE\" ] && echo 'wtclaude --resume abc feat/x' > \"$WTCLAUDE_RESUME_FILE\"\n\
+         exit 3\n",
+    )
+    .expect("write fake wtclaude");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake wtclaude");
+    let seen_log = dir.join("seen.log");
+
+    let output = Command::new("bash")
+        .args(["--norc", "--noprofile", "-c"])
+        .arg(r#"set -o history; source "$1"; wtclaude x; echo "rc=$?"; history"#)
+        .arg("bash")
+        .arg(&script)
+        .env("HOME", dir)
+        .env("XDG_STATE_HOME", state_home)
+        .env("HISTFILE", dir.join("history"))
+        .env("SEEN_LOG_PATH", &seen_log)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .expect("spawning bash");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen = std::fs::read_to_string(&seen_log).expect("reading seen log");
+    (String::from_utf8_lossy(&output.stdout).into_owned(), seen)
+}
+
+#[test]
+fn bash_wrapper_pushes_the_resume_command_onto_history() {
+    let dir = unique_temp_dir("bash-wrapper");
+    let state_home = dir.join("state");
+    let (stdout, handoff) = run_bash_wrapper(&dir, &state_home);
+    let handoff_left = std::path::Path::new(&handoff).exists();
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(stdout.contains("rc=3\n"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("wtclaude --resume abc feat/x\n"),
+        "history should hold the resume command: {stdout}"
+    );
+    assert!(
+        handoff.starts_with(&format!("{}/wtclaude/", state_home.display())),
+        "handoff file should live under XDG_STATE_HOME, got {handoff}"
+    );
+    assert!(!handoff_left, "the wrapper should delete {handoff}");
+}
+
+#[test]
+fn bash_wrapper_still_runs_wtclaude_when_it_cannot_make_a_handoff_file() {
+    let dir = unique_temp_dir("bash-wrapper-no-state");
+    // A regular file where the state dir should be makes mkdir fail.
+    let state_home = dir.join("state");
+    std::fs::write(&state_home, "").expect("create blocking file");
+    let (stdout, handoff) = run_bash_wrapper(&dir, &state_home);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(stdout.contains("rc=3\n"), "stdout: {stdout}");
+    assert_eq!(handoff, "unset");
+    assert!(!stdout.contains("--resume"), "stdout: {stdout}");
 }

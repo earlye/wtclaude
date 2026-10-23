@@ -181,17 +181,29 @@ fn build_after_help() -> String {
 
 /// Wraps `wtclaude` so that, once a session ends, its resume command is
 /// pushed onto the shell's history (`print -s` in zsh, `history -s` in
-/// bash): the binary writes the full command line to a file keyed by the
-/// shell's PID, and the wrapper reads, deletes, and injects it.
+/// bash): the wrapper creates a private file with `mktemp` and passes it as
+/// `WTCLAUDE_RESUME_FILE`, the binary writes the full command line there,
+/// and the wrapper reads, deletes, and injects it.
+///
+/// The file lives under `$XDG_STATE_HOME/wtclaude` (default
+/// `~/.local/state`), which no sandbox plan grants, rather than `/tmp`,
+/// which every plan does: a session that could plant or symlink the file
+/// could inject a command into history or have the unsandboxed binary
+/// overwrite an arbitrary file.
 fn print_history_wrapper(push_history: &str) {
-    let prefix = launch::RESUME_FILE_PREFIX;
     print!(
         r#"
 wtclaude() {{
-  WTCLAUDE_PPID=$$ command wtclaude "$@"
-  local rc=$? _wt_resume _wt_file="{prefix}$$"
-  _wt_resume="$(cat "$_wt_file" 2>/dev/null)"
-  rm -f "$_wt_file"
+  local _wt_dir="${{XDG_STATE_HOME:-$HOME/.local/state}}/wtclaude" _wt_file _wt_resume rc
+  if ! mkdir -p -m 700 -- "$_wt_dir" 2>/dev/null ||
+    ! _wt_file="$(mktemp "$_wt_dir/last-session.XXXXXX" 2>/dev/null)"; then
+    command wtclaude "$@"
+    return $?
+  fi
+  WTCLAUDE_RESUME_FILE="$_wt_file" command wtclaude "$@"
+  rc=$?
+  _wt_resume="$(cat -- "$_wt_file" 2>/dev/null)"
+  rm -f -- "$_wt_file"
   [[ -n $_wt_resume ]] && {push_history} "$_wt_resume"
   return $rc
 }}
@@ -212,7 +224,7 @@ _wtclaude_sessions() {{
     date_str=$(date -r "$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$epoch")
     session_ids+=("$session_id")
     descriptions+=("$session_id:$worktree  $date_str")
-  done < <(wtclaude sessions 2>/dev/null)
+  done < <(command wtclaude sessions 2>/dev/null)
 
   (( ${{#session_ids}} )) || return 1
   compadd -d descriptions -a session_ids
@@ -223,7 +235,7 @@ _wtclaude_worktrees() {{
   for (( i = 1; i <= $#words - 1; i++ )); do
     if [[ ${{words[$i]}} == '--resume' && -n ${{words[$((i+1))]}} ]]; then
       local worktree
-      worktree=$(wtclaude session-worktree "${{words[$((i+1))]}}" 2>/dev/null)
+      worktree=$(command wtclaude session-worktree "${{words[$((i+1))]}}" 2>/dev/null)
       if [[ -n $worktree ]]; then
         compadd -- "$worktree"
         return
@@ -232,13 +244,13 @@ _wtclaude_worktrees() {{
   done
 
   local -a worktrees
-  worktrees=( ${{(f)"$(wtclaude worktrees 2>/dev/null)"}} )
+  worktrees=( ${{(f)"$(command wtclaude worktrees 2>/dev/null)"}} )
   compadd -a worktrees
 }}
 
 _wtclaude_modes() {{
   local -a modes
-  modes=( ${{(f)"$(wtclaude modes 2>/dev/null)"}} )
+  modes=( ${{(f)"$(command wtclaude modes 2>/dev/null)"}} )
   (( ${{#modes}} )) && compadd -a modes
 }}
 
@@ -269,9 +281,9 @@ _wtclaude() {{
   local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}}
   local IFS=$'\n'
   case $prev in
-    --resume) COMPREPLY=($(compgen -W "$(wtclaude sessions 2>/dev/null | cut -f1)" -- "$cur")) ;;
-    --mode) COMPREPLY=($(compgen -W "$(wtclaude modes 2>/dev/null)" -- "$cur")) ;;
-    *) COMPREPLY=($(compgen -W "$(wtclaude worktrees 2>/dev/null)" -- "$cur")) ;;
+    --resume) COMPREPLY=($(compgen -W "$(command wtclaude sessions 2>/dev/null | cut -f1)" -- "$cur")) ;;
+    --mode) COMPREPLY=($(compgen -W "$(command wtclaude modes 2>/dev/null)" -- "$cur")) ;;
+    *) COMPREPLY=($(compgen -W "$(command wtclaude worktrees 2>/dev/null)" -- "$cur")) ;;
   esac
 }}
 

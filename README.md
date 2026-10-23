@@ -203,10 +203,14 @@ The script also defines a `wtclaude` shell function wrapping the binary.
 When a session ends, it pushes the command that resumes that session
 onto your shell history, so pressing up-arrow offers e.g.
 `wtclaude --resume <session-id> my-feature` (or `wtclaude path --resume
-<session-id> <dir>` for path mode). Initial-prompt words are left out.
+<session-id> <dir>` for path mode). Run a branch-mode line from the same
+repository it was launched in. Only an explicit `--mode` carries over;
+other flags (e.g. `--no-pull`) and initial-prompt words are left out.
 Nothing is added if the session ended before any message was sent. The
-binary hands the command over in `/tmp/wtclaude-last-session-<shell
-PID>`, and the function deletes that file after reading it.
+function creates a private handoff file with `mktemp` under
+`${XDG_STATE_HOME:-~/.local/state}/wtclaude/`, a directory sessions
+cannot write, passes it to the binary as `WTCLAUDE_RESUME_FILE`, and
+deletes it after reading it.
 
 
 ## Usage

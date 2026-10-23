@@ -647,3 +647,285 @@ fn active_backend_name() -> &'static str {
     #[cfg(target_os = "linux")]
     return "landlock";
 }
+
+/// Logs claude's argv and whether it saw `WTCLAUDE_RESUME_FILE`, then, when
+/// `MAKE_TRANSCRIPT` is set, creates the transcript Claude would write for
+/// the session it was handed (`--session-id` or `--resume`).
+const RESUME_STUB_CLAUDE: &str = "#!/bin/sh\n\
+     printf '%s\\n' \"$@\" > \"$ARGV_LOG_PATH\"\n\
+     printf '%s' \"${WTCLAUDE_RESUME_FILE-unset}\" > \"$ENV_LOG_PATH\"\n\
+     prev=; id=\n\
+     for a in \"$@\"; do\n\
+     case $prev in --session-id|--resume) id=$a ;; esac\n\
+     prev=$a\n\
+     done\n\
+     if [ -n \"$MAKE_TRANSCRIPT\" ] && [ -n \"$id\" ]; then\n\
+     mkdir -p \"$HOME/.claude/projects/stub\" && : > \"$HOME/.claude/projects/stub/$id.jsonl\"\n\
+     fi\n\
+     exit 0\n";
+
+struct ResumeRun {
+    output: std::process::Output,
+    argv: Vec<String>,
+    /// `WTCLAUDE_RESUME_FILE` as claude saw it, or "unset".
+    claude_saw_resume_file: String,
+    /// The handoff file's contents, or `None` if the run was given none.
+    handoff: Option<String>,
+    /// Files under the test's HOME afterwards, excluding `.claude`.
+    home_files: Vec<PathBuf>,
+}
+
+impl ResumeRun {
+    fn arg_after(&self, flag: &str) -> Option<&str> {
+        let pos = self.argv.iter().position(|a| a == flag)?;
+        self.argv.get(pos + 1).map(String::as_str)
+    }
+}
+
+/// Runs `wtclaude ARGS` from `cwd` against [`RESUME_STUB_CLAUDE`], with a
+/// fresh HOME and, when `with_handoff_file`, an empty handoff file passed as
+/// `WTCLAUDE_RESUME_FILE` the way the shell wrapper does.
+fn run_with_resume_stub(
+    label: &str,
+    cwd: &std::path::Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    with_handoff_file: bool,
+    make_transcript: bool,
+) -> ResumeRun {
+    let home = unique_temp_dir(&format!("{label}-home"));
+    let stub_dir = unique_temp_dir(&format!("{label}-stub"));
+    let argv_log = stub_dir.join("argv.log");
+    let env_log = stub_dir.join("env.log");
+    let handoff_path = stub_dir.join("handoff");
+    make_executable_script(&stub_dir.join("claude"), RESUME_STUB_CLAUDE);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_wtclaude"));
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("HOME", &home)
+        .env("PATH", stub_path_env(&stub_dir))
+        .env("ARGV_LOG_PATH", &argv_log)
+        .env("ENV_LOG_PATH", &env_log)
+        .env_remove("TMUX")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("WTCLAUDE_DEFAULT_MODE")
+        .env_remove("WTCLAUDE_RESUME_FILE")
+        .envs(envs.iter().copied());
+    if with_handoff_file {
+        std::fs::write(&handoff_path, "").expect("create handoff file");
+        cmd.env("WTCLAUDE_RESUME_FILE", &handoff_path);
+    }
+    if make_transcript {
+        cmd.env("MAKE_TRANSCRIPT", "1");
+    }
+    let output = cmd.output().expect("failed to spawn wtclaude");
+
+    let argv = std::fs::read_to_string(&argv_log)
+        .unwrap_or_else(|e| panic!("reading argv log at {}: {e}", argv_log.display()))
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let claude_saw_resume_file = std::fs::read_to_string(&env_log).expect("reading env log");
+    let handoff = with_handoff_file
+        .then(|| std::fs::read_to_string(&handoff_path).expect("reading handoff file"));
+    let mut home_files = Vec::new();
+    let mut pending = vec![home.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("listing test HOME")
+            .flatten()
+        {
+            let path = entry.path();
+            if path == home.join(".claude") {
+                continue;
+            }
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                home_files.push(path);
+            }
+        }
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&stub_dir).ok();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ResumeRun {
+        output,
+        argv,
+        claude_saw_resume_file,
+        handoff,
+        home_files,
+    }
+}
+
+#[test]
+fn path_subcommand_hands_the_resume_command_to_the_wrapper() {
+    let dir = unique_temp_dir("resume-e2e-dir");
+    let canonical = dir.canonicalize().expect("canonicalize dir");
+    let run = run_with_resume_stub(
+        "resume-e2e",
+        &dir,
+        &["path", "--mode", "safe", dir.to_str().unwrap(), "hello"],
+        &[],
+        true,
+        true,
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    let id = run
+        .arg_after("--session-id")
+        .expect("a new session should get --session-id");
+    assert_eq!(
+        run.handoff.as_deref(),
+        Some(
+            format!(
+                "wtclaude path --mode safe --resume {id} {}\n",
+                canonical.display()
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        run.claude_saw_resume_file, "unset",
+        "the session must not learn the handoff file's path"
+    );
+}
+
+#[test]
+fn path_subcommand_writes_no_resume_command_without_a_transcript() {
+    let dir = unique_temp_dir("resume-no-transcript-dir");
+    let run = run_with_resume_stub(
+        "resume-no-transcript",
+        &dir,
+        &["path", dir.to_str().unwrap()],
+        &[],
+        true,
+        false,
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(run.handoff.as_deref(), Some(""));
+    assert!(
+        run.output.stderr.is_empty(),
+        "a missing transcript is not worth a warning: {}",
+        String::from_utf8_lossy(&run.output.stderr)
+    );
+}
+
+#[test]
+fn path_subcommand_writes_nothing_outside_the_wrapper() {
+    let dir = unique_temp_dir("resume-no-wrapper-dir");
+    let run = run_with_resume_stub(
+        "resume-no-wrapper",
+        &dir,
+        &["path", dir.to_str().unwrap()],
+        &[],
+        false,
+        true,
+    );
+    let dir_files: Vec<_> = std::fs::read_dir(&dir).expect("listing dir").collect();
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(run.arg_after("--session-id").is_some());
+    assert_eq!(run.claude_saw_resume_file, "unset");
+    assert!(dir_files.is_empty(), "wrote into DIRECTORY: {dir_files:?}");
+    assert!(
+        run.home_files.is_empty(),
+        "wrote under HOME: {:?}",
+        run.home_files
+    );
+    assert!(
+        run.output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.output.stderr)
+    );
+}
+
+#[test]
+fn path_subcommand_resume_command_names_the_resumed_session() {
+    let dir = unique_temp_dir("resume-old-dir");
+    let canonical = dir.canonicalize().expect("canonicalize dir");
+    let run = run_with_resume_stub(
+        "resume-old",
+        &dir,
+        &["path", "--resume", "OLD", dir.to_str().unwrap()],
+        &[],
+        true,
+        true,
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(run.arg_after("--resume"), Some("OLD"));
+    assert!(
+        !run.argv
+            .iter()
+            .any(|a| a == "--session-id" || a == "--name"),
+        "a resumed session keeps its id and name: {:?}",
+        run.argv
+    );
+    assert_eq!(
+        run.handoff.as_deref(),
+        Some(format!("wtclaude path --resume OLD {}\n", canonical.display()).as_str())
+    );
+}
+
+#[test]
+fn path_subcommand_resume_command_omits_a_mode_from_the_environment() {
+    let dir = unique_temp_dir("resume-env-mode-dir");
+    let canonical = dir.canonicalize().expect("canonicalize dir");
+    let run = run_with_resume_stub(
+        "resume-env-mode",
+        &dir,
+        &["path", dir.to_str().unwrap()],
+        &[("WTCLAUDE_DEFAULT_MODE", "dangerous")],
+        true,
+        true,
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        run.argv
+            .iter()
+            .any(|a| a == "--dangerously-skip-permissions"),
+        "WTCLAUDE_DEFAULT_MODE should still pick the mode: {:?}",
+        run.argv
+    );
+    let id = run.arg_after("--session-id").expect("--session-id");
+    assert_eq!(
+        run.handoff.as_deref(),
+        Some(format!("wtclaude path --resume {id} {}\n", canonical.display()).as_str())
+    );
+}
+
+// Branch mode, exercised here because this file has the stub-claude harness.
+// A repo with no commits runs in place, so there's no worktree to create and
+// no post-exit menu.
+#[test]
+fn branch_mode_resume_command_drops_the_initial_prompt() {
+    let repo = git_init_dir("resume-branch-repo");
+    let run = run_with_resume_stub(
+        "resume-branch",
+        &repo,
+        &["--no-pull", "feat/x", "do", "the", "thing"],
+        &[],
+        true,
+        true,
+    );
+    std::fs::remove_dir_all(&repo).ok();
+
+    assert_eq!(run.argv.last().map(String::as_str), Some("do the thing"));
+    let id = run.arg_after("--session-id").expect("--session-id");
+    assert_eq!(
+        run.handoff.as_deref(),
+        Some(format!("wtclaude --resume {id} feat/x\n").as_str())
+    );
+    assert_eq!(run.claude_saw_resume_file, "unset");
+}

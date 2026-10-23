@@ -19,8 +19,7 @@ pub fn run_sessions() -> Result<()> {
     let repo_root = repo_root()?;
     let slug_prefix = path_to_slug(&repo_root) + "--claude-worktrees-";
 
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+    let projects_dir = projects_dir()?;
 
     if !projects_dir.exists() {
         return Ok(());
@@ -97,8 +96,7 @@ pub fn run_session_worktree(session_id: &str) -> Result<()> {
     let repo_root = repo_root()?;
     let slug_prefix = path_to_slug(&repo_root) + "--claude-worktrees-";
 
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+    let projects_dir = projects_dir()?;
 
     for entry in std::fs::read_dir(&projects_dir).context("reading projects dir")? {
         let entry = entry?;
@@ -121,18 +119,27 @@ pub fn run_session_worktree(session_id: &str) -> Result<()> {
 }
 
 /// Whether Claude has written a transcript for `session_id` under any
-/// project — Claude only creates it once the first message is sent.
-pub fn session_exists(session_id: &str) -> bool {
-    let Ok(home) = std::env::var("HOME") else {
-        return false;
+/// project. Ok(false) means it hasn't — as observed in current Claude Code,
+/// the transcript only appears once the first message is sent.
+pub fn session_exists(session_id: &str) -> Result<bool> {
+    let projects_dir = projects_dir()?;
+    let entries = match std::fs::read_dir(&projects_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).context("reading projects dir"),
     };
-    let projects_dir = PathBuf::from(home).join(".claude").join("projects");
-    let Ok(entries) = std::fs::read_dir(projects_dir) else {
-        return false;
-    };
-    entries
-        .flatten()
-        .any(|entry| entry.path().join(format!("{session_id}.jsonl")).exists())
+    for entry in entries {
+        let entry = entry.context("reading projects dir")?;
+        if entry.path().join(format!("{session_id}.jsonl")).exists() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn projects_dir() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(PathBuf::from(home).join(".claude").join("projects"))
 }
 
 fn path_to_slug(path: &std::path::Path) -> String {
