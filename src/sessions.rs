@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -19,8 +19,7 @@ pub fn run_sessions() -> Result<()> {
     let repo_root = repo_root()?;
     let slug_prefix = path_to_slug(&repo_root) + "--claude-worktrees-";
 
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+    let projects_dir = projects_dir()?;
 
     if !projects_dir.exists() {
         return Ok(());
@@ -97,8 +96,7 @@ pub fn run_session_worktree(session_id: &str) -> Result<()> {
     let repo_root = repo_root()?;
     let slug_prefix = path_to_slug(&repo_root) + "--claude-worktrees-";
 
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let projects_dir = PathBuf::from(&home).join(".claude").join("projects");
+    let projects_dir = projects_dir()?;
 
     for entry in std::fs::read_dir(&projects_dir).context("reading projects dir")? {
         let entry = entry?;
@@ -120,8 +118,45 @@ pub fn run_session_worktree(session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether Claude has written a transcript for `session_id` under any
+/// project. Ok(false) means it hasn't: Claude Code (observed in 2.1.309)
+/// writes the transcript only once the first message is sent; if that
+/// changes, sessions exited without a message get a history entry too. A
+/// missing projects dir is an error, since a session has just run and
+/// should have created it.
+pub fn session_exists(session_id: &str) -> Result<bool> {
+    let projects_dir = projects_dir()?;
+    if !projects_dir
+        .try_exists()
+        .with_context(|| format!("checking {}", projects_dir.display()))?
+    {
+        bail!("{} does not exist", projects_dir.display());
+    }
+    let entries = std::fs::read_dir(&projects_dir)
+        .with_context(|| format!("reading {}", projects_dir.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", projects_dir.display()))?;
+        let transcript = entry.path().join(format!("{session_id}.jsonl"));
+        if transcript
+            .try_exists()
+            .with_context(|| format!("checking {}", transcript.display()))?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Where Claude keeps per-project transcripts: `$CLAUDE_CONFIG_DIR/projects`
+/// when that is set and non-empty, else `~/.claude/projects`.
+fn projects_dir() -> Result<PathBuf> {
+    let config_dir = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".claude"),
+    };
+    Ok(config_dir.join("projects"))
+}
+
 fn path_to_slug(path: &std::path::Path) -> String {
-    path.to_string_lossy()
-        .replace('/', "-")
-        .replace('.', "-")
+    path.to_string_lossy().replace(['/', '.'], "-")
 }

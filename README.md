@@ -181,7 +181,7 @@ cp target/release/wtclaude /usr/local/bin/
 The binary must be on your `PATH`. The optional config file
 (`wtclaude.yml`) is looked up next to the binary at runtime.
 
-### Zsh completion
+### Shell completion and resume history
 
 Add one line to `~/.zshrc`:
 
@@ -189,9 +189,33 @@ Add one line to `~/.zshrc`:
 eval "$(wtclaude --completions zsh)"
 ```
 
-Once loaded, `wtclaude --resume <TAB>` lists recent sessions (showing
-worktree and date). After selecting a session ID, pressing `<TAB>` on the
-next word auto-fills the matching worktree name.
+or, for bash, to `~/.bashrc`:
+
+```bash
+eval "$(wtclaude --completions bash)"
+```
+
+Once loaded, `wtclaude --resume <TAB>` lists recent sessions (zsh shows
+worktree and date). In zsh, after selecting a session ID, pressing
+`<TAB>` on the next word auto-fills the matching worktree name.
+
+The script also defines a `wtclaude` shell function wrapping the binary.
+When a session ends, it pushes the command that resumes that session
+onto your shell history, so pressing up-arrow offers e.g.
+`wtclaude --resume <session-id> my-feature` (or `wtclaude path --resume
+<session-id> <dir>` for path mode). Run a branch-mode line from the same
+repository it was launched in. Only an explicit `--mode` carries over;
+other flags (e.g. `--no-pull`) and initial-prompt words are left out.
+Nothing is added if the session ended before any message was sent. It
+hands the command over through a temporary file under
+`${XDG_STATE_HOME:-~/.local/state}/wtclaude/`, which sessions can't
+write, and deletes the file afterwards (one left behind by an
+interrupted wrapper is swept once it is older than a week). If a sandbox root or
+allowlist entry (top-level, or the session's mode's) covers that directory, wtclaude refuses to write the
+file, deletes it, and warns, so nothing is added — but a sandboxed
+background process that outlives the session could still race a command
+into the file before the wrapper reads it. Keep the state directory
+outside the sandbox root and allowlist.
 
 
 ## Usage

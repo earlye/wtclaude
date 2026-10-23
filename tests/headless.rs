@@ -325,3 +325,37 @@ fn headless_subcommand_forwards_verbose_to_claude() {
     );
     assert_eq!(logged_args.last(), Some(&"hello there"));
 }
+
+#[test]
+fn headless_subcommand_hides_the_resume_handoff_file_from_claude() {
+    let repo = git_init_dir("handoff-repo");
+    let home = unique_temp_dir("handoff-home");
+    let stub_dir = unique_temp_dir("handoff-stub");
+    let log_path = stub_dir.join("env.log");
+    make_executable_script(
+        &stub_dir.join("claude"),
+        "#!/bin/sh\nprintf '%s' \"${WTCLAUDE_RESUME_FILE-unset}\" > \"$ENV_LOG_PATH\"\nexit 0\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["headless", "hello"])
+        .current_dir(&repo)
+        .env("HOME", &home)
+        .env("PATH", stub_path_env(&stub_dir))
+        .env("ENV_LOG_PATH", &log_path)
+        .env("WTCLAUDE_RESUME_FILE", stub_dir.join("handoff"))
+        .output()
+        .expect("failed to spawn wtclaude");
+    let seen = std::fs::read_to_string(&log_path);
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&stub_dir).ok();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(seen.expect("reading env log"), "unset");
+}

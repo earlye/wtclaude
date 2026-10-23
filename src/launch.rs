@@ -76,6 +76,11 @@ impl SandboxSession {
         repo_root: Option<&Path>,
         breakage: Option<SandboxBreakage>,
     ) {
+        // Not passed on, so the session and any nested wtclaude aren't handed
+        // the shell wrapper's handoff file. The path is no secret — it shows
+        // in /proc and in a listing of its directory — so what protects the
+        // file is `record_resume_command` refusing one the plan can reach.
+        cmd.env_remove(RESUME_FILE_ENV);
         cmd.env("WTCLAUDE_SANDBOX", sandbox_root);
         cmd.env("WTCLAUDE_MODE", &self.mode);
         match repo_root {
@@ -225,6 +230,7 @@ impl Args {
 
 pub fn run(args: Args) -> Result<i32> {
     let prompt = args.prompt();
+    let explicit_mode = args.mode.clone();
     let config = config::load()?;
     let mode = args
         .mode
@@ -293,11 +299,7 @@ pub fn run(args: Args) -> Result<i32> {
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
     }
-    // A resumed session keeps its existing name (including any `/rename`).
-    match args.resume {
-        Some(session_id) => cmd.arg("--resume").arg(session_id),
-        None => cmd.arg("--name").arg(&name),
-    };
+    let session_id = add_session_args(&mut cmd, args.resume, &name)?;
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(
@@ -313,6 +315,16 @@ pub fn run(args: Args) -> Result<i32> {
 
     let status = cmd.status().context("launching claude")?;
     let exit_code = status.code().unwrap_or(1);
+    if let Some(handoff) = resume_handoff_file() {
+        record_resume_command(
+            &handoff,
+            &session_id,
+            &resume_command(None, explicit_mode.as_deref(), &session_id, &name),
+            &canonical,
+            Some(&repo_root),
+            &mode,
+        );
+    }
 
     if !in_place {
         let worktree = worktree_path(&repo_root, &name);
@@ -501,6 +513,7 @@ impl PathArgs {
 /// without a surrounding git repo and sandboxes exactly `args.directory`.
 pub fn run_path(args: PathArgs) -> Result<i32> {
     let prompt = args.prompt();
+    let explicit_mode = args.mode.clone();
     let config = config::load()?;
     let mode = args
         .mode
@@ -583,11 +596,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
     }
-    // A resumed session keeps its existing name (including any `/rename`).
-    match args.resume {
-        Some(session_id) => cmd.arg("--resume").arg(session_id),
-        None => cmd.arg("--name").arg(&label),
-    };
+    let session_id = add_session_args(&mut cmd, args.resume, &label)?;
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(
@@ -608,7 +617,219 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
     }
 
     let status = cmd.status().context("launching claude")?;
+    if let Some(handoff) = resume_handoff_file() {
+        match canonical.to_str() {
+            Some(target) => record_resume_command(
+                &handoff,
+                &session_id,
+                &resume_command(Some("path"), explicit_mode.as_deref(), &session_id, target),
+                &canonical,
+                repo_root.as_deref(),
+                &mode,
+            ),
+            None => {
+                eprintln!(
+                    "wtclaude: warning: {} is not valid UTF-8, so no resume command was added to history",
+                    canonical.display()
+                );
+                discard_handoff(&handoff);
+            }
+        }
+    }
     Ok(status.code().unwrap_or(1))
+}
+
+/// Adds `--resume RESUME`, or `--session-id` (freshly generated) plus
+/// `--name NAME`, to `cmd`, returning the session id either way.
+fn add_session_args(cmd: &mut Command, resume: Option<String>, name: &str) -> Result<String> {
+    // A resumed session keeps its existing name (including any `/rename`).
+    match resume {
+        Some(session_id) => {
+            cmd.arg("--resume").arg(&session_id);
+            Ok(session_id)
+        }
+        None => {
+            let session_id = new_session_id()?;
+            cmd.arg("--session-id").arg(&session_id);
+            cmd.arg("--name").arg(name);
+            Ok(session_id)
+        }
+    }
+}
+
+/// Names the file the shell wrapper (see `wtclaude --completions`) created
+/// with `mktemp` for the resume command line.
+const RESUME_FILE_ENV: &str = "WTCLAUDE_RESUME_FILE";
+
+/// A random (v4) UUID for `claude --session-id`, so the resume command is
+/// known up front instead of guessed from session-file mtimes afterwards.
+fn new_session_id() -> Result<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .context("reading /dev/urandom for a session id")?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
+/// The command line that resumes `session_id` against `target` (a branch,
+/// or a directory under `subcommand` `path`). Only an explicit `--mode`
+/// carries over; other flags (e.g. `--no-pull`) and initial-prompt words are
+/// left out.
+fn resume_command(
+    subcommand: Option<&str>,
+    mode: Option<&str>,
+    session_id: &str,
+    target: &str,
+) -> String {
+    let mut words = vec!["wtclaude"];
+    words.extend(subcommand);
+    if let Some(mode) = mode {
+        words.extend(["--mode", mode]);
+    }
+    words.extend(["--resume", session_id, target]);
+    words
+        .iter()
+        .map(|w| shell_quote(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Leaves `word` bare when no shell would split or expand it. A leading `=`
+/// or `%` is quoted: zsh expands `=cmd` to a path, and `%` names a job.
+fn shell_quote(word: &str) -> String {
+    let safe = !word.is_empty()
+        && !word.starts_with(['=', '%'])
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:+@%=,".contains(c));
+    if safe {
+        word.to_string()
+    } else {
+        crate::sandbox::shell_single_quote(word)
+    }
+}
+
+/// The handoff file the shell wrapper passed, if wtclaude runs under it.
+fn resume_handoff_file() -> Option<PathBuf> {
+    std::env::var_os(RESUME_FILE_ENV)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Hands the resume command to the shell wrapper through `handoff`, which
+/// the wrapper then injects into history. Does nothing when the session was
+/// exited before any message created its transcript — there would be
+/// nothing to resume. Warns on stderr, and writes nothing, when the
+/// transcript lookup fails, when `handoff` isn't an existing regular file
+/// (a symlink is refused rather than followed), when the session's plan
+/// (recomputed from `sandbox_root`, `repo_root` and the resolved `mode`,
+/// whose allowlist joins the top-level one, as the hook does for every Bash
+/// call) could have written or replaced it, or
+/// when the write itself fails. On any of those, `handoff` is also
+/// deleted, so the wrapper finds nothing a session may have planted there. That leaves a race when the state directory is inside the
+/// session's sandbox: a sandboxed background process outliving the session
+/// could recreate the file after the deletion, before the wrapper reads it.
+/// Keep the state directory outside the sandbox root and allowlist.
+fn record_resume_command(
+    handoff: &Path,
+    session_id: &str,
+    command: &str,
+    sandbox_root: &Path,
+    repo_root: Option<&Path>,
+    mode: &str,
+) {
+    match crate::sessions::session_exists(session_id) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            eprintln!("wtclaude: warning: looking for session {session_id}: {e:#}");
+            discard_handoff(handoff);
+            return;
+        }
+    }
+    if let Err(e) = write_handoff(handoff, command, sandbox_root, repo_root, mode) {
+        eprintln!(
+            "wtclaude: warning: not adding the resume command to history: {}: {e:#}",
+            handoff.display()
+        );
+        discard_handoff(handoff);
+    }
+}
+
+/// Deletes `handoff` (unlinking a symlink rather than following it), so the
+/// wrapper finds nothing to inject. Warns if it can't.
+fn discard_handoff(handoff: &Path) {
+    if let Err(e) = std::fs::remove_file(handoff)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "wtclaude: warning: could not remove {}: {e}",
+            handoff.display()
+        );
+    }
+}
+
+/// Writes `command` into the existing regular file `handoff`. `libc` isn't
+/// a dependency, so there's no `O_NOFOLLOW`: instead the file is checked
+/// with `symlink_metadata`, opened without creating or truncating it, and
+/// only written if the opened file is the one that was checked.
+fn write_handoff(
+    handoff: &Path,
+    command: &str,
+    sandbox_root: &Path,
+    repo_root: Option<&Path>,
+    mode: &str,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let parent = handoff
+        .parent()
+        .context("has no parent directory")?
+        .canonicalize()
+        .context("resolving its directory")?;
+    if parent.to_str().is_none() {
+        bail!(
+            "{} is not valid UTF-8, so the session's plan can't be checked against it",
+            parent.display()
+        );
+    }
+    let file = parent.join(handoff.file_name().context("has no file name")?);
+    let plan = sandbox::plan(sandbox_root, repo_root, Some(mode)).context("computing the session's plan")?;
+    if plan.grants_write(&file) {
+        bail!(
+            "the session could write {}, so its contents can't be trusted; set \
+             XDG_STATE_HOME to a directory outside the sandbox root and allowlist",
+            parent.display()
+        );
+    }
+    let checked = std::fs::symlink_metadata(&file).context("checking it")?;
+    if !checked.file_type().is_file() {
+        bail!("not a regular file");
+    }
+    let mut opened = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
+        .context("opening it")?;
+    let meta = opened.metadata().context("checking it")?;
+    if (meta.dev(), meta.ino()) != (checked.dev(), checked.ino()) {
+        bail!("replaced while being opened");
+    }
+    opened.set_len(0).context("truncating it")?;
+    opened
+        .write_all(format!("{command}\n").as_bytes())
+        .context("writing it")
 }
 
 /// Rejects a canonicalized DIRECTORY that would make the sandbox a no-op:
@@ -1316,6 +1537,56 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_command_for_branch_mode() {
+        assert_eq!(
+            resume_command(None, None, "abc-123", "feat/x"),
+            "wtclaude --resume abc-123 feat/x"
+        );
+    }
+
+    #[test]
+    fn resume_command_for_path_mode_keeps_the_subcommand_and_mode() {
+        assert_eq!(
+            resume_command(Some("path"), Some("fast"), "abc-123", "/home/me/proj"),
+            "wtclaude path --mode fast --resume abc-123 /home/me/proj"
+        );
+    }
+
+    #[test]
+    fn resume_target_is_the_branch_without_the_prompt_words() {
+        let parsed = Args::try_parse_from(["wtclaude", "feat/x", "do", "the", "thing"]).unwrap();
+        assert_eq!(
+            resume_command(None, None, "abc-123", &parsed.name),
+            "wtclaude --resume abc-123 feat/x"
+        );
+    }
+
+    #[test]
+    fn resume_command_quotes_words_the_shell_would_split_or_expand() {
+        assert_eq!(
+            resume_command(Some("path"), None, "abc", "/tmp/my dir/it's $HOME"),
+            r"wtclaude path --resume abc '/tmp/my dir/it'\''s $HOME'"
+        );
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("=ls"), "'=ls'");
+        assert_eq!(shell_quote("%1"), "'%1'");
+        assert_eq!(shell_quote("a=b%c"), "a=b%c");
+    }
+
+    #[test]
+    fn new_session_id_is_a_v4_uuid() {
+        let id = new_session_id().unwrap();
+        let groups: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(groups[2].starts_with('4'));
+        assert!("89ab".contains(&groups[3][..1]));
+        assert_ne!(id, new_session_id().unwrap());
+    }
 
     #[test]
     fn sanitize_branch_name_cleans_names_git_rejects() {
