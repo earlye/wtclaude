@@ -55,6 +55,28 @@ struct ModeOverrides {
 pub struct Mode {
     #[serde(rename = "claude-flags", default)]
     pub claude_flags: Vec<String>,
+    /// Directories put in front of `PATH` for the session, in order. Exists
+    /// for classic snaps: `/snap/bin/<app>` goes through `snap-confine`,
+    /// which refuses to run under Landlock's NO_NEW_PRIVS, but the payload
+    /// under `/snap/<name>/current` runs fine when invoked directly.
+    #[serde(rename = "path-prepend", default)]
+    pub path_prepend: Vec<String>,
+}
+
+impl Mode {
+    /// `path-prepend` with a leading `~` expanded. Deliberately nothing more
+    /// (no `$VAR`): the entries are meant to be literal directories.
+    pub fn expanded_path_prepend(&self, home: &str) -> Vec<PathBuf> {
+        self.path_prepend
+            .iter()
+            .map(|entry| match entry.strip_prefix('~') {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                    PathBuf::from(format!("{home}{rest}"))
+                }
+                _ => PathBuf::from(entry),
+            })
+            .collect()
+    }
 }
 
 const DEFAULT_CONFIG: &str = include_str!("default_config.yml");
@@ -67,7 +89,7 @@ const USER_CONFIG_KEYS: &[&str] = &[
     "socket_allowlist",
     "sandbox-backend",
 ];
-const MODE_KEYS: &[&str] = &["claude-flags"];
+const MODE_KEYS: &[&str] = &["claude-flags", "path-prepend"];
 
 /// Unknown keys are not reported here: the hook calls this on every tool
 /// call and would repeat them each time. `load`, which every launch runs,
@@ -98,7 +120,7 @@ fn read_user<T: DeserializeOwned + Default>(path: &Path) -> Result<(T, Vec<Strin
 
 /// Parses `content` as `T`, also returning the keys serde would silently
 /// ignore: top-level keys not in `known`, and keys inside a `modes` entry
-/// other than `claude-flags`, as dotted paths (`modes.safe.flags`).
+/// other than those in `MODE_KEYS`, as dotted paths (`modes.safe.flags`).
 fn parse_checked<T: DeserializeOwned>(content: &str, known: &[&str]) -> Result<(T, Vec<String>)> {
     let value: Value = serde_yaml::from_str(content)?;
     let unknown = unknown_keys(&value, known);
@@ -322,6 +344,40 @@ mod tests {
         assert_eq!(flags(&merged, "verbose"), ["--verbose"]);
         assert!(flags(&merged, "safe").is_empty());
         assert_eq!(merged.default_mode, "safe");
+    }
+
+    #[test]
+    fn parse_checked_accepts_path_prepend_as_a_mode_key() {
+        let (user, unknown): (ModeOverrides, _) = parse_checked(
+            "modes:\n  dangerous:\n    path-prepend: [/snap/just/current/bin, ~/bin]\n",
+            USER_CONFIG_KEYS,
+        )
+        .unwrap();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        assert_eq!(
+            user.modes["dangerous"].path_prepend,
+            ["/snap/just/current/bin", "~/bin"]
+        );
+        assert!(user.modes["dangerous"].claude_flags.is_empty());
+    }
+
+    #[test]
+    fn expanded_path_prepend_expands_only_a_leading_tilde() {
+        let (user, _): (ModeOverrides, _) = parse_checked(
+            "modes:\n  m:\n    path-prepend: [~/bin, ~, /a/~/b, ~other/bin, $HOME/bin]\n",
+            USER_CONFIG_KEYS,
+        )
+        .unwrap();
+        assert_eq!(
+            user.modes["m"].expanded_path_prepend("/home/x"),
+            [
+                PathBuf::from("/home/x/bin"),
+                PathBuf::from("/home/x"),
+                PathBuf::from("/a/~/b"),
+                PathBuf::from("~other/bin"),
+                PathBuf::from("$HOME/bin"),
+            ]
+        );
     }
 
     #[test]

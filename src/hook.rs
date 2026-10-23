@@ -164,6 +164,16 @@ fn sandboxed_bash_response(
         return Ok(Some(deny_bash(&privilege_escalation_deny_message(name))));
     }
 
+    // Same cause as the check above: snap-confine is a privileged helper, so
+    // it fails wherever NO_NEW_PRIVS makes privilege escalation impossible.
+    if backend.privilege_escalation_blocked() {
+        let path = std::env::var("PATH").unwrap_or_default();
+        if let Some(snap) = snap_command(command, &path, Path::new(SNAP_BIN)) {
+            let launch = snap_launch(Path::new(SNAP_ROOT), &snap.app);
+            return Ok(Some(deny_bash(&snap_deny_message(&snap.launcher, &launch))));
+        }
+    }
+
     let repo_root = std::env::var("WTCLAUDE_REPO_ROOT")
         .ok()
         .filter(|s| !s.is_empty())
@@ -225,18 +235,165 @@ const PRIVILEGE_COMMANDS: &[&str] = &["sudo", "doas", "pkexec", "su"];
 /// tracked — `echo "step 1; sudo dnf install x"` does trip it — and the deny
 /// message says so, in the same spirit as `contains_heredoc`.
 fn privilege_escalation_command(command: &str) -> Option<&'static str> {
-    for segment in command.split(['\n', ';', '&', '|']) {
-        let segment =
-            segment.trim_start_matches(|c: char| c.is_whitespace() || c == '(' || c == '{');
-        let Some(word) = segment.split_whitespace().find(|w| !is_env_assignment(w)) else {
-            continue;
-        };
+    command_words(command).find_map(|word| {
         let name = word.rsplit('/').next().unwrap_or(word);
-        if let Some(found) = PRIVILEGE_COMMANDS.iter().find(|c| **c == name) {
-            return Some(found);
+        PRIVILEGE_COMMANDS.iter().find(|c| **c == name).copied()
+    })
+}
+
+/// The word in command position of each segment of `command`: the start of
+/// the line, or straight after a `;`, `&&`, `||`, `|`, `&` or newline,
+/// skipping `VAR=value` prefixes. Shares `privilege_escalation_command`'s
+/// caveat that quoting isn't tracked.
+fn command_words(command: &str) -> impl Iterator<Item = &str> {
+    command.split(['\n', ';', '&', '|']).filter_map(|segment| {
+        segment
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '(' || c == '{')
+            .split_whitespace()
+            .find(|w| !is_env_assignment(w))
+    })
+}
+
+/// Where snapd puts the launchers for snap apps.
+const SNAP_BIN: &str = "/snap/bin";
+/// Where snapd mounts each snap, as `<SNAP_ROOT>/<snap>/current`.
+const SNAP_ROOT: &str = "/snap";
+
+/// A command in command position that runs a snap app through `snap_bin`.
+#[derive(Debug, PartialEq)]
+struct SnapCommand {
+    /// The launcher's name in `snap_bin`, as the command invoked it.
+    launcher: String,
+    /// The snap app it runs: `<snap>` when the app is named after its snap,
+    /// otherwise `<snap>.<app>`.
+    app: String,
+}
+
+/// The first word in command position that names a file in `snap_bin`
+/// directly, or that `path_var` resolves into it.
+fn snap_command(command: &str, path_var: &str, snap_bin: &Path) -> Option<SnapCommand> {
+    command_words(command).find_map(|word| {
+        let resolved = resolve_on_path(word, path_var)?;
+        if resolved.parent()? != snap_bin {
+            return None;
         }
+        let launcher = resolved.file_name()?.to_string_lossy().into_owned();
+        // A snap alias is a symlink to another launcher in the same directory
+        // (`cargo -> rustup.cargo`); every real launcher points at
+        // `/usr/bin/snap` instead.
+        let app = match std::fs::read_link(&resolved) {
+            Ok(target)
+                if target
+                    .parent()
+                    .is_none_or(|p| p.as_os_str().is_empty() || p == snap_bin) =>
+            {
+                target.file_name()?.to_string_lossy().into_owned()
+            }
+            _ => launcher.clone(),
+        };
+        Some(SnapCommand { launcher, app })
+    })
+}
+
+/// What the shell would run for `word`: the word itself if it contains a
+/// `/`, otherwise the first executable file of that name in `path_var`.
+/// Ignores aliases, functions and builtins, none of which live in `/snap/bin`.
+fn resolve_on_path(word: &str, path_var: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    if word.contains('/') {
+        return Some(PathBuf::from(word));
     }
-    None
+    std::env::split_paths(path_var)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(word))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+}
+
+/// How a snap app could be run without `snap-confine`, if at all.
+#[derive(Debug, PartialEq)]
+enum SnapLaunch {
+    /// A classic snap's payload, runnable directly.
+    Classic(PathBuf),
+    /// Strict or devmode confinement, or metadata that couldn't be read:
+    /// the payload depends on the mount namespace snap-confine builds.
+    Unavailable,
+}
+
+#[derive(Deserialize)]
+struct SnapYaml {
+    #[serde(default)]
+    confinement: Option<String>,
+    #[serde(default)]
+    apps: std::collections::HashMap<String, SnapApp>,
+}
+
+#[derive(Deserialize)]
+struct SnapApp {
+    #[serde(default)]
+    command: Option<String>,
+}
+
+/// Reads `<snap_root>/<snap>/current/meta/snap.yaml` for the snap app
+/// `app` (`gh`, or `<snap>.<app>` when the app is not named after its snap).
+fn snap_launch(snap_root: &Path, app: &str) -> SnapLaunch {
+    let (snap, app_name) = app.split_once('.').unwrap_or((app, app));
+    let current = snap_root.join(snap).join("current");
+    let Ok(text) = std::fs::read_to_string(current.join("meta/snap.yaml")) else {
+        return SnapLaunch::Unavailable;
+    };
+    let Ok(meta) = serde_yaml::from_str::<SnapYaml>(&text) else {
+        return SnapLaunch::Unavailable;
+    };
+    if meta.confinement.as_deref() != Some("classic") {
+        return SnapLaunch::Unavailable;
+    }
+    // `command` is relative to the snap's root, may carry arguments, and in
+    // older snaps may spell that root `$SNAP`.
+    let Some(command) = meta
+        .apps
+        .get(app_name)
+        .and_then(|a| a.command.as_deref())
+        .and_then(|c| c.split_whitespace().next())
+    else {
+        return SnapLaunch::Unavailable;
+    };
+    let relative = command
+        .strip_prefix("$SNAP/")
+        .or_else(|| command.strip_prefix("${SNAP}/"))
+        .unwrap_or(command);
+    SnapLaunch::Classic(current.join(relative))
+}
+
+/// `launcher` is the name the command used, so the message talks about the
+/// command the session actually ran.
+fn snap_deny_message(launcher: &str, launch: &SnapLaunch) -> String {
+    let why = format!(
+        "`{launcher}` resolves to {SNAP_BIN}/{launcher}, a snap launcher. It hands off to \
+         snap-confine, a privileged helper that the NO_NEW_PRIVS flag this sandbox needs \
+         (see the system prompt) stops from elevating, so it refuses to start."
+    );
+    match launch {
+        SnapLaunch::Classic(payload) => {
+            let dir = payload.parent().unwrap_or(payload);
+            format!(
+                "{why} `{launcher}` is a classic snap, whose payload runs fine without \
+                 snap-confine: run `{}` instead. To make plain `{launcher}` work everywhere, \
+                 including in scripts and justfile recipes, ask the user to add `{}` to this \
+                 mode's `path-prepend` in ~/.config/wtclaude/wtclaude.yml.",
+                payload.display(),
+                dir.display()
+            )
+        }
+        SnapLaunch::Unavailable => format!(
+            "{why} `{launcher}` is not a classic snap (or its metadata could not be read), \
+             so it depends on the mount namespace snap-confine builds and cannot run under \
+             NO_NEW_PRIVS at all. Ask the user to install a non-snap build of it."
+        ),
+    }
 }
 
 /// Whether `word` is a `VAR=value` prefix rather than the command itself.
@@ -832,6 +989,152 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>";
         assert_eq!(privilege_escalation_command("grep -rn sudo docs/"), None);
         assert_eq!(privilege_escalation_command("echo pseudonym"), None);
         assert_eq!(privilege_escalation_command("./sudoku"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn snap_commands_are_denied_under_landlock() {
+        // Named by path so the test doesn't depend on this machine's PATH or
+        // snaps; a snap that isn't installed has no metadata to read.
+        let reason = deny_reason(
+            sandboxed_bash_response(
+                &bash_payload("/snap/bin/wtclaude-test-no-such-snap --version"),
+                &crate::sandbox::landlock::Landlock,
+                Path::new("/tmp"),
+                Path::new("/tmp"),
+            )
+            .expect("sandboxed_bash_response"),
+        );
+        assert!(reason.contains("snap-confine"), "reason: {reason}");
+        assert!(reason.contains("non-snap build"), "reason: {reason}");
+    }
+
+    /// A fresh directory for one snap test; removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "wtclaude-test-snap-{}-{}",
+                label,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("creating temp dir");
+            TempDir(dir)
+        }
+
+        fn file(&self, relative: &str, content: &str, mode: u32) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("creating parent dir");
+            std::fs::write(&path, content).expect("writing file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("setting permissions");
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn snap_command_finds_a_command_resolving_into_snap_bin() {
+        let dir = TempDir::new("resolve");
+        dir.file("snap/bin/gh", "", 0o755);
+        dir.file("snap/bin/just", "", 0o755);
+        dir.file("first/just", "", 0o755);
+        dir.file("first/gh", "", 0o644); // not executable, so skipped
+        dir.file("snap/bin/rustup.cargo", "", 0o755);
+        let snap_bin = dir.0.join("snap/bin");
+        std::os::unix::fs::symlink("rustup.cargo", snap_bin.join("cargo")).unwrap();
+        let found = |launcher: &str, app: &str| {
+            Some(SnapCommand {
+                launcher: launcher.to_string(),
+                app: app.to_string(),
+            })
+        };
+        let path = format!("{}:{}", dir.0.join("first").display(), snap_bin.display());
+
+        assert_eq!(
+            snap_command("gh pr view", &path, &snap_bin),
+            found("gh", "gh")
+        );
+        assert_eq!(
+            snap_command("make && GH_PAGER= gh pr view", &path, &snap_bin),
+            found("gh", "gh")
+        );
+        // An earlier PATH entry shadows the snap launcher.
+        assert_eq!(snap_command("just test", &path, &snap_bin), None);
+        // Named by path, whatever PATH says.
+        let direct = format!("{}/just test", snap_bin.display());
+        assert_eq!(snap_command(&direct, "", &snap_bin), found("just", "just"));
+        // An alias resolves to the app it points at.
+        assert_eq!(
+            snap_command("cargo build", &path, &snap_bin),
+            found("cargo", "rustup.cargo")
+        );
+        // Not in command position.
+        assert_eq!(snap_command("echo gh", &path, &snap_bin), None);
+        assert_eq!(snap_command("no-such-command", &path, &snap_bin), None);
+    }
+
+    #[test]
+    fn snap_launch_names_a_classic_snaps_payload() {
+        let dir = TempDir::new("classic");
+        dir.file(
+            "just/current/meta/snap.yaml",
+            "name: just\nconfinement: classic\napps:\n  just:\n    command: bin/just\n",
+            0o644,
+        );
+        dir.file(
+            "tool/current/meta/snap.yaml",
+            "name: tool\nconfinement: classic\napps:\n  helper:\n    command: $SNAP/usr/bin/helper --flag\n",
+            0o644,
+        );
+        assert_eq!(
+            snap_launch(&dir.0, "just"),
+            SnapLaunch::Classic(dir.0.join("just/current/bin/just"))
+        );
+        assert_eq!(
+            snap_launch(&dir.0, "tool.helper"),
+            SnapLaunch::Classic(dir.0.join("tool/current/usr/bin/helper"))
+        );
+        // The snap is classic, but has no app of that name.
+        assert_eq!(snap_launch(&dir.0, "tool"), SnapLaunch::Unavailable);
+    }
+
+    #[test]
+    fn snap_launch_refuses_strict_and_unreadable_snaps() {
+        let dir = TempDir::new("strict");
+        dir.file(
+            "strict/current/meta/snap.yaml",
+            "name: strict\nconfinement: strict\napps:\n  strict:\n    command: bin/strict\n",
+            0o644,
+        );
+        dir.file("broken/current/meta/snap.yaml", "apps: [", 0o644);
+        assert_eq!(snap_launch(&dir.0, "strict"), SnapLaunch::Unavailable);
+        assert_eq!(snap_launch(&dir.0, "broken"), SnapLaunch::Unavailable);
+        assert_eq!(snap_launch(&dir.0, "absent"), SnapLaunch::Unavailable);
+    }
+
+    #[test]
+    fn snap_deny_message_suggests_path_prepend_for_a_classic_snap() {
+        let message = snap_deny_message(
+            "just",
+            &SnapLaunch::Classic(PathBuf::from("/snap/just/current/bin/just")),
+        );
+        assert!(
+            message.contains("run `/snap/just/current/bin/just` instead"),
+            "{message}"
+        );
+        assert!(
+            message.contains("add `/snap/just/current/bin` to this mode's `path-prepend`"),
+            "{message}"
+        );
     }
 
     #[test]
