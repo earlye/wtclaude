@@ -18,27 +18,73 @@ Please make sure that the snapd.apparmor service is enabled and started.
 
 `just --version` fails with the same message.
 
-## Root cause hypothesis
+## Root cause (confirmed)
 
 The landlock backend sets `NO_NEW_PRIVS` before `landlock_restrict_self`,
 because the kernel requires that flag for unprivileged self-sandboxing.
-`snap-confine` depends on elevated privileges (setuid/capabilities) and an
-AppArmor profile transition on exec. `NO_NEW_PRIVS` blocks both, so
-`snap-confine` decides it is running unconfined and refuses to start. The
-snapd.apparmor hint in the message is a red herring: the service is fine
-outside the sandbox.
+`/snap/bin/<app>` is a symlink to `/usr/bin/snap`, which hands off to
+`snap-confine`: a setuid/file-caps helper that builds a mount namespace,
+switches AppArmor profile and moves the process into a `snap.<name>.<app>`
+cgroup. `NO_NEW_PRIVS` blocks the privilege and the profile transition, so
+`snap-confine` finds itself unconfined and refuses. The snapd.apparmor hint
+is a red herring. No landlock rule change can fix this.
 
-If that is right, no landlock rule change will fix this. Some options:
+The payload does not need `snap-confine` when the snap is
+`confinement: classic` (no namespace, no AppArmor/seccomp; snap-confine only
+does refresh-awareness bookkeeping). `gh` and `just` are both classic, and
+running `/snap/gh/current/gh` and `/snap/just/current/bin/just` directly
+works inside the sandbox. Strict snaps depend on their base-snap mount
+namespace and stay unsupported.
 
-- Run snap commands outside the NNP process. For example, the launcher
-  (which has no NNP set) could exec them on the sandboxed process's behalf.
-  Doing that would also take them out of the filesystem sandbox, which is a
-  real security trade-off.
-- Detect `/snap/bin/*` and resolve to a non-snap install, or tell the user
-  clearly to install `gh` and `just` some other way (apt, cargo, release
-  binary).
-- At minimum, have the Bash hook recognize this failure and print an
-  actionable message instead of snap-confine's misleading one.
+## Plan
+
+1. **Per-mode `path-prepend` in `wtclaude.yml`.** Add
+   `path-prepend: Vec<String>` to `Mode` (`src/config.rs`) next to
+   `claude-flags`, and add it to `MODE_KEYS`. The launcher prepends the
+   entries, in order, to `PATH` in the environment it gives Claude, so
+   every Bash command and every nested call (justfile recipes, scripts)
+   inherits it. Example:
+
+   ```yaml
+   modes:
+     dangerous:
+       claude-flags: [ "--dangerously-skip-permissions" ]
+       path-prepend: [ "/snap/just/current/bin" ]
+   ```
+
+   - Expand a leading `~` only; no `$VAR` expansion.
+   - An entry that doesn't exist: warn at launch, still prepend.
+   - An entry inside one of the plan's write subtrees: warn at launch (it
+     recreates the writable-PATH hole from
+     `issue-01a0ac0b-…-writable-path-dirs-allow-unconfined-exec.md`), don't
+     refuse.
+   - Applies to every backend (it is just `PATH`).
+   - `default_config.yml` ships no `path-prepend`; which snaps to expose
+     depends on the machine, so it goes in `~/.config/wtclaude/wtclaude.yml`.
+   - Modes merge whole (existing behaviour), so no merge logic is needed.
+
+2. **Hook deny for snap commands, landlock only.** Alongside the
+   `privilege_escalation_command` check (`src/hook.rs:161`): if a
+   command-position word resolves through `PATH` to `/snap/bin/<app>`,
+   deny it. Read `/snap/<name>/current/meta/snap.yaml`:
+   - classic: name the direct payload path (`/snap/<name>/current/<command>`)
+     and suggest the user add its directory to this mode's `path-prepend`;
+   - strict: say it can't run under NO_NEW_PRIVS and to ask the user for a
+     non-snap install.
+
+   Nested calls can't be caught by the hook; `path-prepend` is the fix for
+   those.
+
+### Rejected
+
+- **Relay snap commands through the unsandboxed launcher.** A general
+  escape hatch out of the filesystem sandbox (`gh api`, extensions,
+  aliases), and no relay channel exists to build on.
+- **Generate shims from `meta/snap.yaml` at launch.** More machinery than
+  the problem needs; `path-prepend` gives the user the same result with an
+  explicit allow-list.
+- **Refuse to launch on writable `path-prepend` entries.** wtclaude is a
+  hallucination safety net, not a security boundary.
 
 ## Relevant files
 
@@ -46,6 +92,9 @@ If that is right, no landlock rule change will fix this. Some options:
   take effect for sandboxed commands
 - `src/sandbox/landlock.rs:115`: the sandbox notice explaining NO_NEW_PRIVS
 - `src/hook.rs:257`: hook text about privilege escalation being impossible
+- `src/hook.rs:161`: where the snap deny check goes, beside the `sudo` one
+- `src/config.rs:55`: `Mode`, where `path-prepend` goes (and `MODE_KEYS`)
+- `src/launch.rs:223`, `:345`, `:514`: where mode config is applied at launch
 
 ## Grill Log
 
@@ -82,3 +131,6 @@ If that is right, no landlock rule change will fix this. Some options:
   `path-prepend` entry; for a strict snap, say it can't run and to install a
   non-snap build. Giving the direct path is fine — omitting `gh` from
   `path-prepend` is about convenience, not keeping the agent away from it.
+- Q: How are `path-prepend` entries interpreted? — A: Leading `~` expanded,
+  no `$VAR`; missing dirs warn but are still prepended; applies on every
+  backend; `default_config.yml` ships none.
