@@ -100,6 +100,16 @@ refuses them in command position with an explanation, rather than
 letting them fail with a confusing kernel message. Install toolchains
 outside the sandbox and let the session use them.
 
+**Snap-packaged commands cannot run through `/snap/bin` under Landlock.**
+`/snap/bin/<app>` hands off to `snap-confine`, a privileged helper that
+`NO_NEW_PRIVS` neuters, so it refuses to start. For a `classic` snap
+(`gh` and `just` are both classic) the payload under
+`/snap/<name>/current` runs fine when invoked directly: add its
+directory to the mode's `path-prepend` (see Per-machine configuration).
+The hook denies a command in command position that resolves through
+`PATH` to `/snap/bin`, naming the direct path for a classic snap.
+Strict snaps need their own mount namespace and cannot run at all.
+
 **Heredocs are only restricted under Seatbelt.** Apple's bash 3.2
 miscounts quote nesting for a heredoc inside a `$(...)` inside double
 quotes — the common `git commit -m "$(cat <<'EOF' ... EOF)"` idiom —
@@ -301,6 +311,8 @@ default-mode: dangerous
 modes:
   dangerous:
     claude-flags: ["--dangerously-skip-permissions", "--verbose"]
+    # Directories put in front of PATH for this mode's sessions, in order.
+    path-prepend: ["/snap/just/current/bin"]
 
 # Which backend enforces the plan: auto (default), seatbelt, landlock.
 sandbox-backend: auto
@@ -315,6 +327,15 @@ allowlist:
 socket_allowlist:
   - ~/.colima/default/docker.sock
 ```
+
+A mode's `path-prepend` entries are prepended, in order, to the `PATH`
+Claude is launched with, so every Bash command and anything it runs
+(justfile recipes, scripts) sees them, under every backend. A leading
+`~` is expanded; nothing else is (no `$VAR`). An entry that doesn't
+exist, or that lies inside a directory the session may write to (which
+would let a session plant commands on its own `PATH`), prints a warning
+at launch but is still used. The built-in modes set no `path-prepend`:
+which tools need it depends on the machine.
 
 An `allowlist` entry containing `*` is a glob, which only the Seatbelt
 backend can express (see Differences between backends). An entry whose

@@ -100,6 +100,77 @@ impl SandboxSession {
     }
 }
 
+/// Puts the mode's `path-prepend` entries in front of the child's `PATH`, so
+/// every Bash command and everything it runs (justfile recipes, scripts)
+/// finds them first. Applies under every backend: it is only `PATH`.
+///
+/// Questionable entries are warned about but still used — the user named
+/// them, and wtclaude is a safety net against accidents rather than a
+/// security boundary — except one containing `:`, which `PATH` cannot hold.
+fn apply_path_prepend(
+    cmd: &mut Command,
+    mode: &config::Mode,
+    sandbox_root: &Path,
+    repo_root: Option<&Path>,
+) -> Result<()> {
+    if mode.path_prepend.is_empty() {
+        return Ok(());
+    }
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let entries = mode.expanded_path_prepend(&home);
+    let plan = sandbox::plan(sandbox_root, repo_root)?;
+    for warning in path_prepend_warnings(&entries, &plan.write_subtrees) {
+        eprintln!("wtclaude: warning: {warning}");
+    }
+    let current = std::env::var_os("PATH");
+    cmd.env("PATH", prepend_to_path(&entries, current.as_deref()));
+    Ok(())
+}
+
+/// What is worth telling the user about each `path-prepend` entry: one that
+/// doesn't exist, one that can't go in `PATH`, and one inside a write subtree
+/// — a command the session plants there shadows the real one for everything
+/// launched with this `PATH`, the hole described for `~/.cargo/bin` in the
+/// writable-PATH issue.
+fn path_prepend_warnings(entries: &[PathBuf], write_subtrees: &[PathBuf]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for entry in entries {
+        let shown = entry.display();
+        if entry.to_string_lossy().contains(':') {
+            warnings.push(format!(
+                "path-prepend entry `{shown}` contains `:`, which PATH cannot hold; skipping it"
+            ));
+            continue;
+        }
+        if !entry.exists() {
+            warnings.push(format!(
+                "path-prepend entry `{shown}` does not exist; prepending it anyway"
+            ));
+        }
+        let resolved = config::resolve_existing_prefix(entry);
+        if let Some(subtree) = write_subtrees.iter().find(|w| resolved.starts_with(w)) {
+            warnings.push(format!(
+                "path-prepend entry `{shown}` is inside `{}`, which the session may write \
+                 to, so it can put commands on its own PATH; prepending it anyway",
+                subtree.display()
+            ));
+        }
+    }
+    warnings
+}
+
+/// `entries`, in order, in front of `current`. Entries containing `:` are
+/// left out (`path_prepend_warnings` reports them).
+fn prepend_to_path(entries: &[PathBuf], current: Option<&std::ffi::OsStr>) -> std::ffi::OsString {
+    let usable = entries
+        .iter()
+        .filter(|e| !e.to_string_lossy().contains(':'))
+        .cloned();
+    let existing = current.map(std::env::split_paths).into_iter().flatten();
+    std::env::join_paths(usable.chain(existing))
+        .expect("entries containing `:` were filtered out, and the rest came from PATH")
+}
+
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum SandboxBreakage {
     Hide,
@@ -236,6 +307,7 @@ pub fn run(args: Args) -> Result<i32> {
         Some(&repo_root),
         args.test_sandbox_breakage,
     );
+    apply_path_prepend(&mut cmd, mode_config, &canonical, Some(&repo_root))?;
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -361,6 +433,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(&mut cmd, &canonical, Some(&repo_root), None);
+    apply_path_prepend(&mut cmd, mode_config, &canonical, Some(&repo_root))?;
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -527,6 +600,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         repo_root.as_deref(),
         args.test_sandbox_breakage,
     );
+    apply_path_prepend(&mut cmd, mode_config, &canonical, repo_root.as_deref())?;
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -1158,6 +1232,47 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepend_to_path_puts_entries_first_in_order() {
+        let entries = [PathBuf::from("/a"), PathBuf::from("/b")];
+        assert_eq!(
+            prepend_to_path(&entries, Some(std::ffi::OsStr::new("/usr/bin:/bin"))),
+            "/a:/b:/usr/bin:/bin"
+        );
+        assert_eq!(prepend_to_path(&entries, None), "/a:/b");
+    }
+
+    #[test]
+    fn prepend_to_path_skips_entries_containing_a_colon() {
+        let entries = [PathBuf::from("/a:/b"), PathBuf::from("/c")];
+        assert_eq!(
+            prepend_to_path(&entries, Some(std::ffi::OsStr::new("/bin"))),
+            "/c:/bin"
+        );
+    }
+
+    #[test]
+    fn path_prepend_warnings_flag_missing_writable_and_colon_entries() {
+        let dir = unique_test_dir("path-prepend");
+        let writable = dir.join("writable");
+        let fine = dir.join("fine");
+        std::fs::create_dir_all(writable.join("bin")).unwrap();
+        std::fs::create_dir_all(&fine).unwrap();
+        let entries = [
+            fine.clone(),
+            dir.join("missing"),
+            writable.join("bin"),
+            PathBuf::from("/x:/y"),
+        ];
+        let warnings = path_prepend_warnings(&entries, std::slice::from_ref(&writable));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("does not exist"), "{warnings:?}");
+        assert!(warnings[1].contains("may write"), "{warnings:?}");
+        assert!(warnings[2].contains("contains `:`"), "{warnings:?}");
+    }
 
     // git canonicalizes symlinked ancestors (e.g. macOS's /tmp -> /private/tmp)
     // in its own `rev-parse` output, so test dirs must be canonicalized too —
