@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 struct TempFile(PathBuf);
 
@@ -229,6 +229,8 @@ pub fn run(args: Args) -> Result<i32> {
         .modes
         .get(&mode)
         .with_context(|| format!("unknown mode: {}", mode))?;
+    // Before repo_root(), git init, pull or worktree creation, so a bad
+    // name fails before git is touched.
     let name = branch_name(&args.name)?;
 
     let repo_root = match repo_root() {
@@ -243,7 +245,7 @@ pub fn run(args: Args) -> Result<i32> {
     };
 
     let fresh = is_fresh_repo(&repo_root);
-    let in_place = fresh || current_branch().ok().map(|b| b == name).unwrap_or(false);
+    let in_place = fresh || current_branch().is_ok_and(|b| b == name);
 
     if !args.no_pull {
         git_pull(&repo_root)?;
@@ -256,14 +258,9 @@ pub fn run(args: Args) -> Result<i32> {
             .canonicalize()
             .unwrap_or_else(|_| repo_root.clone())
     } else {
-        let worktree_path = repo_root
-            .join(".claude")
-            .join("worktrees")
-            .join(sanitize_name(&name));
-        ensure_worktree(&worktree_path, &name, &repo_root)?;
-        worktree_path
-            .canonicalize()
-            .unwrap_or_else(|_| worktree_path.clone())
+        let worktree = worktree_path(&repo_root, &name);
+        ensure_worktree(&worktree, &name, &repo_root)?;
+        worktree.canonicalize().unwrap_or_else(|_| worktree.clone())
     };
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
@@ -313,11 +310,8 @@ pub fn run(args: Args) -> Result<i32> {
     let exit_code = status.code().unwrap_or(1);
 
     if !in_place {
-        let worktree_path = repo_root
-            .join(".claude")
-            .join("worktrees")
-            .join(sanitize_name(&name));
-        if let Err(e) = post_exit_menu(&name, &worktree_path, &repo_root) {
+        let worktree = worktree_path(&repo_root, &name);
+        if let Err(e) = post_exit_menu(&name, &worktree, &repo_root) {
             eprintln!("wtclaude: warning: post-exit menu: {e}");
         }
     }
@@ -675,21 +669,34 @@ fn sanitize_name(name: &str) -> String {
     name.replace('/', "+")
 }
 
+fn worktree_path(repo_root: &Path, name: &str) -> PathBuf {
+    repo_root
+        .join(".claude")
+        .join("worktrees")
+        .join(sanitize_name(name))
+}
+
 /// Cleans `raw` into a branch name git accepts, announcing any change on
-/// stderr, and bails if nothing usable is left. Runs before any git
-/// mutation so a bad name never half-creates a worktree.
+/// stderr. Bails if the result is empty or git still rejects it.
 fn branch_name(raw: &str) -> Result<String> {
     let clean = sanitize_branch_name(raw);
-    let valid = !clean.is_empty()
-        && Command::new("git")
-            .args(["check-ref-format", "--branch", &clean])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .context("running git check-ref-format")?
-            .success();
-    if !valid {
+    if clean.is_empty() {
         bail!("'{raw}' has no characters usable in a branch name");
+    }
+    let output = Command::new("git")
+        .args(["check-ref-format", "--branch", &clean])
+        .output()
+        .context("running git check-ref-format")?;
+    if !output.status.success() {
+        let from = if clean == raw {
+            String::new()
+        } else {
+            format!(" (from '{raw}')")
+        };
+        bail!(
+            "'{clean}'{from} is not a valid branch name: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     if clean != raw {
         eprintln!("wtclaude: using branch '{clean}' (from '{raw}')");
@@ -697,30 +704,31 @@ fn branch_name(raw: &str) -> Result<String> {
     Ok(clean)
 }
 
-/// Drops or rewrites the parts of `raw` that `git check-ref-format` rejects:
-/// whitespace runs become `-`, forbidden characters are deleted, and `..`,
-/// `@{`, empty path components, a component's leading `.` or trailing
-/// `.lock`, a leading `-` and a trailing `.` are removed. Repeats until
-/// stable, since one removal can expose another (`a.lock.` -> `a.lock`).
+/// Drops or rewrites the common things `git check-ref-format` rejects (not
+/// all of them: `HEAD` passes through). Surrounding whitespace is trimmed,
+/// inner whitespace runs become `-`, forbidden characters are deleted, `..`
+/// collapses to `.`, and `@{`, empty path components, a component's leading
+/// `.` or trailing `.lock`, a leading `-` and a trailing `.` are removed. The
+/// structural rules repeat until stable, since one removal can expose
+/// another (`a.lock.` -> `a.lock`).
 fn sanitize_branch_name(raw: &str) -> String {
-    let mut name = raw.to_string();
-    loop {
-        let mut next = String::with_capacity(name.len());
-        let mut in_space = false;
-        for c in name.chars() {
-            if c.is_whitespace() {
-                if !in_space {
-                    next.push('-');
-                }
-                in_space = true;
-                continue;
+    let mut name = String::with_capacity(raw.len());
+    let mut in_space = false;
+    for c in raw.trim().chars() {
+        if c.is_whitespace() {
+            if !in_space {
+                name.push('-');
             }
-            in_space = false;
-            if !c.is_control() && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
-                next.push(c);
-            }
+            in_space = true;
+            continue;
         }
-        let next = next.replace("..", ".").replace("@{", "");
+        in_space = false;
+        if !c.is_control() && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
+            name.push(c);
+        }
+    }
+    loop {
+        let next = name.replace("..", ".").replace("@{", "");
         let next = next
             .split('/')
             .map(|part| {
@@ -1307,6 +1315,8 @@ mod tests {
         let cases = [
             ("fix the bug", "fix-the-bug"),
             ("fix \t the  bug", "fix-the-bug"),
+            (" fix the bug ", "fix-the-bug"),
+            ("\tfix\n", "fix"),
             ("a..b", "a.b"),
             ("a:b", "ab"),
             ("a~b", "ab"),
@@ -1335,6 +1345,15 @@ mod tests {
         ];
         for (raw, want) in cases {
             assert_eq!(sanitize_branch_name(raw), want, "input {raw:?}");
+            if !want.is_empty() {
+                let ok = Command::new("git")
+                    .args(["check-ref-format", "--branch", want])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success();
+                assert!(ok, "git rejects {want:?} (from {raw:?})");
+            }
         }
     }
 
@@ -1355,7 +1374,18 @@ mod tests {
     fn branch_name_bails_when_nothing_usable_is_left() {
         let err = branch_name("???").unwrap_err().to_string();
         assert_eq!(err, "'???' has no characters usable in a branch name");
+    }
+
+    #[test]
+    fn branch_name_returns_the_cleaned_name() {
         assert_eq!(branch_name("fix the bug").unwrap(), "fix-the-bug");
+    }
+
+    #[test]
+    fn branch_name_reports_names_git_still_rejects() {
+        let err = branch_name("HEAD").unwrap_err().to_string();
+        assert!(err.contains("'HEAD'"), "{err}");
+        assert!(!err.contains("no characters usable"), "{err}");
     }
 
     #[test]

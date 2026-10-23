@@ -33,7 +33,8 @@ The only change wtclaude makes to the name today is for the worktree
 
 ## Decisions
 
-- **Sanitizing rules:** whitespace runs become a single `-`. The forbidden
+- **Sanitizing rules:** leading and trailing whitespace is trimmed rather
+  than turned into `-`; inner whitespace runs become a single `-`. The forbidden
   characters `~ ^ : ? * [ \` and control characters are deleted. `..`
   collapses to `.`, `//` to `/`, and `@{` is removed. Leading `-`/`.`/`/` and
   trailing `.`/`/`/`.lock` are trimmed. Repeat until the name stops changing.
@@ -50,12 +51,13 @@ The only change wtclaude makes to the name today is for the worktree
 
 ## Relevant files
 
-- `src/launch.rs:802`: `ensure_worktree`, which passes the raw name to
-  `git worktree add`
-- `src/launch.rs:676`: `sanitize_name`, which only handles `/` and only for
-  the directory name
-- `src/launch.rs:204`: `Args.name`, the `WORKTREE_NAME` positional
-- `src/launch.rs:230-330`: `run`, where every use of `args.name` lives
+- `src/launch.rs` `branch_name` / `sanitize_branch_name`: clean the raw name
+  and validate it with `git check-ref-format --branch`
+- `src/launch.rs` `run`: cleans the name once and uses the result everywhere
+- `src/launch.rs` `sanitize_name`: maps the branch name to the worktree
+  directory name (`/` → `+`)
+- `src/launch.rs` `ensure_worktree`: creates the branch and worktree
+- `src/launch.rs` `Args.name`: the `WORKTREE_NAME` positional
 
 ## Grill Log
 
