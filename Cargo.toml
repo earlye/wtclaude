@@ -1,6 +1,6 @@
 [package]
 name = "wtclaude"
-version = "0.1.17"
+version = "0.1.52"
 edition = "2024"
 
 [dependencies]
