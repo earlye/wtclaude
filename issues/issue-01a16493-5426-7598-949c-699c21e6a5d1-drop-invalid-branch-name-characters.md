@@ -69,3 +69,8 @@ The only change wtclaude makes to the name today is for the worktree
   problems collapse: `..` → `.`, `//` → `/`, `@{` removed, leading `-`/`.`/`/`
   and trailing `.`/`/`/`.lock` trimmed (`trailing.` → `trailing`). Repeat until
   the name stops changing.
+- Q: How to validate, and what if nothing usable is left? — A: After
+  sanitizing, check the result with `git check-ref-format --branch`. If the
+  result is empty or git rejects it, bail before any git mutation with a clear
+  error naming the raw input. No generated fallback name, because a fallback
+  would break "same raw input finds the same worktree".
