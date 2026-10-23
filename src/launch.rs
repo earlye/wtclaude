@@ -702,44 +702,42 @@ fn branch_name(raw: &str) -> Result<String> {
     Ok(clean)
 }
 
-/// Drops or rewrites the common things `git check-ref-format` rejects (not
-/// all of them: `HEAD` passes through). Surrounding whitespace is trimmed,
-/// inner whitespace runs become `-`, forbidden characters are deleted, `..`
-/// collapses to `.`, and `@{`, empty path components, a component's leading
-/// `.` or trailing `.lock`, a leading `-` and a trailing `.` are removed. The
-/// structural rules repeat until stable, since one removal can expose
-/// another (`a.lock.` -> `a.lock`).
+/// Keeps only ASCII alphanumerics, `_`, `-`, `.` and `/` (as a path
+/// separator); every other character is deleted. Surrounding whitespace is
+/// trimmed and inner whitespace runs become `-`. Runs of the same separator
+/// collapse to one (`--` -> `-`, `..` -> `.`, but `-_` stays). Each path
+/// component loses leading and trailing `.` and a trailing `.lock`, empty
+/// components are dropped, and a leading `-` is trimmed. These rules repeat
+/// until stable, since one removal can expose another (`a.lock.` -> `a`).
+/// Not everything git rejects is caught: `HEAD` passes through.
 fn sanitize_branch_name(raw: &str) -> String {
     let mut name = String::with_capacity(raw.len());
-    let mut in_space = false;
     for c in raw.trim().chars() {
-        if c.is_whitespace() {
-            if !in_space {
-                name.push('-');
-            }
-            in_space = true;
+        let c = if c.is_whitespace() { '-' } else { c };
+        let separator = matches!(c, '_' | '-' | '.' | '/');
+        if !(c.is_ascii_alphanumeric() || separator) || (separator && name.ends_with(c)) {
             continue;
         }
-        in_space = false;
-        if !c.is_control() && !matches!(c, '~' | '^' | ':' | '?' | '*' | '[' | '\\') {
-            name.push(c);
-        }
+        name.push(c);
     }
     loop {
-        let next = name.replace("..", ".").replace("@{", "");
-        let next = next
+        let next = name
             .split('/')
             .map(|part| {
-                let part = part.trim_start_matches('.');
-                part.strip_suffix(".lock").unwrap_or(part)
+                let mut part = part;
+                loop {
+                    let trimmed = part.trim_matches('.');
+                    let trimmed = trimmed.strip_suffix(".lock").unwrap_or(trimmed);
+                    if trimmed == part {
+                        return part;
+                    }
+                    part = trimmed;
+                }
             })
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join("/");
-        let next = next
-            .trim_start_matches('-')
-            .trim_end_matches('.')
-            .to_string();
+        let next = next.trim_start_matches(['-', '/']).to_string();
         if next == name {
             return name;
         }
@@ -1311,34 +1309,37 @@ mod tests {
     #[test]
     fn sanitize_branch_name_cleans_names_git_rejects() {
         let cases = [
+            ("this!is%silly...", "thisissilly"),
             ("fix the bug", "fix-the-bug"),
-            ("fix \t the  bug", "fix-the-bug"),
             (" fix the bug ", "fix-the-bug"),
+            ("fix \t the  bug", "fix-the-bug"),
             ("\tfix\n", "fix"),
+            ("a--b", "a-b"),
+            ("a___b", "a_b"),
+            ("a-_b", "a-_b"),
+            ("a-!-b", "a-b"),
+            ("a - b", "a-b"),
             ("a..b", "a.b"),
-            ("a:b", "ab"),
-            ("a~b", "ab"),
-            ("a^b", "ab"),
-            ("a?b", "ab"),
-            ("a*b", "ab"),
-            ("a[b", "ab"),
-            ("a\\b", "ab"),
+            ("v1.2", "v1.2"),
+            ("a.lock", "a"),
+            ("a.lock.", "a"),
+            ("a.lock.lock", "a"),
+            (".a", "a"),
+            ("a.", "a"),
+            ("a/.b", "a/b"),
+            ("a.lock/b", "a/b"),
+            ("trailing...", "trailing"),
+            ("-.a", "a"),
+            ("a:b~c^d?e*f[g\\h", "abcdefgh"),
             ("a\u{7}b", "ab"),
             ("a@{b", "ab"),
             ("a//b", "a/b"),
-            ("a/", "a"),
-            ("/a", "a"),
-            (".a", "a"),
-            ("a.", "a"),
-            ("trailing...", "trailing"),
-            ("a.lock", "a"),
-            ("a.lock.", "a"),
-            ("a/.b", "a/b"),
-            ("a.lock/b", "a/b"),
+            ("/a/", "a"),
             ("-a", "a"),
-            ("--.a", "a"),
+            ("/-a", "a"),
+            ("-/a", "a"),
+            ("héllo", "hllo"),
             ("???", ""),
-            ("~^:?*[\\", ""),
             ("../..", ""),
         ];
         for (raw, want) in cases {
@@ -1361,8 +1362,9 @@ mod tests {
             "earlye/699c21e6a5d1/foo",
             "main",
             "fix-the-bug",
+            "feature_x-1",
             "v1.2",
-            "a@b",
+            "a-_b",
         ] {
             assert_eq!(sanitize_branch_name(name), name);
         }

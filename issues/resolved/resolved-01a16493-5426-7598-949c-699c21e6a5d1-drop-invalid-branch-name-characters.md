@@ -33,12 +33,15 @@ The only change wtclaude makes to the name today is for the worktree
 
 ## Decisions
 
-- **Sanitizing rules:** leading and trailing whitespace is trimmed rather
-  than turned into `-`; inner whitespace runs become a single `-`. The forbidden
-  characters `~ ^ : ? * [ \` and control characters are deleted. `..`
-  collapses to `.`, `//` to `/`, and `@{` is removed. Leading `-`/`.`/`/` and
-  trailing `.`/`/`/`.lock` are trimmed. Repeat until the name stops changing.
-  Examples: `fix the bug` → `fix-the-bug`, `trailing.` → `trailing`.
+- **Sanitizing rules:** an allowlist. Leading and trailing whitespace is
+  trimmed; inner whitespace runs become a single `-`. Only ASCII
+  alphanumerics, `_`, `-`, `.`, and `/` (as a path separator) are kept;
+  every other character is deleted. Runs of the same `-`, `_`, `.`, or `/`
+  collapse to one (`-_` is left alone). Each `/` component loses leading and
+  trailing `.` and a trailing `.lock`; empty components are dropped, and a
+  leading `-` is trimmed. Repeat until the name stops changing. Examples:
+  `fix the bug` → `fix-the-bug`, `this!is%silly...` → `thisissilly`,
+  `a.lock.` → `a`.
 - **Validation:** check the result with `git check-ref-format --branch`. If
   it's empty or rejected, bail before any git mutation with a clear error
   naming the raw input. There is no generated fallback name.
@@ -78,3 +81,11 @@ The only change wtclaude makes to the name today is for the worktree
   name differs from the raw one, print one line to stderr:
   `wtclaude: using branch 'fix-the-bug' (from 'fix the bug')`. Print nothing
   when it's unchanged, and don't ask for confirmation.
+
+### 2026-10-23
+
+- Q: `this!is%silly...` kept `!` and `%`; denylist or allowlist? — A:
+  Allowlist: ASCII alphanumerics, `_`, `-`, and `/` as separator; everything
+  else (including `.`) is deleted; runs of the same `-` or `_` collapse to
+  one. Follow-up: `.` is allowed too; runs of `.` collapse, and
+  leading/trailing `.` and a trailing `.lock` are stripped per component.
