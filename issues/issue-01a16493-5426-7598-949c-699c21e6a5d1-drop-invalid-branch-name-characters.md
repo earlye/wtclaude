@@ -31,33 +31,31 @@ The only change wtclaude makes to the name today is for the worktree
 | `a.lock`      | `.lock` suffix                        |
 | `-a`          | leading `-` (and clap treats it as a flag anyway) |
 
-## Open questions
+## Decisions
 
-- **Drop or replace?** Taken literally, "drop" turns `fix the bug` into
-  `fixthebug`. Replacing spaces with `-` might read better, but that's a
-  choice for the user to make.
-- **Some invalid parts aren't single characters:** `..`, `//`, `@{`, a
-  `.lock` suffix, and a leading or trailing `.` or `/`. They need
-  collapsing or trimming, not character-by-character removal.
-- **Validation:** sanitize first, then check the result with
-  `git check-ref-format --branch`. Fail clearly if nothing usable is left
-  (for example, the input was all punctuation).
-- **What uses the cleaned name:** it has to be the one name used everywhere
-  the branch name goes, which is the worktree path (`sanitize_name`), the
-  tmux window title, `claude --name`, and the post-exit menu. Otherwise a
-  later relaunch with the same raw input won't find the same worktree.
-- **Tell the user:** probably print a notice when the name changes, so they
-  know which branch they're on.
+- **Sanitizing rules:** whitespace runs become a single `-`. The forbidden
+  characters `~ ^ : ? * [ \` and control characters are deleted. `..`
+  collapses to `.`, `//` to `/`, and `@{` is removed. Leading `-`/`.`/`/` and
+  trailing `.`/`/`/`.lock` are trimmed. Repeat until the name stops changing.
+  Examples: `fix the bug` → `fix-the-bug`, `trailing.` → `trailing`.
+- **Validation:** check the result with `git check-ref-format --branch`. If
+  it's empty or rejected, bail before any git mutation with a clear error
+  naming the raw input. There is no generated fallback name.
+- **One name everywhere:** clean once at the top of `run` and use that value
+  for the in-place `current_branch()` comparison, the tmux window title, the
+  worktree path (`sanitize_name`), `ensure_worktree`, the sandbox notice,
+  `claude --name`, and the post-exit menu.
+- **Notice:** if the name changed, print
+  `wtclaude: using branch '<clean>' (from '<raw>')` to stderr.
 
 ## Relevant files
 
-- `src/launch.rs:728`: `ensure_worktree`, which passes the raw name to
+- `src/launch.rs:802`: `ensure_worktree`, which passes the raw name to
   `git worktree add`
-- `src/launch.rs:602`: `sanitize_name`, which only handles `/` and only for
+- `src/launch.rs:676`: `sanitize_name`, which only handles `/` and only for
   the directory name
-- `src/launch.rs:132`: `Args.name`, the `WORKTREE_NAME` positional
-- `src/launch.rs:183`, `src/launch.rs:229`: the tmux window name and
-  `claude --name`, which also use `args.name`
+- `src/launch.rs:204`: `Args.name`, the `WORKTREE_NAME` positional
+- `src/launch.rs:230-330`: `run`, where every use of `args.name` lives
 
 ## Grill Log
 
@@ -74,3 +72,7 @@ The only change wtclaude makes to the name today is for the worktree
   result is empty or git rejects it, bail before any git mutation with a clear
   error naming the raw input. No generated fallback name, because a fallback
   would break "same raw input finds the same worktree".
+- Q: Should the user be told the name changed? — A: Yes. When the cleaned
+  name differs from the raw one, print one line to stderr:
+  `wtclaude: using branch 'fix-the-bug' (from 'fix the bug')`. Print nothing
+  when it's unchanged, and don't ask for confirmation.
