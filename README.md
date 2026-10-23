@@ -210,7 +210,7 @@ Nothing is added if the session ended before any message was sent. It
 hands the command over through a temporary file under
 `${XDG_STATE_HOME:-~/.local/state}/wtclaude/`, which sessions can't
 write, and deletes the file afterwards (one left behind by an
-interrupted wrapper is swept once it is a day old). If a sandbox root or
+interrupted wrapper is swept once it is older than a week). If a sandbox root or
 allowlist entry covers that directory, wtclaude refuses to write the
 file, deletes it, and warns, so nothing is added — but a sandboxed
 background process that outlives the session could still race a command

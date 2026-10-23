@@ -280,7 +280,7 @@ fn bash_wrapper_does_not_follow_a_symlinked_handoff_file() {
 }
 
 #[test]
-fn bash_wrapper_sweeps_day_old_handoff_files() {
+fn bash_wrapper_sweeps_week_old_handoff_files() {
     let dir = unique_temp_dir("bash-wrapper-sweep");
     let state_home = dir.join("state");
     let wt_dir = state_home.join("wtclaude");
@@ -289,17 +289,17 @@ fn bash_wrapper_sweeps_day_old_handoff_files() {
     let fresh = wt_dir.join("last-session.fresh1");
     std::fs::write(&stale, "").expect("create stale file");
     std::fs::write(&fresh, "").expect("create fresh file");
-    let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+    let eight_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86400);
     std::fs::File::options()
         .write(true)
         .open(&stale)
-        .and_then(|f| f.set_modified(two_days_ago))
+        .and_then(|f| f.set_modified(eight_days_ago))
         .expect("backdate stale file");
     run_bash_wrapper(&dir, &state_home, WRITES_RESUME_COMMAND);
     let (stale_left, fresh_left) = (stale.exists(), fresh.exists());
     std::fs::remove_dir_all(&dir).ok();
 
-    assert!(!stale_left, "a day-old handoff file should be swept");
+    assert!(!stale_left, "a handoff file over a week old should be swept");
     assert!(
         fresh_left,
         "a recent handoff file may belong to a live wrapper"

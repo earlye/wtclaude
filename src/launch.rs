@@ -731,9 +731,8 @@ fn resume_handoff_file() -> Option<PathBuf> {
 /// (a symlink is refused rather than followed), when the session's plan
 /// (recomputed from `sandbox_root` and `repo_root`, allowlist included, as
 /// the hook does for every Bash call) could have written or replaced it, or
-/// when the write itself fails. On any of those but the lookup, `handoff`
-/// is also deleted, so the wrapper finds nothing a session may have planted
-/// there. That leaves a race when the state directory is inside the
+/// when the write itself fails. On any of those, `handoff` is also
+/// deleted, so the wrapper finds nothing a session may have planted there. That leaves a race when the state directory is inside the
 /// session's sandbox: a sandboxed background process outliving the session
 /// could recreate the file after the deletion, before the wrapper reads it.
 /// Keep the state directory outside the sandbox root and allowlist.
@@ -749,6 +748,7 @@ fn record_resume_command(
         Ok(false) => return,
         Err(e) => {
             eprintln!("wtclaude: warning: looking for session {session_id}: {e:#}");
+            discard_handoff(handoff);
             return;
         }
     }

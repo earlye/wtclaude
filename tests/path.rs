@@ -1017,7 +1017,7 @@ fn path_subcommand_warns_when_the_projects_dir_is_missing() {
     );
     std::fs::remove_dir_all(&dir).ok();
 
-    assert_eq!(run.handoff.as_deref(), Some(""));
+    assert_eq!(run.handoff, None, "the handoff file should be deleted");
     let stderr = String::from_utf8_lossy(&run.output.stderr);
     assert!(
         stderr.contains("looking for session") && stderr.contains("does not exist"),

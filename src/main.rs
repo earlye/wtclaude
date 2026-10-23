@@ -198,7 +198,7 @@ fn build_after_help() -> String {
 /// file, never a symlink (or a FIFO, which would hang `cat`).
 ///
 /// Handoff files left by an interrupted wrapper (e.g. Ctrl-C) are swept
-/// once they are a day old.
+/// once they are over a week old.
 fn print_history_wrapper(push_history: &str) {
     print!(
         r#"
@@ -210,7 +210,7 @@ wtclaude() {{
     command wtclaude "$@"
     return $?
   fi
-  find "$_wt_dir" -maxdepth 1 -name 'last-session.*' -mmin +1440 -delete 2>/dev/null
+  find "$_wt_dir" -maxdepth 1 -name 'last-session.*' -mmin +10080 -delete 2>/dev/null
   WTCLAUDE_RESUME_FILE="$_wt_file" command wtclaude "$@"
   rc=$?
   if [[ -f $_wt_file && ! -L $_wt_file ]]; then
