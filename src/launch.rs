@@ -24,24 +24,27 @@ use crate::sandbox;
 struct SandboxSession {
     backend: Box<dyn sandbox::Backend>,
     dir: sandbox::SessionDir,
+    /// The session's mode, whose `allowlist` joins the top-level one.
+    mode: String,
 }
 
 impl SandboxSession {
     /// Picks a backend and reports anything it cannot enforce. Fails if no
     /// backend on this machine can confine writes at all, rather than
     /// launching a session that only looks sandboxed.
-    fn start(sandbox_root: &Path, repo_root: Option<&Path>) -> Result<Self> {
+    fn start(sandbox_root: &Path, repo_root: Option<&Path>, mode: &str) -> Result<Self> {
         let preference = config::load_user()?.backend_preference();
         let (backend, caveat) = sandbox::select(&preference)?;
         if let Some(caveat) = caveat {
             eprintln!("wtclaude: warning: {caveat}");
         }
-        for unhonored in backend.unhonored(&sandbox::plan(sandbox_root, repo_root)?) {
+        for unhonored in backend.unhonored(&sandbox::plan(sandbox_root, repo_root, Some(mode))?) {
             eprintln!("wtclaude: warning: {unhonored}");
         }
         Ok(Self {
             backend,
             dir: sandbox::SessionDir::create()?,
+            mode: mode.to_string(),
         })
     }
 
@@ -49,7 +52,7 @@ impl SandboxSession {
     fn describe(&self, sandbox_root: &Path, repo_root: Option<&Path>) -> Result<String> {
         Ok(self
             .backend
-            .describe(&sandbox::plan(sandbox_root, repo_root)?))
+            .describe(&sandbox::plan(sandbox_root, repo_root, Some(&self.mode))?))
     }
 
     /// The sandbox notice for `--append-system-prompt`: what is true of every
@@ -79,6 +82,7 @@ impl SandboxSession {
         // file is `record_resume_command` refusing one the plan can reach.
         cmd.env_remove(RESUME_FILE_ENV);
         cmd.env("WTCLAUDE_SANDBOX", sandbox_root);
+        cmd.env("WTCLAUDE_MODE", &self.mode);
         match repo_root {
             Some(repo_root) => cmd.env("WTCLAUDE_REPO_ROOT", repo_root),
             None => cmd.env_remove("WTCLAUDE_REPO_ROOT"),
@@ -114,6 +118,7 @@ impl SandboxSession {
 /// security boundary — except one containing `:`, which `PATH` cannot hold.
 fn apply_path_prepend(
     cmd: &mut Command,
+    mode_name: &str,
     mode: &config::Mode,
     sandbox_root: &Path,
     repo_root: Option<&Path>,
@@ -123,7 +128,7 @@ fn apply_path_prepend(
     }
     let home = std::env::var("HOME").context("HOME not set")?;
     let entries = mode.expanded_path_prepend(&home);
-    let plan = sandbox::plan(sandbox_root, repo_root)?;
+    let plan = sandbox::plan(sandbox_root, repo_root, Some(mode_name))?;
     for warning in path_prepend_warnings(&entries, &plan.write_subtrees) {
         eprintln!("wtclaude: warning: {warning}");
     }
@@ -235,6 +240,9 @@ pub fn run(args: Args) -> Result<i32> {
         .modes
         .get(&mode)
         .with_context(|| format!("unknown mode: {}", mode))?;
+    // Before repo_root(), git init, pull or worktree creation, so a bad
+    // name fails before git is touched.
+    let name = branch_name(&args.name)?;
 
     let repo_root = match repo_root() {
         Ok(r) => r,
@@ -248,16 +256,12 @@ pub fn run(args: Args) -> Result<i32> {
     };
 
     let fresh = is_fresh_repo(&repo_root);
-    let in_place = fresh
-        || current_branch()
-            .ok()
-            .map(|b| b == args.name)
-            .unwrap_or(false);
+    let in_place = fresh || current_branch().is_ok_and(|b| b == name);
 
     if !args.no_pull {
         git_pull(&repo_root)?;
     }
-    let _window_name = TmuxWindowName::rename(&args.name);
+    let _window_name = TmuxWindowName::rename(&name);
     update_trust(&repo_root)?;
 
     let canonical = if in_place {
@@ -265,19 +269,14 @@ pub fn run(args: Args) -> Result<i32> {
             .canonicalize()
             .unwrap_or_else(|_| repo_root.clone())
     } else {
-        let worktree_path = repo_root
-            .join(".claude")
-            .join("worktrees")
-            .join(sanitize_name(&args.name));
-        ensure_worktree(&worktree_path, &args.name, &repo_root)?;
-        worktree_path
-            .canonicalize()
-            .unwrap_or_else(|_| worktree_path.clone())
+        let worktree = worktree_path(&repo_root, &name);
+        ensure_worktree(&worktree, &name, &repo_root)?;
+        worktree.canonicalize().unwrap_or_else(|_| worktree.clone())
     };
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let session = SandboxSession::start(&canonical, Some(&repo_root))?;
+    let session = SandboxSession::start(&canonical, Some(&repo_root), &mode)?;
 
     if args.show_policy {
         println!("{}", session.describe(&canonical, Some(&repo_root))?);
@@ -290,7 +289,7 @@ pub fn run(args: Args) -> Result<i32> {
     let sandbox_notice = format!(
         "You are running in a git worktree sandbox for branch '{}'. \
          You may only write files under: {}. {}",
-        args.name,
+        name,
         canonical.display(),
         session.notice()
     );
@@ -300,7 +299,7 @@ pub fn run(args: Args) -> Result<i32> {
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
     }
-    let session_id = add_session_args(&mut cmd, args.resume, &args.name)?;
+    let session_id = add_session_args(&mut cmd, args.resume, &name)?;
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(
@@ -309,7 +308,7 @@ pub fn run(args: Args) -> Result<i32> {
         Some(&repo_root),
         args.test_sandbox_breakage,
     );
-    apply_path_prepend(&mut cmd, mode_config, &canonical, Some(&repo_root))?;
+    apply_path_prepend(&mut cmd, &mode, mode_config, &canonical, Some(&repo_root))?;
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -320,18 +319,16 @@ pub fn run(args: Args) -> Result<i32> {
         record_resume_command(
             &handoff,
             &session_id,
-            &resume_command(None, explicit_mode.as_deref(), &session_id, &args.name),
+            &resume_command(None, explicit_mode.as_deref(), &session_id, &name),
             &canonical,
             Some(&repo_root),
+            &mode,
         );
     }
 
     if !in_place {
-        let worktree_path = repo_root
-            .join(".claude")
-            .join("worktrees")
-            .join(sanitize_name(&args.name));
-        if let Err(e) = post_exit_menu(&args.name, &worktree_path, &repo_root) {
+        let worktree = worktree_path(&repo_root, &name);
+        if let Err(e) = post_exit_menu(&name, &worktree, &repo_root) {
             eprintln!("wtclaude: warning: post-exit menu: {e}");
         }
     }
@@ -407,7 +404,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let session = SandboxSession::start(&canonical, Some(&repo_root))?;
+    let session = SandboxSession::start(&canonical, Some(&repo_root), &mode)?;
 
     if args.show_policy {
         // Printed to stderr, not stdout, so it never mixes into `claude
@@ -444,7 +441,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(&mut cmd, &canonical, Some(&repo_root), None);
-    apply_path_prepend(&mut cmd, mode_config, &canonical, Some(&repo_root))?;
+    apply_path_prepend(&mut cmd, &mode, mode_config, &canonical, Some(&repo_root))?;
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -572,7 +569,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let session = SandboxSession::start(&canonical, repo_root.as_deref())?;
+    let session = SandboxSession::start(&canonical, repo_root.as_deref(), &mode)?;
 
     if args.show_policy {
         println!("{}", session.describe(&canonical, repo_root.as_deref())?);
@@ -608,7 +605,13 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         repo_root.as_deref(),
         args.test_sandbox_breakage,
     );
-    apply_path_prepend(&mut cmd, mode_config, &canonical, repo_root.as_deref())?;
+    apply_path_prepend(
+        &mut cmd,
+        &mode,
+        mode_config,
+        &canonical,
+        repo_root.as_deref(),
+    )?;
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -622,6 +625,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
                 &resume_command(Some("path"), explicit_mode.as_deref(), &session_id, target),
                 &canonical,
                 repo_root.as_deref(),
+                &mode,
             ),
             None => {
                 eprintln!(
@@ -729,8 +733,9 @@ fn resume_handoff_file() -> Option<PathBuf> {
 /// nothing to resume. Warns on stderr, and writes nothing, when the
 /// transcript lookup fails, when `handoff` isn't an existing regular file
 /// (a symlink is refused rather than followed), when the session's plan
-/// (recomputed from `sandbox_root` and `repo_root`, allowlist included, as
-/// the hook does for every Bash call) could have written or replaced it, or
+/// (recomputed from `sandbox_root`, `repo_root` and the resolved `mode`,
+/// whose allowlist joins the top-level one, as the hook does for every Bash
+/// call) could have written or replaced it, or
 /// when the write itself fails. On any of those, `handoff` is also
 /// deleted, so the wrapper finds nothing a session may have planted there. That leaves a race when the state directory is inside the
 /// session's sandbox: a sandboxed background process outliving the session
@@ -742,6 +747,7 @@ fn record_resume_command(
     command: &str,
     sandbox_root: &Path,
     repo_root: Option<&Path>,
+    mode: &str,
 ) {
     match crate::sessions::session_exists(session_id) {
         Ok(true) => {}
@@ -752,7 +758,7 @@ fn record_resume_command(
             return;
         }
     }
-    if let Err(e) = write_handoff(handoff, command, sandbox_root, repo_root) {
+    if let Err(e) = write_handoff(handoff, command, sandbox_root, repo_root, mode) {
         eprintln!(
             "wtclaude: warning: not adding the resume command to history: {}: {e:#}",
             handoff.display()
@@ -783,6 +789,7 @@ fn write_handoff(
     command: &str,
     sandbox_root: &Path,
     repo_root: Option<&Path>,
+    mode: &str,
 ) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
@@ -799,7 +806,7 @@ fn write_handoff(
         );
     }
     let file = parent.join(handoff.file_name().context("has no file name")?);
-    let plan = sandbox::plan(sandbox_root, repo_root).context("computing the session's plan")?;
+    let plan = sandbox::plan(sandbox_root, repo_root, Some(mode)).context("computing the session's plan")?;
     if plan.grants_write(&file) {
         bail!(
             "the session could write {}, so its contents can't be trusted; set \
@@ -892,6 +899,82 @@ fn directory_label(canonical: &Path) -> String {
 fn sanitize_name(name: &str) -> String {
     // claude replaces '/' with '+' in worktree directory names
     name.replace('/', "+")
+}
+
+fn worktree_path(repo_root: &Path, name: &str) -> PathBuf {
+    repo_root
+        .join(".claude")
+        .join("worktrees")
+        .join(sanitize_name(name))
+}
+
+/// Cleans `raw` into a branch name git accepts, announcing any change on
+/// stderr. Bails if the result is empty or git still rejects it.
+fn branch_name(raw: &str) -> Result<String> {
+    let clean = sanitize_branch_name(raw);
+    if clean.is_empty() {
+        bail!("'{raw}' has no characters usable in a branch name");
+    }
+    // git's stderr only repeats "'<name>' is not a valid branch name".
+    let output = Command::new("git")
+        .args(["check-ref-format", "--branch", &clean])
+        .output()
+        .context("running git check-ref-format")?;
+    if !output.status.success() {
+        let from = if clean == raw {
+            String::new()
+        } else {
+            format!(" (from '{raw}')")
+        };
+        bail!("'{clean}'{from} is not a valid branch name");
+    }
+    if clean != raw {
+        eprintln!("wtclaude: using branch '{clean}' (from '{raw}')");
+    }
+    Ok(clean)
+}
+
+/// Keeps only ASCII alphanumerics, `_`, `-`, `.` and `/` (as a path
+/// separator); every other character is deleted. Surrounding whitespace is
+/// trimmed and inner whitespace runs become `-`. Runs of the same separator
+/// collapse to one (`--` -> `-`, `..` -> `.`, but `-_` stays). Each path
+/// component loses leading and trailing `.` and a trailing `.lock`, empty
+/// components are dropped, and a leading `-` is trimmed. These rules repeat
+/// until stable, since one removal can expose another (`a.lock.` -> `a`).
+/// Not everything git rejects is caught: `HEAD` passes through.
+fn sanitize_branch_name(raw: &str) -> String {
+    let mut name = String::with_capacity(raw.len());
+    for c in raw.trim().chars() {
+        let c = if c.is_whitespace() { '-' } else { c };
+        let separator = matches!(c, '_' | '-' | '.' | '/');
+        if !(c.is_ascii_alphanumeric() || separator) || (separator && name.ends_with(c)) {
+            continue;
+        }
+        name.push(c);
+    }
+    loop {
+        let next = name
+            .split('/')
+            .map(|part| {
+                let mut part = part;
+                loop {
+                    let trimmed = part.trim_matches('.');
+                    let trimmed = trimmed.strip_suffix(".lock").unwrap_or(trimmed);
+                    if trimmed == part {
+                        return part;
+                    }
+                    part = trimmed;
+                }
+            })
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        let next = next.trim_start_matches(['-', '/']).to_string();
+        if next == name {
+            return name;
+        }
+        name = next;
+    }
 }
 
 fn offer_git_init(dir: &Path) -> Result<bool> {
@@ -1330,7 +1413,13 @@ impl Drop for TmuxWindowName {
         match &state.restore {
             TmuxRestore::AutoRename => {
                 if let Err(e) = Command::new("tmux")
-                    .args(["set-window-option", "-t", &state.pane, "automatic-rename", "on"])
+                    .args([
+                        "set-window-option",
+                        "-t",
+                        &state.pane,
+                        "automatic-rename",
+                        "on",
+                    ])
                     .status()
                 {
                     eprintln!("wtclaude: warning: tmux set automatic-rename on: {e}");
@@ -1497,6 +1586,88 @@ mod tests {
         assert!(groups[2].starts_with('4'));
         assert!("89ab".contains(&groups[3][..1]));
         assert_ne!(id, new_session_id().unwrap());
+    }
+
+    #[test]
+    fn sanitize_branch_name_cleans_names_git_rejects() {
+        let cases = [
+            ("this!is%silly...", "thisissilly"),
+            ("fix the bug", "fix-the-bug"),
+            (" fix the bug ", "fix-the-bug"),
+            ("fix \t the  bug", "fix-the-bug"),
+            ("\tfix\n", "fix"),
+            ("a--b", "a-b"),
+            ("a___b", "a_b"),
+            ("a-_b", "a-_b"),
+            ("a-!-b", "a-b"),
+            ("a - b", "a-b"),
+            ("a..b", "a.b"),
+            ("v1.2", "v1.2"),
+            ("a.lock", "a"),
+            ("a.lock.", "a"),
+            ("a.lock.lock", "a"),
+            (".a", "a"),
+            ("a.", "a"),
+            ("a/.b", "a/b"),
+            ("a.lock/b", "a/b"),
+            ("trailing...", "trailing"),
+            ("-.a", "a"),
+            ("a:b~c^d?e*f[g\\h", "abcdefgh"),
+            ("a\u{7}b", "ab"),
+            ("a@{b", "ab"),
+            ("a//b", "a/b"),
+            ("/a/", "a"),
+            ("-a", "a"),
+            ("/-a", "a"),
+            ("-/a", "a"),
+            ("héllo", "hllo"),
+            ("???", ""),
+            ("../..", ""),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(sanitize_branch_name(raw), want, "input {raw:?}");
+            if !want.is_empty() {
+                let ok = Command::new("git")
+                    .args(["check-ref-format", "--branch", want])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success();
+                assert!(ok, "git rejects {want:?} (from {raw:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_branch_name_leaves_valid_names_alone() {
+        for name in [
+            "earlye/699c21e6a5d1/foo",
+            "main",
+            "fix-the-bug",
+            "feature_x-1",
+            "v1.2",
+            "a-_b",
+        ] {
+            assert_eq!(sanitize_branch_name(name), name);
+        }
+    }
+
+    #[test]
+    fn branch_name_bails_when_nothing_usable_is_left() {
+        let err = branch_name("???").unwrap_err().to_string();
+        assert_eq!(err, "'???' has no characters usable in a branch name");
+    }
+
+    #[test]
+    fn branch_name_returns_the_cleaned_name() {
+        assert_eq!(branch_name("fix the bug").unwrap(), "fix-the-bug");
+    }
+
+    #[test]
+    fn branch_name_reports_names_git_still_rejects() {
+        let err = branch_name("HEAD").unwrap_err().to_string();
+        assert!(err.contains("'HEAD'"), "{err}");
+        assert!(!err.contains("no characters usable"), "{err}");
     }
 
     #[test]
