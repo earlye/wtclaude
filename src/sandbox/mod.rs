@@ -216,18 +216,19 @@ fn candidates_names() -> Vec<&'static str> {
 }
 
 /// Computes the writable path set for a session. `repo_root` is `None` for
-/// `wtclaude path` against a directory outside any git repo.
+/// `wtclaude path` against a directory outside any git repo. `mode` is the
+/// session's mode, whose own `allowlist` (if any) joins the top-level one.
 ///
 /// Derived fresh per Bash call rather than cached at launch: it costs single
 /// digit milliseconds against a hook that already pays a process spawn, and
 /// Landlock rules need a path that already exists, so a cache dir created
 /// mid-session can only become writable if the plan is recomputed.
-pub fn plan(sandbox_root: &Path, repo_root: Option<&Path>) -> Result<Plan> {
+pub fn plan(sandbox_root: &Path, repo_root: Option<&Path>, mode: Option<&str>) -> Result<Plan> {
     let home = std::env::var("HOME").context("HOME not set")?;
     let tmpdir = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
 
     let user_config = config::load_user()?;
-    let (write_globs, literal_allow) = partition_allowlist(&user_config.allowlist, &home);
+    let (write_globs, literal_allow) = partition_allowlist(&user_config.allowlist_for(mode), &home);
 
     let raw: Vec<PathBuf> = [sandbox_root.to_path_buf(), PathBuf::from("/tmp")]
         .into_iter()
@@ -481,7 +482,7 @@ pub(crate) mod tests {
     #[test]
     fn plan_includes_the_sandbox_root_and_the_temp_dirs() {
         let sandbox = unique_test_dir("plan-sandbox-root");
-        let plan = plan(&sandbox, None).unwrap();
+        let plan = plan(&sandbox, None, None).unwrap();
         assert_eq!(plan.sandbox_root, sandbox);
         assert!(plan.write_subtrees.contains(&sandbox));
         assert!(
@@ -498,7 +499,7 @@ pub(crate) mod tests {
         // plan without this makes `git commit` fail with "failed to write
         // commit object", which points nowhere near the sandbox.
         let sandbox = unique_test_dir("plan-gnupg");
-        let plan = plan(&sandbox, None).unwrap();
+        let plan = plan(&sandbox, None, None).unwrap();
         let home = std::env::var("HOME").unwrap();
         let gnupg = config::resolve_existing_prefix(&PathBuf::from(&home).join(".gnupg"));
         assert!(
@@ -523,8 +524,8 @@ pub(crate) mod tests {
                 .success()
         );
 
-        let with_repo = plan(&sandbox, Some(&repo_root)).unwrap();
-        let without_repo = plan(&sandbox, None).unwrap();
+        let with_repo = plan(&sandbox, Some(&repo_root), None).unwrap();
+        let without_repo = plan(&sandbox, None, None).unwrap();
 
         std::fs::remove_dir_all(&repo_root).unwrap();
         std::fs::remove_dir_all(&sandbox).unwrap();
@@ -582,7 +583,7 @@ pub(crate) mod tests {
         // session, so the scratch dir deliberately lives outside every
         // granted subtree.
         let sandbox = unique_test_dir("session-dir-plan");
-        let plan = plan(&sandbox, None).unwrap();
+        let plan = plan(&sandbox, None, None).unwrap();
         let session = SessionDir::create().unwrap();
         let path = session.path().to_path_buf();
 

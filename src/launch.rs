@@ -24,24 +24,27 @@ use crate::sandbox;
 struct SandboxSession {
     backend: Box<dyn sandbox::Backend>,
     dir: sandbox::SessionDir,
+    /// The session's mode, whose `allowlist` joins the top-level one.
+    mode: String,
 }
 
 impl SandboxSession {
     /// Picks a backend and reports anything it cannot enforce. Fails if no
     /// backend on this machine can confine writes at all, rather than
     /// launching a session that only looks sandboxed.
-    fn start(sandbox_root: &Path, repo_root: Option<&Path>) -> Result<Self> {
+    fn start(sandbox_root: &Path, repo_root: Option<&Path>, mode: &str) -> Result<Self> {
         let preference = config::load_user()?.backend_preference();
         let (backend, caveat) = sandbox::select(&preference)?;
         if let Some(caveat) = caveat {
             eprintln!("wtclaude: warning: {caveat}");
         }
-        for unhonored in backend.unhonored(&sandbox::plan(sandbox_root, repo_root)?) {
+        for unhonored in backend.unhonored(&sandbox::plan(sandbox_root, repo_root, Some(mode))?) {
             eprintln!("wtclaude: warning: {unhonored}");
         }
         Ok(Self {
             backend,
             dir: sandbox::SessionDir::create()?,
+            mode: mode.to_string(),
         })
     }
 
@@ -49,7 +52,7 @@ impl SandboxSession {
     fn describe(&self, sandbox_root: &Path, repo_root: Option<&Path>) -> Result<String> {
         Ok(self
             .backend
-            .describe(&sandbox::plan(sandbox_root, repo_root)?))
+            .describe(&sandbox::plan(sandbox_root, repo_root, Some(&self.mode))?))
     }
 
     /// The sandbox notice for `--append-system-prompt`: what is true of every
@@ -74,6 +77,7 @@ impl SandboxSession {
         breakage: Option<SandboxBreakage>,
     ) {
         cmd.env("WTCLAUDE_SANDBOX", sandbox_root);
+        cmd.env("WTCLAUDE_MODE", &self.mode);
         match repo_root {
             Some(repo_root) => cmd.env("WTCLAUDE_REPO_ROOT", repo_root),
             None => cmd.env_remove("WTCLAUDE_REPO_ROOT"),
@@ -109,6 +113,7 @@ impl SandboxSession {
 /// security boundary — except one containing `:`, which `PATH` cannot hold.
 fn apply_path_prepend(
     cmd: &mut Command,
+    mode_name: &str,
     mode: &config::Mode,
     sandbox_root: &Path,
     repo_root: Option<&Path>,
@@ -118,7 +123,7 @@ fn apply_path_prepend(
     }
     let home = std::env::var("HOME").context("HOME not set")?;
     let entries = mode.expanded_path_prepend(&home);
-    let plan = sandbox::plan(sandbox_root, repo_root)?;
+    let plan = sandbox::plan(sandbox_root, repo_root, Some(mode_name))?;
     for warning in path_prepend_warnings(&entries, &plan.write_subtrees) {
         eprintln!("wtclaude: warning: {warning}");
     }
@@ -265,7 +270,7 @@ pub fn run(args: Args) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let session = SandboxSession::start(&canonical, Some(&repo_root))?;
+    let session = SandboxSession::start(&canonical, Some(&repo_root), &mode)?;
 
     if args.show_policy {
         println!("{}", session.describe(&canonical, Some(&repo_root))?);
@@ -301,7 +306,7 @@ pub fn run(args: Args) -> Result<i32> {
         Some(&repo_root),
         args.test_sandbox_breakage,
     );
-    apply_path_prepend(&mut cmd, mode_config, &canonical, Some(&repo_root))?;
+    apply_path_prepend(&mut cmd, &mode, mode_config, &canonical, Some(&repo_root))?;
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -387,7 +392,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let session = SandboxSession::start(&canonical, Some(&repo_root))?;
+    let session = SandboxSession::start(&canonical, Some(&repo_root), &mode)?;
 
     if args.show_policy {
         // Printed to stderr, not stdout, so it never mixes into `claude
@@ -424,7 +429,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
     session.apply_env(&mut cmd, &canonical, Some(&repo_root), None);
-    apply_path_prepend(&mut cmd, mode_config, &canonical, Some(&repo_root))?;
+    apply_path_prepend(&mut cmd, &mode, mode_config, &canonical, Some(&repo_root))?;
     if let Some(p) = prompt {
         cmd.arg(p);
     }
@@ -551,7 +556,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
 
     let binary_path = std::env::current_exe().context("resolving binary path")?;
     let _settings = write_hook_settings(&binary_path)?;
-    let session = SandboxSession::start(&canonical, repo_root.as_deref())?;
+    let session = SandboxSession::start(&canonical, repo_root.as_deref(), &mode)?;
 
     if args.show_policy {
         println!("{}", session.describe(&canonical, repo_root.as_deref())?);
@@ -591,7 +596,13 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         repo_root.as_deref(),
         args.test_sandbox_breakage,
     );
-    apply_path_prepend(&mut cmd, mode_config, &canonical, repo_root.as_deref())?;
+    apply_path_prepend(
+        &mut cmd,
+        &mode,
+        mode_config,
+        &canonical,
+        repo_root.as_deref(),
+    )?;
     if let Some(p) = prompt {
         cmd.arg(p);
     }

@@ -242,8 +242,9 @@ fn restrict(plan: &Plan) -> Result<()> {
 /// Runs a command under the sandbox described by the current environment.
 ///
 /// Invoked by the `PreToolUse` hook as
-/// `wtclaude sandbox -- /bin/bash -c '<command>'`. Reads the sandbox root and
-/// repo root from `WTCLAUDE_SANDBOX` / `WTCLAUDE_REPO_ROOT` rather than argv,
+/// `wtclaude sandbox -- /bin/bash -c '<command>'`. Reads the sandbox root,
+/// repo root and mode from `WTCLAUDE_SANDBOX` / `WTCLAUDE_REPO_ROOT` /
+/// `WTCLAUDE_MODE` rather than argv,
 /// since those are already exported to every child of the session.
 #[derive(Parser)]
 pub struct SandboxArgs {
@@ -271,8 +272,18 @@ pub fn run_sandbox(args: SandboxArgs) -> Result<i32> {
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    // Comes from the launcher's env like WTCLAUDE_SANDBOX. A sandboxed
+    // command that re-runs this wrapper with another mode gains nothing:
+    // Landlock domains only stack, so the new one can only narrow.
+    let mode = std::env::var("WTCLAUDE_MODE")
+        .ok()
+        .filter(|s| !s.is_empty());
 
-    let plan = super::plan(Path::new(&sandbox_root), repo_root.as_deref())?;
+    let plan = super::plan(
+        Path::new(&sandbox_root),
+        repo_root.as_deref(),
+        mode.as_deref(),
+    )?;
 
     if args.describe {
         print!("{}", Landlock.describe(&plan));
@@ -359,7 +370,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("wtclaude-test-confine-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let plan = super::super::plan(&dir, None).unwrap();
+        let plan = super::super::plan(&dir, None, None).unwrap();
 
         let wrapped = Landlock.confine(&plan, "echo it's fine", &dir).unwrap();
 
@@ -378,7 +389,7 @@ mod tests {
     fn confine_refuses_when_the_session_dir_is_gone() {
         let dir = std::env::temp_dir().join("wtclaude-test-confine-absent-session-dir");
         let _ = std::fs::remove_dir_all(&dir);
-        let plan = super::super::plan(Path::new("/tmp"), None).unwrap();
+        let plan = super::super::plan(Path::new("/tmp"), None, None).unwrap();
 
         let err = Landlock.confine(&plan, "echo hi", &dir).unwrap_err();
         assert!(err.to_string().contains("session dir"), "error: {err}");
