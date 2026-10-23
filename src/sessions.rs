@@ -158,5 +158,5 @@ fn projects_dir() -> Result<PathBuf> {
 }
 
 fn path_to_slug(path: &std::path::Path) -> String {
-    path.to_string_lossy().replace('/', "-").replace('.', "-")
+    path.to_string_lossy().replace(['/', '.'], "-")
 }
