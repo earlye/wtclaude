@@ -220,6 +220,7 @@ impl Args {
 
 pub fn run(args: Args) -> Result<i32> {
     let prompt = args.prompt();
+    let explicit_mode = args.mode.clone();
     let config = config::load()?;
     let mode = args
         .mode
@@ -295,9 +296,17 @@ pub fn run(args: Args) -> Result<i32> {
         cmd.arg(flag);
     }
     // A resumed session keeps its existing name (including any `/rename`).
-    match args.resume {
-        Some(session_id) => cmd.arg("--resume").arg(session_id),
-        None => cmd.arg("--name").arg(&args.name),
+    let session_id = match args.resume {
+        Some(session_id) => {
+            cmd.arg("--resume").arg(&session_id);
+            session_id
+        }
+        None => {
+            let session_id = new_session_id()?;
+            cmd.arg("--session-id").arg(&session_id);
+            cmd.arg("--name").arg(&args.name);
+            session_id
+        }
     };
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
@@ -314,6 +323,10 @@ pub fn run(args: Args) -> Result<i32> {
 
     let status = cmd.status().context("launching claude")?;
     let exit_code = status.code().unwrap_or(1);
+    record_resume_command(
+        &session_id,
+        &resume_command(None, explicit_mode.as_deref(), &session_id, &args.name),
+    );
 
     if !in_place {
         let worktree_path = repo_root
@@ -505,6 +518,7 @@ impl PathArgs {
 /// without a surrounding git repo and sandboxes exactly `args.directory`.
 pub fn run_path(args: PathArgs) -> Result<i32> {
     let prompt = args.prompt();
+    let explicit_mode = args.mode.clone();
     let config = config::load()?;
     let mode = args
         .mode
@@ -588,9 +602,17 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         cmd.arg(flag);
     }
     // A resumed session keeps its existing name (including any `/rename`).
-    match args.resume {
-        Some(session_id) => cmd.arg("--resume").arg(session_id),
-        None => cmd.arg("--name").arg(&label),
+    let session_id = match args.resume {
+        Some(session_id) => {
+            cmd.arg("--resume").arg(&session_id);
+            session_id
+        }
+        None => {
+            let session_id = new_session_id()?;
+            cmd.arg("--session-id").arg(&session_id);
+            cmd.arg("--name").arg(&label);
+            session_id
+        }
     };
     cmd.arg("--settings").arg(&_settings.0);
     cmd.arg("--append-system-prompt").arg(&sandbox_notice);
@@ -606,7 +628,96 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
     }
 
     let status = cmd.status().context("launching claude")?;
+    record_resume_command(
+        &session_id,
+        &resume_command(
+            Some("path"),
+            explicit_mode.as_deref(),
+            &session_id,
+            &canonical.to_string_lossy(),
+        ),
+    );
     Ok(status.code().unwrap_or(1))
+}
+
+/// Where the shell wrapper (see `wtclaude --completions`) looks for the
+/// resume command line; keyed by the wrapper's own PID, which it passes in
+/// as `WTCLAUDE_PPID`.
+pub(crate) const RESUME_FILE_PREFIX: &str = "/tmp/wtclaude-last-session-";
+
+/// A random (v4) UUID for `claude --session-id`, so the resume command is
+/// known up front instead of guessed from session-file mtimes afterwards.
+fn new_session_id() -> Result<String> {
+    use std::io::Read;
+    let mut b = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .context("reading /dev/urandom for a session id")?;
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
+/// The command line that resumes `session_id` against `target` (a branch,
+/// or a directory under `subcommand` `path`). Initial-prompt words are
+/// deliberately absent: a resumed session doesn't need them.
+fn resume_command(
+    subcommand: Option<&str>,
+    mode: Option<&str>,
+    session_id: &str,
+    target: &str,
+) -> String {
+    let mut words = vec!["wtclaude"];
+    words.extend(subcommand);
+    if let Some(mode) = mode {
+        words.extend(["--mode", mode]);
+    }
+    words.extend(["--resume", session_id, target]);
+    words
+        .iter()
+        .map(|w| shell_quote(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:+@%=,".contains(c));
+    if safe {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// Hands the resume command to the shell wrapper, which injects it into
+/// history. Does nothing outside the wrapper (no `WTCLAUDE_PPID`), or when
+/// the session was exited before any message created its transcript —
+/// there would be nothing to resume.
+fn record_resume_command(session_id: &str, command: &str) {
+    let Ok(ppid) = std::env::var("WTCLAUDE_PPID") else {
+        return;
+    };
+    if ppid.is_empty() || !ppid.chars().all(|c| c.is_ascii_digit()) {
+        return;
+    }
+    if !crate::sessions::session_exists(session_id) {
+        return;
+    }
+    let path = format!("{RESUME_FILE_PREFIX}{ppid}");
+    if let Err(e) = std::fs::write(&path, format!("{command}\n")) {
+        eprintln!("wtclaude: warning: writing {path}: {e}");
+    }
 }
 
 /// Rejects a canonicalized DIRECTORY that would make the sandbox a no-op:
@@ -1232,6 +1343,53 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_command_for_branch_mode() {
+        assert_eq!(
+            resume_command(None, None, "abc-123", "feat/x"),
+            "wtclaude --resume abc-123 feat/x"
+        );
+    }
+
+    #[test]
+    fn resume_command_for_path_mode_keeps_the_subcommand_and_mode() {
+        assert_eq!(
+            resume_command(Some("path"), Some("fast"), "abc-123", "/home/me/proj"),
+            "wtclaude path --mode fast --resume abc-123 /home/me/proj"
+        );
+    }
+
+    #[test]
+    fn resume_command_drops_the_initial_prompt() {
+        let parsed = Args::try_parse_from(["wtclaude", "feat/x", "do", "the", "thing"]).unwrap();
+        assert_eq!(
+            resume_command(None, None, "abc-123", &parsed.name),
+            "wtclaude --resume abc-123 feat/x"
+        );
+    }
+
+    #[test]
+    fn resume_command_quotes_words_the_shell_would_split_or_expand() {
+        assert_eq!(
+            resume_command(Some("path"), None, "abc", "/tmp/my dir/it's $HOME"),
+            r"wtclaude path --resume abc '/tmp/my dir/it'\''s $HOME'"
+        );
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn new_session_id_is_a_v4_uuid() {
+        let id = new_session_id().unwrap();
+        let groups: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            groups.iter().map(|g| g.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(groups[2].starts_with('4'));
+        assert!("89ab".contains(&groups[3][..1]));
+        assert_ne!(id, new_session_id().unwrap());
+    }
 
     #[test]
     fn prepend_to_path_puts_entries_first_in_order() {

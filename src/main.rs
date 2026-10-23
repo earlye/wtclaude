@@ -47,12 +47,13 @@ fn main() {
     if first == Some("--completions") {
         match raw_args.get(2).map(|s| s.as_str()) {
             Some("zsh") => print_completions_zsh(),
+            Some("bash") => print_completions_bash(),
             Some(other) => {
-                eprintln!("unsupported shell: {}. Supported: zsh", other);
+                eprintln!("unsupported shell: {}. Supported: zsh, bash", other);
                 std::process::exit(1);
             }
             None => {
-                eprintln!("usage: wtclaude --completions zsh");
+                eprintln!("usage: wtclaude --completions zsh|bash");
                 std::process::exit(1);
             }
         }
@@ -148,8 +149,8 @@ fn main() {
 
 /// Lists the other subcommands (name + about, pulled live from `Commands`)
 /// so `wtclaude --help` documents the full command surface without
-/// hand-duplicating it — the one exception is `--completions zsh`, which
-/// isn't a `Commands` variant (it's intercepted before clap ever runs).
+/// hand-duplicating it — the one exception is `--completions`, which isn't
+/// a `Commands` variant (it's intercepted before clap ever runs).
 fn build_after_help() -> String {
     let entries: Vec<(String, String)> = Cli::command()
         .get_subcommands()
@@ -160,8 +161,8 @@ fn build_after_help() -> String {
             )
         })
         .chain(std::iter::once((
-            "--completions zsh".to_string(),
-            "Print the zsh completion script".to_string(),
+            "--completions zsh|bash".to_string(),
+            "Print the shell completion script and history wrapper".to_string(),
         )))
         .collect();
     let width = entries
@@ -178,7 +179,28 @@ fn build_after_help() -> String {
     help
 }
 
+/// Wraps `wtclaude` so that, once a session ends, its resume command is
+/// pushed onto the shell's history (`print -s` in zsh, `history -s` in
+/// bash): the binary writes the full command line to a file keyed by the
+/// shell's PID, and the wrapper reads, deletes, and injects it.
+fn print_history_wrapper(push_history: &str) {
+    let prefix = launch::RESUME_FILE_PREFIX;
+    print!(
+        r#"
+wtclaude() {{
+  WTCLAUDE_PPID=$$ command wtclaude "$@"
+  local rc=$? _wt_resume _wt_file="{prefix}$$"
+  _wt_resume="$(cat "$_wt_file" 2>/dev/null)"
+  rm -f "$_wt_file"
+  [[ -n $_wt_resume ]] && {push_history} "$_wt_resume"
+  return $rc
+}}
+"#
+    );
+}
+
 fn print_completions_zsh() {
+    print_history_wrapper("print -s --");
     print!(
         r#"
 _wtclaude_sessions() {{
@@ -235,6 +257,25 @@ _wtclaude() {{
 }}
 
 compdef _wtclaude wtclaude
+"#
+    );
+}
+
+fn print_completions_bash() {
+    print_history_wrapper("history -s --");
+    print!(
+        r#"
+_wtclaude() {{
+  local cur=${{COMP_WORDS[COMP_CWORD]}} prev=${{COMP_WORDS[COMP_CWORD-1]}}
+  local IFS=$'\n'
+  case $prev in
+    --resume) COMPREPLY=($(compgen -W "$(wtclaude sessions 2>/dev/null | cut -f1)" -- "$cur")) ;;
+    --mode) COMPREPLY=($(compgen -W "$(wtclaude modes 2>/dev/null)" -- "$cur")) ;;
+    *) COMPREPLY=($(compgen -W "$(wtclaude worktrees 2>/dev/null)" -- "$cur")) ;;
+  esac
+}}
+
+complete -F _wtclaude wtclaude
 "#
     );
 }

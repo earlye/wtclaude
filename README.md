@@ -181,7 +181,7 @@ cp target/release/wtclaude /usr/local/bin/
 The binary must be on your `PATH`. The optional config file
 (`wtclaude.yml`) is looked up next to the binary at runtime.
 
-### Zsh completion
+### Shell completion and resume history
 
 Add one line to `~/.zshrc`:
 
@@ -189,9 +189,24 @@ Add one line to `~/.zshrc`:
 eval "$(wtclaude --completions zsh)"
 ```
 
-Once loaded, `wtclaude --resume <TAB>` lists recent sessions (showing
-worktree and date). After selecting a session ID, pressing `<TAB>` on the
-next word auto-fills the matching worktree name.
+or, for bash, to `~/.bashrc`:
+
+```bash
+eval "$(wtclaude --completions bash)"
+```
+
+Once loaded, `wtclaude --resume <TAB>` lists recent sessions (zsh shows
+worktree and date). In zsh, after selecting a session ID, pressing
+`<TAB>` on the next word auto-fills the matching worktree name.
+
+The script also defines a `wtclaude` shell function wrapping the binary.
+When a session ends, it pushes the command that resumes that session
+onto your shell history, so pressing up-arrow offers e.g.
+`wtclaude --resume <session-id> my-feature` (or `wtclaude path --resume
+<session-id> <dir>` for path mode). Initial-prompt words are left out.
+Nothing is added if the session ended before any message was sent. The
+binary hands the command over in `/tmp/wtclaude-last-session-<shell
+PID>`, and the function deletes that file after reading it.
 
 
 ## Usage

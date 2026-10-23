@@ -120,6 +120,21 @@ pub fn run_session_worktree(session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether Claude has written a transcript for `session_id` under any
+/// project — Claude only creates it once the first message is sent.
+pub fn session_exists(session_id: &str) -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+    let projects_dir = PathBuf::from(home).join(".claude").join("projects");
+    let Ok(entries) = std::fs::read_dir(projects_dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.path().join(format!("{session_id}.jsonl")).exists())
+}
+
 fn path_to_slug(path: &std::path::Path) -> String {
     path.to_string_lossy()
         .replace('/', "-")
