@@ -90,3 +90,15 @@ leaving the session to find out when it pushes.
   set
 - `~/.claude/skills/md-issue-tmux/SKILL.md`: launches sessions with
   `tmux new-window`, which inherits the tmux server's environment
+
+## Grill Log
+
+### 2026-10-23
+
+- Q: Does the newly installed `startish` resolve this? — A: Partly. `startish`
+  runs its command in an interactive login shell, and `~/.bashrc` starts an
+  agent there, so anything launched as `startish -- …` gets one. But
+  `~/.claude/skills/md-issue-tmux/SKILL.md` still runs `tmux new-window` with
+  `wtclaude` directly, and the tmux server still has `-SSH_AUTH_SOCK`, so
+  sessions opened with `/md-issue-tmux` still have no agent until that skill
+  launches through `startish`. That's a skill change, outside this repository.
