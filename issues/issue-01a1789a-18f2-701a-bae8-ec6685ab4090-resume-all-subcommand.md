@@ -9,8 +9,9 @@ layout `src` uses. You run it after a power loss or reboot. The skill is
 deterministic, so Early wants it moved into wtclaude as a subcommand. The
 skill is deleted once this ships.
 
-The spec is the skill itself, and every caveat in it came from a real
-run. It exists only on the skills branch `earlye/a411e1ea53d2/md-issue-resume`:
+The skill was the original spec, and every caveat in it came from a real
+run. Where this file departs from it (window launch via `src`, no seeded
+prompt, the dropped resolved-issue filter), this file wins. The skill exists only on the skills branch `earlye/a411e1ea53d2/md-issue-resume`:
 
 - `~/Documents/github.com/earlye/skills/.claude/worktrees/earlye+a411e1ea53d2+md-issue-resume/skills/resume-tmux/SKILL.md`
 - `~/Documents/github.com/earlye/skills/.claude/worktrees/earlye+a411e1ea53d2+md-issue-resume/skills/resume-tmux/launch-window.sh`
@@ -19,8 +20,7 @@ Requested by the skills-secretary session for Early, 2026-10-26.
 
 ## Behaviour
 
-`--dry-run` prints the same report without creating tmux sessions or
-windows.
+`--dry-run` prints the same report without calling `src window`.
 
 1. **Discover worktrees from transcripts.**
    - Read `projects_dir()/*--claude-worktrees-*/*.jsonl`, top-level files
@@ -120,7 +120,8 @@ wtclaude's side:
 - **DIR:** the **repo root**. Started inside a worktree, wtclaude would
   nest `.claude/worktrees/`.
 - **NAME:** the branch.
-- **ARGV:** `<startish> --history "wtclaude --no-pull <branch>" -- wtclaude --no-pull --resume <sid> <branch>`.
+- **ARGV:** `<startish> --history "wtclaude --no-pull <branch>" -- wtclaude --no-pull --resume <sid> <branch>`,
+  or `… -- wtclaude --no-pull <branch>` for a worktree with no transcript.
   - Resolve `startish` to an absolute path before launching. The window
     gets the tmux server's environment, which may not have
     `~/.cargo/bin`.
