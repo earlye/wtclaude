@@ -13,6 +13,18 @@ session, the launch, and the report. `resume` keeps only one repo.
 `--dry-run` behaves the same as on `resume-all`. That is an inference;
 the request didn't mention it.
 
+## Decisions (Early, 2026-10-26)
+
+- **Current repository:** found with
+  `git rev-parse --git-common-dir --show-toplevel`.
+  - Inside a worktree the two outputs differ. `--git-common-dir` points
+    at the main repo's `.git`, and its parent is the main repo root.
+  - In the root checkout, both outputs give that same root.
+- **The branch-name collision is accepted.** Under the `md-issue-track`
+  and `initiative` naming conventions (`<handle>/<id>/<slug>`), `resume`
+  is an unlikely branch name. Make it a subcommand, not a `resume-all`
+  flag.
+
 ## Design notes
 
 - **"Current repository" must mean the main repo root, not the worktree
