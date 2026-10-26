@@ -301,7 +301,7 @@ fn snap_command(command: &str, path_var: &str, snap_bin: &Path) -> Option<SnapCo
 /// What the shell would run for `word`: the word itself if it contains a
 /// `/`, otherwise the first executable file of that name in `path_var`.
 /// Ignores aliases, functions and builtins, none of which live in `/snap/bin`.
-fn resolve_on_path(word: &str, path_var: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_on_path(word: &str, path_var: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     if word.contains('/') {
         return Some(PathBuf::from(word));

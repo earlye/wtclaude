@@ -314,7 +314,10 @@ fn bash_wrapper_sweeps_week_old_handoff_files() {
     let (stale_left, fresh_left) = (stale.exists(), fresh.exists());
     std::fs::remove_dir_all(&dir).ok();
 
-    assert!(!stale_left, "a handoff file over a week old should be swept");
+    assert!(
+        !stale_left,
+        "a handoff file over a week old should be swept"
+    );
     assert!(
         fresh_left,
         "a recent handoff file may belong to a live wrapper"

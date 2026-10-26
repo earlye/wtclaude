@@ -1,6 +1,7 @@
 mod config;
 mod hook;
 mod launch;
+mod resume;
 mod sandbox;
 mod sessions;
 
@@ -36,6 +37,8 @@ enum Commands {
     /// Run a command confined by this session's sandbox (invoked by the hook)
     #[cfg(target_os = "linux")]
     Sandbox(sandbox::SandboxArgs),
+    /// Reopen, in tmux, every worktree whose Claude session isn't running
+    ResumeAll(resume::ResumeAllArgs),
     /// Print the worktree name for a session
     SessionWorktree {
         /// Session ID to resolve to a worktree name
@@ -123,6 +126,13 @@ fn main() {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("wtclaude sandbox: {:#}", e);
+                    std::process::exit(1);
+                }
+            },
+            Commands::ResumeAll(parsed) => match resume::run(parsed) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {:#}", e);
                     std::process::exit(1);
                 }
             },
