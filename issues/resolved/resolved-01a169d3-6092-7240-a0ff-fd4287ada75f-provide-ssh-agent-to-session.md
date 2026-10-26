@@ -1,5 +1,15 @@
 # Provide an ssh-agent to the Claude session
 
+## Resolution (2026-10-26)
+
+Closed without changes to wtclaude. The failing path was sessions opened by
+`/md-issue-tmux`, which inherited the tmux server's environment and its unset
+`SSH_AUTH_SOCK`. That skill now launches `wtclaude` through `startish`, which
+runs it in an interactive login shell where `~/.bashrc` starts an agent.
+Approaches 1–3 and the launch-time warning below were considered and dropped:
+`startish` covers the case they were for. The rest of this file is the
+pre-grill record.
+
 ## Context
 
 The user asked for wtclaude to make sure its Claude session has a working
@@ -107,3 +117,8 @@ leaving the session to find out when it pushes.
   --no-pull <branch> /md-issue-fix <id>"`, so the window's interactive shell
   runs `~/.bashrc`, which starts an agent before `wtclaude` runs. The tmux path
   no longer depends on the tmux server's `SSH_AUTH_SOCK`.
+
+### 2026-10-26
+
+- Q: What, if anything, should wtclaude itself do (warning only, warning plus
+  discovery, or close)? — A: Close. No wtclaude change; `startish` resolves it.
