@@ -52,8 +52,8 @@ Requested by the skills-secretary session for Early, 2026-10-26.
 3. **Filters**, applied in this order:
    - **Gone:** not listed, `prunable`, or the directory is missing. Skip
      silently. This is the only silent skip.
-   - **Live:** the path equals the `.cwd` of an entry in
-     `claude agents --json`. Skip it. If that call fails, abort: with no
+   - **Live:** the `.cwd` of an entry in `claude agents --json` is the
+     worktree path or a directory inside it. Skip it. If that call fails, abort: with no
      live list, every running session looks dead and would get a second
      Claude. Don't infer liveness from tmux window names, because a
      window outlives its Claude.
@@ -77,7 +77,7 @@ Requested by the skills-secretary session for Early, 2026-10-26.
      2026-10-26: the skill seeded "Run `pwd && git branch`…", which
      spends a turn per window for nothing the window name doesn't show.)
    - **Stale windows** (a window already named after the branch): pass
-     on whatever `src window` reports about it. Open question, see below.
+     on whatever `src window` reports about it. Decided, see below.
    - If `src window` exits non-zero, record its stderr under "failed"
      and continue with the next worktree. A wtclaude refusal shows up
      inside the window, not in the report.
@@ -134,11 +134,16 @@ wtclaude's side:
 - **Ordering:** this PR depends on `src window` being released and
   installed. With an older `src`, every launch fails with clap's
   "unrecognized subcommand" and lands under "failed".
-- **Open question:** stale-window detection needs the session name,
-  which now lives only in `src`. Proposed to src: warn on stderr when a
-  window named NAME already exists, still open the new one, and don't
-  kill it or type into it. wtclaude reports the warning. The alternative
-  is to drop the stale-window report.
+- **Stale windows (decided):** detection needs the session name, which
+  lives only in `src`. When a window named NAME already exists, `src`
+  warns on stderr, still opens the new window, and doesn't kill the old
+  one or type into it. wtclaude reports the warning under "Stale
+  windows". The cross-repo contract is this exact stderr line, one per
+  existing window:
+
+  ```
+  Warning: session S already has a window named N (@id)
+  ```
 
 ## Testing
 

@@ -265,16 +265,19 @@ wtclaude --no-pull my-feature
 ### Reopening worktrees after a reboot
 
 `wtclaude resume-all [--dry-run]` reopens every worktree under
-`.claude/worktrees/` whose Claude session isn't running. It finds them
-from Claude's transcripts, takes each branch from
-`git worktree list --porcelain`, and skips worktrees that are gone, live
-(per `claude agents --json`) or whose PR is merged (per `gh`). Each of
-the rest gets a window in its repo's tmux session, opened with
-`src window`, running `wtclaude --no-pull --resume <session> <branch>`
-under `startish` (or `wtclaude --no-pull <branch>` when the worktree
-has no transcript). It prints a report grouped by outcome. `--dry-run`
-prints the same report without opening any windows. Needs `src` with
-the `window` subcommand, and `startish`, on `PATH`.
+`.claude/worktrees/` whose Claude session isn't running. Claude's
+transcripts name the repos, and each transcript the session to resume;
+`git worktree list --porcelain` then lists every worktree in those repos,
+including ones without a transcript, and gives each one's branch. It
+skips worktrees that are gone, live (per `claude agents --json`) or
+whose PR is merged (per `gh`). Each of the rest gets a window in its
+repo's tmux session, opened with `src window`, running
+`wtclaude --no-pull --resume <session> <branch>` under `startish` (or
+`wtclaude --no-pull <branch>` when the worktree has no transcript). It
+prints a report grouped by outcome. `--dry-run` prints the same report
+without opening any windows. Needs `claude`, `src` with the `window`
+subcommand, and `startish` on `PATH`; `gh` is optional (without it,
+every branch is treated as unmerged and the report says so).
 
 
 ## Modes

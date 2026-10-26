@@ -27,22 +27,38 @@ const TAIL_BYTES: u64 = 64 * 1024;
 const WORKTREES_MARKER: &str = "/.claude/worktrees/";
 
 pub fn run(args: ResumeAllArgs) -> Result<i32> {
-    // The window gets the tmux server's environment, whose PATH may not
-    // include ~/.cargo/bin, so startish goes in by absolute path.
     let path_var = std::env::var("PATH").unwrap_or_default();
-    let startish = resolve_on_path("startish", &path_var)
-        .context("startish not found on PATH")
-        .and_then(|p| std::path::absolute(&p).context("resolving startish"))?;
+    let (startish, startish_note) = resolve_startish(&path_var, args.dry_run)?;
 
     let projects_dir = projects_dir()?;
     let discovery = discover(&projects_dir, TAIL_BYTES)?;
-    let report = sweep(&System, discovery, &startish, args.dry_run)?;
+    let mut report = sweep(&System, discovery, &startish, args.dry_run)?;
+    report.startish_note = startish_note;
     print!("{}", report.render(&projects_dir));
-    Ok(if report.failed.is_empty() { 0 } else { 1 })
+    Ok(report.exit_code())
+}
+
+/// The absolute path of `startish`: the window gets the tmux server's
+/// environment, whose PATH may not include ~/.cargo/bin. A dry run opens
+/// no window, so there a missing `startish` falls back to the bare word,
+/// with a note for the report.
+fn resolve_startish(path_var: &str, dry_run: bool) -> Result<(PathBuf, Option<String>)> {
+    match resolve_on_path("startish", path_var) {
+        Some(p) => {
+            let p = std::path::absolute(&p).context("resolving startish")?;
+            Ok((p, None))
+        }
+        None if dry_run => Ok((
+            PathBuf::from("startish"),
+            Some("startish not found on PATH; a real run would stop here".to_string()),
+        )),
+        None => bail!("startish not found on PATH"),
+    }
 }
 
 /// The commands `resume-all` runs, behind a trait so tests can fake them.
-/// Each returns the command's stdout, or an error carrying its stderr.
+/// Each except `src` returns the command's stdout, or an error carrying its
+/// exit status and stderr.
 pub(crate) trait External {
     /// `claude agents --json`
     fn claude_agents(&self) -> Result<String>;
@@ -57,19 +73,37 @@ pub(crate) trait External {
 
 pub(crate) struct SrcOutput {
     pub success: bool,
+    /// The exit status as `ExitStatus` displays it, e.g. `exit status: 1`.
+    pub status: String,
     pub stdout: String,
     pub stderr: String,
 }
 
 struct System;
 
-/// Runs `cmd`, returning its stdout, or its stderr as the error.
+/// Why a command failed: its stderr, or its stdout when stderr is empty,
+/// followed by the exit status, which is all there is for a signal.
+fn failure_reason(status: &str, stdout: &str, stderr: &str) -> String {
+    let text = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .find(|t| !t.is_empty());
+    match text {
+        Some(text) => format!("{text} ({status})"),
+        None => status.to_string(),
+    }
+}
+
+/// Runs `cmd`, returning its stdout, or why it failed as the error.
 fn output_of(mut cmd: Command, what: &str) -> Result<String> {
     let output = cmd.output().with_context(|| format!("running {what}"))?;
     if !output.status.success() {
         bail!(
             "{what} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            failure_reason(
+                &output.status.to_string(),
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr),
+            )
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -115,6 +149,7 @@ impl External for System {
             .context("running src")?;
         Ok(SrcOutput {
             success: output.status.success(),
+            status: output.status.to_string(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
@@ -150,7 +185,9 @@ struct Discovery {
 }
 
 /// Splits a `cwd` inside `<repo>/.claude/worktrees/<dir>` into the repo root
-/// and the worktree path, dropping anything below the worktree.
+/// and the worktree path, dropping anything below the worktree. It splits at
+/// the last marker, so for a worktree nested inside another, the outer
+/// worktree is the repo root, deliberately.
 fn split_worktree_cwd(cwd: &str) -> Option<(PathBuf, PathBuf)> {
     let at = cwd.rfind(WORKTREES_MARKER)?;
     let repo_root = &cwd[..at];
@@ -213,7 +250,9 @@ fn read_transcript(path: &Path, tail: u64) -> Result<Option<LastLine>> {
 }
 
 /// Reads `<projects_dir>/*--claude-worktrees-*/*.jsonl`. Only top-level
-/// files, which leaves out subagent transcripts in subdirectories.
+/// files, which leaves out subagent transcripts in subdirectories. Paths
+/// are canonicalized, so two spellings of one repo or worktree (a symlink,
+/// a bind mount) group together.
 fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
     let mut discovery = Discovery::default();
     if !projects_dir.is_dir() {
@@ -223,7 +262,15 @@ fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
     let entries = std::fs::read_dir(projects_dir)
         .with_context(|| format!("reading {}", projects_dir.display()))?;
     for entry in entries {
-        let entry = entry.with_context(|| format!("reading {}", projects_dir.display()))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                discovery
+                    .skipped
+                    .push((projects_dir.to_path_buf(), e.to_string()));
+                continue;
+            }
+        };
         if !entry
             .file_name()
             .to_string_lossy()
@@ -232,10 +279,21 @@ fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
         {
             continue;
         }
-        let transcripts = std::fs::read_dir(entry.path())
-            .with_context(|| format!("reading {}", entry.path().display()))?;
+        let transcripts = match std::fs::read_dir(entry.path()) {
+            Ok(transcripts) => transcripts,
+            Err(e) => {
+                discovery.skipped.push((entry.path(), e.to_string()));
+                continue;
+            }
+        };
         for transcript in transcripts {
-            let path = transcript?.path();
+            let path = match transcript {
+                Ok(transcript) => transcript.path(),
+                Err(e) => {
+                    discovery.skipped.push((entry.path(), e.to_string()));
+                    continue;
+                }
+            };
             if path.extension().is_none_or(|e| e != "jsonl") || !path.is_file() {
                 continue;
             }
@@ -256,14 +314,15 @@ fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
     found.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut by_worktree: BTreeMap<PathBuf, Session> = BTreeMap::new();
     for (_, line) in found {
-        match by_worktree.get_mut(&line.worktree) {
+        let worktree = canonical(&line.worktree);
+        match by_worktree.get_mut(&worktree) {
             Some(newer) => newer.older.push(line.session_id),
             None => {
                 by_worktree.insert(
-                    line.worktree.clone(),
+                    worktree.clone(),
                     Session {
-                        repo_root: line.repo_root,
-                        worktree: line.worktree,
+                        repo_root: canonical(&line.repo_root),
+                        worktree,
                         transcript_branch: line.branch,
                         session_id: line.session_id,
                         older: Vec::new(),
@@ -306,15 +365,19 @@ fn parse_porcelain(output: &str) -> Vec<WorktreeEntry> {
     entries
 }
 
-/// The `cwd` of every running session in `claude agents --json`.
+/// The `cwd` of every running session in `claude agents --json`. An entry
+/// without a string `cwd` is an error: dropping it would make its session
+/// look dead.
 fn parse_live_cwds(json: &str) -> Result<HashSet<PathBuf>> {
     let agents: Vec<serde_json::Value> =
         serde_json::from_str(json).context("parsing claude agents --json")?;
-    Ok(agents
+    agents
         .iter()
-        .filter_map(|a| a.get("cwd")?.as_str())
-        .map(|cwd| canonical(Path::new(cwd)))
-        .collect())
+        .map(|a| match a.get("cwd").and_then(|c| c.as_str()) {
+            Some(cwd) => Ok(canonical(Path::new(cwd))),
+            None => bail!("claude agents --json: an entry has no string cwd: {a}"),
+        })
+        .collect()
 }
 
 /// Whether the worktree directory is the one wtclaude would derive from
@@ -329,8 +392,10 @@ fn dir_matches_branch(worktree: &Path, branch: &str) -> bool {
 /// The arguments to `src` that open a window in the repo's session running
 /// `wtclaude --no-pull [--resume SESSION_ID] BRANCH` under `startish`. The
 /// window starts in the repo root: started inside a worktree, wtclaude
-/// would nest `.claude/worktrees/`. `wtclaude` stays a bare word, so the
-/// window's shell finds it, and its history wrapper, after the rc file ran.
+/// would nest `.claude/worktrees/`. `wtclaude` stays a bare word because it
+/// runs in the user's interactive shell, after the rc file has set PATH and
+/// defined the wtclaude wrapper. The `--history` entry omits `--resume`;
+/// the wrapper pushes the resume line itself on exit.
 fn src_window_args(
     repo_root: &Path,
     branch: &str,
@@ -357,15 +422,22 @@ fn src_window_args(
     args
 }
 
-/// The `Warning: …` lines `src window` prints for each existing window that
-/// already has the new window's name, without the `Warning: ` prefix.
-fn stale_window_warnings(stderr: &str) -> Vec<String> {
-    stderr
-        .lines()
-        .filter_map(|l| l.strip_prefix("Warning: "))
-        .filter(|l| l.starts_with("session ") && l.contains(" already has a window named "))
-        .map(String::from)
-        .collect()
+/// Splits a successful `src window`'s stderr into the warnings it prints
+/// for each existing window that already has the new window's name
+/// (`Warning: session S already has a window named N (@id)`, without the
+/// `Warning: ` prefix), and every other non-empty line.
+fn split_src_stderr(stderr: &str) -> (Vec<String>, Vec<String>) {
+    let mut stale = Vec::new();
+    let mut other = Vec::new();
+    for line in stderr.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match line.strip_prefix("Warning: ") {
+            Some(w) if w.starts_with("session ") && w.contains(" already has a window named ") => {
+                stale.push(w.to_string())
+            }
+            _ => other.push(line.to_string()),
+        }
+    }
+    (stale, other)
 }
 
 /// Resolves symlinks where the path exists, so paths from transcripts, git
@@ -375,7 +447,8 @@ fn canonical(path: &Path) -> PathBuf {
 }
 
 /// One line of the report: a worktree (by branch, or by path when it has
-/// no usable branch) in a repo, plus whatever is worth saying about it.
+/// no usable branch), or `(whole repo)` when the repo couldn't be listed,
+/// in a repo, plus whatever is worth saying about it.
 #[derive(Debug, PartialEq)]
 struct Entry {
     repo: PathBuf,
@@ -391,11 +464,24 @@ impl Entry {
             detail: detail.into(),
         }
     }
+
+    /// Appends `note` to the detail, if there is one.
+    fn with_note(mut self, note: Option<&str>) -> Self {
+        if let Some(note) = note {
+            if !self.detail.is_empty() {
+                self.detail.push_str("; ");
+            }
+            self.detail.push_str(note);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Default)]
 struct Report {
     dry_run: bool,
+    /// Set when a dry run couldn't find `startish`.
+    startish_note: Option<String>,
     resumed: Vec<Entry>,
     fresh: Vec<Entry>,
     failed: Vec<Entry>,
@@ -407,13 +493,6 @@ struct Report {
     left_alone: Vec<Entry>,
     scanned: usize,
     skipped_transcripts: Vec<(PathBuf, String)>,
-}
-
-/// A worktree that survived discovery and is a candidate for a window.
-struct Target<'a> {
-    repo_root: &'a Path,
-    worktree: PathBuf,
-    session: Option<&'a Session>,
 }
 
 /// Filters the discovered worktrees and launches (or, on a dry run, only
@@ -441,12 +520,14 @@ fn sweep(
         .and_then(|json| parse_live_cwds(&json))
         .context("cannot tell which worktrees are live")?;
 
+    // Discovery canonicalized both paths, so each repo has one bucket.
     let mut repos: BTreeMap<&Path, Vec<&Session>> = BTreeMap::new();
     for session in &discovery.sessions {
         repos.entry(&session.repo_root).or_default().push(session);
     }
 
     for (repo_root, sessions) in repos {
+        // A missing repo root is skipped silently, like a gone worktree.
         if !repo_root.is_dir() {
             continue;
         }
@@ -459,70 +540,72 @@ fn sweep(
                 continue;
             }
         };
-        let entries = parse_porcelain(&porcelain);
-        let worktrees_dir = canonical(repo_root).join(".claude").join("worktrees");
+        let entries: Vec<(PathBuf, WorktreeEntry)> = parse_porcelain(&porcelain)
+            .into_iter()
+            .map(|e| (canonical(&e.path), e))
+            .collect();
+        let worktrees_dir = repo_root.join(".claude").join("worktrees");
 
         // Every worktree with a transcript, plus those under .claude/worktrees
         // without one, which get a fresh session.
-        let mut targets: BTreeMap<PathBuf, Target> = BTreeMap::new();
-        for entry in &entries {
-            let path = canonical(&entry.path);
+        let mut targets: BTreeMap<&Path, Option<&Session>> = BTreeMap::new();
+        for (path, _) in &entries {
             if path.parent() == Some(worktrees_dir.as_path()) {
-                targets.insert(
-                    path.clone(),
-                    Target {
-                        repo_root,
-                        worktree: path,
-                        session: None,
-                    },
-                );
+                targets.insert(path, None);
             }
         }
         for session in sessions {
-            let path = canonical(&session.worktree);
-            targets.insert(
-                path.clone(),
-                Target {
-                    repo_root,
-                    worktree: path,
-                    session: Some(session),
-                },
-            );
+            targets.insert(&session.worktree, Some(session));
         }
 
-        for target in targets.into_values() {
-            let entry = entries
-                .iter()
-                .find(|e| canonical(&e.path) == target.worktree);
-            // Gone: the only silent skip. A missing directory would be
-            // recreated by wtclaude.
-            let Some(entry) = entry.filter(|e| !e.prunable && target.worktree.is_dir()) else {
+        for (worktree, session) in targets {
+            let entry = entries.iter().find(|(p, _)| p == worktree).map(|(_, e)| e);
+            // Gone, skipped silently (as is a missing repo root, above). A
+            // missing directory would be recreated by wtclaude.
+            let Some(entry) = entry.filter(|e| !e.prunable && worktree.is_dir()) else {
                 continue;
             };
-            let worktree_label = target.worktree.to_string_lossy().into_owned();
+            let worktree_label = worktree.to_string_lossy().into_owned();
+            let note = match (
+                session.and_then(|s| s.transcript_branch.as_deref()),
+                &entry.branch,
+            ) {
+                (Some(theirs), Some(branch)) if theirs != branch => {
+                    Some(format!("transcript was on {theirs}"))
+                }
+                _ => None,
+            };
+            let note = note.as_deref();
+            // A Claude started below the worktree still counts.
+            if live.iter().any(|cwd| cwd.starts_with(worktree)) {
+                let what = entry.branch.as_deref().unwrap_or(&worktree_label);
+                report
+                    .live
+                    .push(Entry::new(repo_root, what, "").with_note(note));
+                continue;
+            }
             let Some(branch) = &entry.branch else {
                 report
                     .left_alone
                     .push(Entry::new(repo_root, worktree_label, "detached"));
                 continue;
             };
-            if !dir_matches_branch(&target.worktree, branch) {
-                report.left_alone.push(Entry::new(
-                    repo_root,
-                    worktree_label,
-                    format!("directory name doesn't match branch {branch}"),
-                ));
-                continue;
-            }
-            if live.contains(&target.worktree) {
-                report.live.push(Entry::new(repo_root, branch, ""));
+            if !dir_matches_branch(worktree, branch) {
+                report.left_alone.push(
+                    Entry::new(
+                        repo_root,
+                        worktree_label,
+                        format!("directory name doesn't match branch {branch}"),
+                    )
+                    .with_note(note),
+                );
                 continue;
             }
             match ext.gh_merged_pr(repo_root, branch) {
                 Ok(pr) if !pr.trim().is_empty() => {
-                    report
-                        .merged
-                        .push(Entry::new(repo_root, branch, format!("PR #{}", pr.trim())));
+                    report.merged.push(
+                        Entry::new(repo_root, branch, format!("PR #{}", pr.trim())).with_note(note),
+                    );
                     continue;
                 }
                 Ok(_) => {}
@@ -532,22 +615,29 @@ fn sweep(
                         .push(Entry::new(repo_root, branch, format!("{e:#}")))
                 }
             }
-            launch(ext, &mut report, &target, branch, startish);
+            launch(ext, &mut report, repo_root, session, branch, startish, note);
         }
     }
     Ok(report)
 }
 
 /// Opens one window through `src window` (or, on a dry run, records the
-/// command) and files the outcome in `report`.
-fn launch(ext: &dyn External, report: &mut Report, target: &Target, branch: &str, startish: &Path) {
-    let repo_root = target.repo_root;
-    let session_id = target.session.map(|s| s.session_id.as_str());
+/// command) and files the outcome in `report`, with `note` appended.
+fn launch(
+    ext: &dyn External,
+    report: &mut Report,
+    repo_root: &Path,
+    session: Option<&Session>,
+    branch: &str,
+    startish: &Path,
+    note: Option<&str>,
+) {
+    let session_id = session.map(|s| s.session_id.as_str());
     let args = src_window_args(repo_root, branch, session_id, startish);
 
     let mut details: Vec<String> = Vec::new();
-    if let Some(session) = target.session {
-        details.push(format!("session {}", session.session_id));
+    if let Some(session_id) = session_id {
+        details.push(format!("session {session_id}"));
     }
     if report.dry_run {
         let command: Vec<String> = std::iter::once("src")
@@ -556,46 +646,41 @@ fn launch(ext: &dyn External, report: &mut Report, target: &Target, branch: &str
             .collect();
         details.push(format!("would run: {}", command.join(" ")));
     } else {
-        let output = match ext.src(&args) {
-            Ok(output) => output,
-            Err(e) => {
-                report
-                    .failed
-                    .push(Entry::new(repo_root, branch, format!("{e:#}")));
-                return;
+        let failure = match ext.src(&args) {
+            Err(e) => Some(format!("{e:#}")),
+            Ok(output) if !output.success => Some(failure_reason(
+                &output.status,
+                &output.stdout,
+                &output.stderr,
+            )),
+            Ok(output) => {
+                let (stale, other) = split_src_stderr(&output.stderr);
+                for warning in stale {
+                    report
+                        .stale_windows
+                        .push(Entry::new(repo_root, branch, warning));
+                }
+                details.push(format!("window {}", output.stdout.trim()));
+                details.extend(other);
+                None
             }
         };
-        if !output.success {
+        if let Some(failure) = failure {
             report
                 .failed
-                .push(Entry::new(repo_root, branch, output.stderr.trim()));
+                .push(Entry::new(repo_root, branch, failure).with_note(note));
             return;
         }
-        for warning in stale_window_warnings(&output.stderr) {
-            report
-                .stale_windows
-                .push(Entry::new(repo_root, branch, warning));
-        }
-        details.push(format!("window {}", output.stdout.trim()));
     }
-    if let Some(session) = target.session {
-        if !session.older.is_empty() {
-            details.push(format!(
-                "older sessions ignored: {}",
-                session.older.join(", ")
-            ));
-        }
-        if let Some(theirs) = session
-            .transcript_branch
-            .as_deref()
-            .filter(|b| *b != branch)
-        {
-            details.push(format!("transcript was on {theirs}"));
-        }
+    if let Some(session) = session.filter(|s| !s.older.is_empty()) {
+        details.push(format!(
+            "older sessions ignored: {}",
+            session.older.join(", ")
+        ));
     }
 
-    let entry = Entry::new(repo_root, branch, details.join("; "));
-    if target.session.is_some() {
+    let entry = Entry::new(repo_root, branch, details.join("; ")).with_note(note);
+    if session.is_some() {
         report.resumed.push(entry);
     } else {
         report.fresh.push(entry);
@@ -603,6 +688,11 @@ fn launch(ext: &dyn External, report: &mut Report, target: &Target, branch: &str
 }
 
 impl Report {
+    /// 1 when anything failed, else 0.
+    fn exit_code(&self) -> i32 {
+        if self.failed.is_empty() { 0 } else { 1 }
+    }
+
     fn render(&self, projects_dir: &Path) -> String {
         let mut out = String::new();
         if self.scanned == 0 {
@@ -613,7 +703,11 @@ impl Report {
             return out;
         }
         if self.dry_run {
-            out.push_str("Dry run: no windows were opened.\n\n");
+            out.push_str("Dry run: no windows were opened.\n");
+            if let Some(note) = &self.startish_note {
+                out.push_str(&format!("Note: {note}.\n"));
+            }
+            out.push('\n');
         }
 
         let (resumed, fresh) = if self.dry_run {
@@ -835,12 +929,58 @@ mod tests {
     }
 
     #[test]
-    fn stale_window_warnings_keeps_only_the_warning_lines() {
-        let stderr = "something else\n\
-                      Warning: session r already has a window named a/b (@3)\n";
+    fn split_src_stderr_separates_stale_window_warnings() {
+        let stderr = "Note: something else\n\n\
+                      Warning: session r already has a window named a/b (@3)\n\
+                      Warning: unrelated\n";
+        let (stale, other) = split_src_stderr(stderr);
+        assert_eq!(stale, ["session r already has a window named a/b (@3)"]);
+        assert_eq!(other, ["Note: something else", "Warning: unrelated"]);
+    }
+
+    #[test]
+    fn failure_reason_falls_back_to_stdout_then_the_status() {
         assert_eq!(
-            stale_window_warnings(stderr),
-            ["session r already has a window named a/b (@3)"]
+            failure_reason("exit status: 1", "out", "err\n"),
+            "err (exit status: 1)"
+        );
+        assert_eq!(
+            failure_reason("exit status: 1", "out\n", " \n"),
+            "out (exit status: 1)"
+        );
+        assert_eq!(
+            failure_reason("signal: 9 (SIGKILL)", "", ""),
+            "signal: 9 (SIGKILL)"
+        );
+    }
+
+    #[test]
+    fn parse_live_cwds_rejects_an_entry_without_a_cwd() {
+        assert_eq!(
+            parse_live_cwds(r#"[{"cwd":"/nonexistent/a"}]"#).unwrap(),
+            HashSet::from([PathBuf::from("/nonexistent/a")])
+        );
+        assert!(parse_live_cwds(r#"[{"cwd":"/a"},{"directory":"/b"}]"#).is_err());
+        assert!(parse_live_cwds(r#"[{"cwd":null}]"#).is_err());
+    }
+
+    #[test]
+    fn resolve_startish_falls_back_only_on_a_dry_run() {
+        assert!(resolve_startish("", false).is_err());
+        let (path, note) = resolve_startish("", true).unwrap();
+        assert_eq!(path, PathBuf::from("startish"));
+        assert!(note.is_some());
+
+        let report = Report {
+            dry_run: true,
+            startish_note: note,
+            scanned: 1,
+            ..Report::default()
+        };
+        assert!(
+            report
+                .render(Path::new("/p"))
+                .starts_with("Dry run: no windows were opened.\nNote: startish not found on PATH")
         );
     }
 
@@ -869,18 +1009,23 @@ mod tests {
         }
         fn src(&self, args: &[String]) -> Result<SrcOutput> {
             self.src_calls.borrow_mut().push(args.to_vec());
-            let (success, stdout, stderr) =
-                self.src.get(&args[3]).cloned().context("src not found")?;
+            let name = args
+                .iter()
+                .skip_while(|a| *a != "-n")
+                .nth(1)
+                .context("no -n")?;
+            let (success, stdout, stderr) = self.src.get(name).cloned().context("src not found")?;
             Ok(SrcOutput {
                 success,
+                status: format!("exit status: {}", if success { 0 } else { 1 }),
                 stdout,
                 stderr,
             })
         }
     }
 
-    /// A repo with worktrees under .claude/worktrees, plus a projects dir
-    /// holding a transcript for each of `with_transcripts`.
+    /// A repo with the given directories under .claude/worktrees, plus an
+    /// empty projects dir; add transcripts with `transcript()`.
     struct Setup {
         base: PathBuf,
         repo: PathBuf,
@@ -889,7 +1034,8 @@ mod tests {
 
     impl Setup {
         fn new(label: &str, dirs: &[&str]) -> Self {
-            let base = temp_dir(label);
+            // Canonical, as discovery's paths are.
+            let base = canonical(&temp_dir(label));
             let repo = base.join("repo");
             for dir in dirs {
                 std::fs::create_dir_all(repo.join(".claude/worktrees").join(dir)).unwrap();
@@ -908,10 +1054,15 @@ mod tests {
         }
 
         fn transcript(&self, dir: &str, session_id: &str, branch: &str) {
+            self.transcript_via(&self.repo, dir, session_id, branch);
+        }
+
+        /// A transcript whose cwd spells the repo as `repo`.
+        fn transcript_via(&self, repo: &Path, dir: &str, session_id: &str, branch: &str) {
             let project = self.projects.join(format!("x--claude-worktrees-{dir}"));
             std::fs::create_dir_all(&project).unwrap();
             let line = serde_json::json!({
-                "cwd": self.worktree(dir).join("src"),
+                "cwd": repo.join(".claude/worktrees").join(dir).join("src"),
                 "gitBranch": branch,
                 "sessionId": session_id,
             });
@@ -954,20 +1105,32 @@ mod tests {
         let s = Setup::new(
             "dry-run",
             &[
-                "e+resume", "e+fresh", "e+live", "e+merged", "e+nogh", "detached", "misnamed",
+                "e+resume",
+                "e+fresh",
+                "e+live",
+                "e+merged",
+                "e+nogh",
+                "detached",
+                "misnamed",
+                "live-detached",
             ],
         );
         s.transcript("e+resume", "sid-resume", "HEAD");
-        s.transcript("e+live", "sid-live", "e/live");
-        s.transcript("e+merged", "sid-merged", "e/merged");
+        s.transcript("e+live", "sid-live", "old/live");
+        s.transcript("e+merged", "sid-merged", "old/merged");
         s.transcript("e+nogh", "sid-nogh", "e/nogh");
         s.transcript("detached", "sid-detached", "HEAD");
         s.transcript("e+gone", "sid-gone", "e/gone");
 
         let mut fake = Fake {
             agents: Some(
-                serde_json::json!([{ "cwd": s.worktree("e+live") }, { "cwd": "/elsewhere" }])
-                    .to_string(),
+                // A Claude below the worktree counts as live.
+                serde_json::json!([
+                    { "cwd": s.worktree("e+live").join("src") },
+                    { "cwd": s.worktree("live-detached") },
+                    { "cwd": "/elsewhere" },
+                ])
+                .to_string(),
             ),
             ..Fake::default()
         };
@@ -981,6 +1144,7 @@ mod tests {
                 ("e+nogh", Some("e/nogh")),
                 ("detached", None),
                 ("misnamed", Some("other")),
+                ("live-detached", None),
             ]),
         );
         for branch in ["e/resume", "e/fresh", "e/live"] {
@@ -1005,10 +1169,11 @@ mod tests {
              \x20 {repo}  e/resume  (session sid-resume; would run: src window {repo} -n e/resume -- /bin/startish --history 'wtclaude --no-pull e/resume' -- wtclaude --no-pull --resume sid-resume e/resume; transcript was on HEAD)\n\n\
              Would start fresh (1):\n\
              \x20 {repo}  e/fresh  (would run: src window {repo} -n e/fresh -- /bin/startish --history 'wtclaude --no-pull e/fresh' -- wtclaude --no-pull e/fresh)\n\n\
-             Skipped, live (1):\n\
-             \x20 {repo}  e/live\n\n\
+             Skipped, live (2):\n\
+             \x20 {repo}  e/live  (transcript was on old/live)\n\
+             \x20 {repo}  {live_detached}\n\n\
              Skipped, merged (1):\n\
-             \x20 {repo}  e/merged  (PR #42)\n\n\
+             \x20 {repo}  e/merged  (PR #42; transcript was on old/merged)\n\n\
              Merge check failed, treated as unmerged (1):\n\
              \x20 {repo}  e/nogh  (gh: no auth)\n\n\
              Detached or mismatched worktrees, left alone (2):\n\
@@ -1017,8 +1182,10 @@ mod tests {
              Transcripts scanned: 6, skipped: 0\n",
             detached = s.worktree("detached").display(),
             misnamed = s.worktree("misnamed").display(),
+            live_detached = s.worktree("live-detached").display(),
         );
         assert_eq!(rendered, expected);
+        assert_eq!(report.exit_code(), 0);
     }
 
     #[test]
@@ -1040,8 +1207,10 @@ mod tests {
         for branch in ["ok", "stale", "bad"] {
             fake.merged.insert(branch.into(), String::new());
         }
-        fake.src
-            .insert("ok".into(), (true, "@1\n".into(), String::new()));
+        fake.src.insert(
+            "ok".into(),
+            (true, "@1\n".into(), "Note: created session repo\n".into()),
+        );
         fake.src.insert(
             "stale".into(),
             (
@@ -1059,9 +1228,19 @@ mod tests {
         let report = sweep(&fake, discovery, Path::new(STARTISH), false).unwrap();
 
         let entry = |what: &str, detail: &str| Entry::new(&s.repo, what, detail);
-        assert_eq!(report.resumed, [entry("ok", "session sid-ok; window @1")]);
+        // Other stderr lines go into the detail.
+        assert_eq!(
+            report.resumed,
+            [entry(
+                "ok",
+                "session sid-ok; window @1; Note: created session repo"
+            )]
+        );
         assert_eq!(report.fresh, [entry("stale", "window @2")]);
-        assert_eq!(report.failed, [entry("bad", "no such session")]);
+        assert_eq!(
+            report.failed,
+            [entry("bad", "no such session (exit status: 1)")]
+        );
         assert_eq!(
             report.stale_windows,
             [entry(
@@ -1070,6 +1249,78 @@ mod tests {
             )]
         );
         assert_eq!(fake.src_calls.borrow().len(), 3);
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_failed_repo_or_src_call_does_not_stop_the_sweep() {
+        let a = Setup::new("two-a", &["a1", "a2"]);
+        let b = Setup::new("two-b", &["b1"]);
+        a.transcript("a1", "sid-a1", "a1");
+        a.transcript_via(&b.repo, "b1", "sid-b1", "b1");
+        let mut fake = Fake {
+            agents: Some("[]".into()),
+            ..Fake::default()
+        };
+        // b's worktree list fails; a2's src call can't run.
+        fake.worktrees.insert(
+            a.repo.clone(),
+            a.porcelain(&[("a1", Some("a1")), ("a2", Some("a2"))]),
+        );
+        for branch in ["a1", "a2"] {
+            fake.merged.insert(branch.into(), String::new());
+        }
+        fake.src
+            .insert("a1".into(), (true, "@1\n".into(), String::new()));
+
+        let discovery = discover(&a.projects, TAIL_BYTES).unwrap();
+        let report = sweep(&fake, discovery, Path::new(STARTISH), false).unwrap();
+
+        assert_eq!(
+            report.resumed,
+            [Entry::new(&a.repo, "a1", "session sid-a1; window @1")]
+        );
+        assert_eq!(
+            report.failed,
+            [
+                Entry::new(&a.repo, "a2", "src not found"),
+                Entry::new(&b.repo, "(whole repo)", "not a git repo"),
+            ]
+        );
+        assert_eq!(report.exit_code(), 1);
+    }
+
+    #[test]
+    fn two_spellings_of_one_repo_group_together() {
+        let s = Setup::new("symlink", &["w"]);
+        let link = s.base.join("link");
+        std::os::unix::fs::symlink(&s.repo, &link).unwrap();
+        s.transcript("w", "old", "w");
+        let old = s.projects.join("x--claude-worktrees-w").join("old.jsonl");
+        let earlier = SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        s.transcript_via(&link, "w", "new", "w");
+
+        let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        assert_eq!(discovery.sessions.len(), 1);
+        assert_eq!(discovery.sessions[0].repo_root, s.repo);
+        assert_eq!(discovery.sessions[0].session_id, "new");
+        assert_eq!(discovery.sessions[0].older, ["old"]);
+
+        let mut fake = Fake {
+            agents: Some("[]".into()),
+            ..Fake::default()
+        };
+        fake.worktrees
+            .insert(s.repo.clone(), s.porcelain(&[("w", Some("w"))]));
+        fake.merged.insert("w".into(), String::new());
+        let report = sweep(&fake, discovery, Path::new(STARTISH), true).unwrap();
+        assert_eq!(report.resumed.len(), 1);
     }
 
     #[test]
