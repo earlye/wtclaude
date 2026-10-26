@@ -652,9 +652,10 @@ fn claude_command() -> Command {
 
 /// Lowers the CPU scheduling priority (niceness +`CLAUDE_NICENESS`) of the
 /// process `cmd` spawns. Its children inherit the niceness, so the session's
-/// builds, tests and subagents also yield the CPU to processes the kernel
-/// schedules in the same group (cgroup or autogroup). Separate groups are
-/// balanced by CPU weight, which niceness doesn't change. wtclaude keeps its
+/// builds, tests and subagents also yield the CPU to other processes. On
+/// Linux that's only processes the kernel schedules in the same group (cgroup
+/// or autogroup); separate groups are balanced by CPU weight, which niceness
+/// doesn't change. wtclaude keeps its
 /// own priority.
 fn lower_priority(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;

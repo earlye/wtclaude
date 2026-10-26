@@ -52,8 +52,8 @@ When you run `wtclaude <name>`, it:
    session is recognizable in `/resume`; omitted when resuming, so a
    resumed session keeps its name), and the working directory set to the
    worktree. `claude` is started at niceness +10, which the builds,
-   tests, and subagents it spawns inherit. Niceness only ranks processes
-   that the kernel schedules in the same group (a cgroup, or an
+   tests, and subagents it spawns inherit. On Linux, niceness only ranks
+   processes that the kernel schedules in the same group (a cgroup, or an
    autogroup per terminal session); it doesn't shrink the session's
    CPU share against apps in other groups.
 
