@@ -28,7 +28,11 @@ const TAIL_BYTES: u64 = 64 * 1024;
 const WORKTREES_MARKER: &str = "/.claude/worktrees/";
 
 pub fn run(args: ResumeAllArgs) -> Result<i32> {
-    let path_var = std::env::var("PATH").unwrap_or_default();
+    let path_var = match std::env::var("PATH") {
+        Ok(path_var) => path_var,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(e) => bail!("reading PATH: {e}"),
+    };
     let (startish, startish_note) = resolve_tool("startish", "", &path_var, args.dry_run)?;
     let (src, src_note) = resolve_tool(
         "src",
@@ -48,9 +52,9 @@ pub fn run(args: ResumeAllArgs) -> Result<i32> {
 /// The absolute path of `word` on PATH, resolved up front so a missing
 /// tool stops the run once instead of failing every worktree. `startish`
 /// needs it anyway: the window gets the tmux server's environment, whose
-/// PATH may not include ~/.cargo/bin. A dry run opens no window, so there
-/// a missing tool falls back to the bare word, with a note for the report.
-/// `why` is appended to the error.
+/// PATH may not include ~/.cargo/bin. On a dry run, which opens no window,
+/// a missing tool falls back to the bare word and adds a note to the
+/// report. `why` is appended to the error.
 fn resolve_tool(
     word: &str,
     why: &str,
@@ -180,7 +184,8 @@ impl External for System {
 #[derive(Debug, PartialEq)]
 struct LastLine {
     repo_root: PathBuf,
-    worktree: PathBuf,
+    /// The worktree's directory name under `.claude/worktrees/`.
+    dir: String,
     /// `gitBranch`, kept only to report a mismatch with git's view.
     branch: Option<String>,
     session_id: String,
@@ -205,21 +210,23 @@ struct Discovery {
 }
 
 /// Splits a `cwd` inside `<repo>/.claude/worktrees/<dir>` into the repo root
-/// and the worktree path, dropping anything below the worktree. It splits at
+/// and `<dir>`, dropping anything below the worktree. It splits at
 /// the last marker, so for a worktree nested inside another, the outer
 /// worktree is the repo root: wtclaude run inside a worktree nests
 /// `.claude/worktrees/` under it, so the outer worktree is where that
 /// branch's directory lives and where `wtclaude <branch>` would look.
-fn split_worktree_cwd(cwd: &str) -> Option<(PathBuf, PathBuf)> {
+fn split_worktree_cwd(cwd: &str) -> Option<(PathBuf, String)> {
     let at = cwd.rfind(WORKTREES_MARKER)?;
     let repo_root = &cwd[..at];
     let dir = cwd[at + WORKTREES_MARKER.len()..].split('/').next()?;
     if repo_root.is_empty() || dir.is_empty() {
         return None;
     }
-    let repo_root = PathBuf::from(repo_root);
-    let worktree = repo_root.join(".claude").join("worktrees").join(dir);
-    Some((repo_root, worktree))
+    Some((PathBuf::from(repo_root), dir.to_string()))
+}
+
+fn worktree_path(repo_root: &Path, dir: &str) -> PathBuf {
+    repo_root.join(".claude").join("worktrees").join(dir)
 }
 
 /// The newest line of `data` that is a JSON object with a `cwd` inside a
@@ -237,18 +244,18 @@ fn newest_usable_line(data: &[u8], stem: &str) -> Option<LastLine> {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
             };
-            let (repo_root, worktree) = split_worktree_cwd(text("cwd")?)?;
+            let (repo_root, dir) = split_worktree_cwd(text("cwd")?)?;
             Some(LastLine {
                 repo_root,
-                worktree,
+                dir,
                 branch: text("gitBranch").map(String::from),
                 session_id: text("sessionId").unwrap_or(stem).to_string(),
             })
         })
 }
 
-/// Reads the last `tail` bytes of the transcript at `path`, and the whole
-/// file if they hold no usable line (one huge final line).
+/// The newest usable line of the transcript at `path`, looked for in its
+/// last `tail` bytes, then in the whole file if the tail has none.
 fn read_transcript(path: &Path, tail: u64) -> Result<Option<LastLine>> {
     let stem = path
         .file_stem()
@@ -277,12 +284,14 @@ fn read_transcript(path: &Path, tail: u64) -> Result<Option<LastLine>> {
 /// together. Bind mounts are not unified.
 fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
     let mut discovery = Discovery::default();
-    if !projects_dir.is_dir() {
-        return Ok(discovery);
-    }
+    let entries = match std::fs::read_dir(projects_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(discovery),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", projects_dir.display()));
+        }
+    };
     let mut found: Vec<(SystemTime, LastLine)> = Vec::new();
-    let entries = std::fs::read_dir(projects_dir)
-        .with_context(|| format!("reading {}", projects_dir.display()))?;
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -297,9 +306,17 @@ fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
             .file_name()
             .to_string_lossy()
             .contains("--claude-worktrees-")
-            || !entry.path().is_dir()
         {
             continue;
+        }
+        // Follows symlinks, as the transcripts' own paths do.
+        match std::fs::metadata(entry.path()) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) => {
+                discovery.skipped.push((entry.path(), e.to_string()));
+                continue;
+            }
         }
         let transcripts = match std::fs::read_dir(entry.path()) {
             Ok(transcripts) => transcripts,
@@ -340,14 +357,17 @@ fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
     found.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut by_worktree: BTreeMap<PathBuf, Session> = BTreeMap::new();
     for (_, line) in found {
-        let worktree = canonical(&line.worktree);
+        // Derived from the canonical root rather than canonicalized on its
+        // own, so a symlink can't move it out of `repo_root`'s worktrees.
+        let repo_root = canonical(&line.repo_root);
+        let worktree = worktree_path(&repo_root, &line.dir);
         match by_worktree.get_mut(&worktree) {
             Some(newer) => newer.older.push(line.session_id),
             None => {
                 by_worktree.insert(
                     worktree.clone(),
                     Session {
-                        repo_root: canonical(&line.repo_root),
+                        repo_root,
                         worktree,
                         transcript_branch: line.branch,
                         session_id: line.session_id,
@@ -394,15 +414,17 @@ fn parse_porcelain(output: &str) -> Vec<WorktreeEntry> {
 /// The running sessions, per `claude agents --json`.
 #[derive(Debug, Default, PartialEq)]
 struct Live {
-    cwds: HashSet<PathBuf>,
+    /// Each cwd's worktree, by the rule discovery uses, or the cwd itself
+    /// when it isn't in one.
+    worktrees: HashSet<PathBuf>,
     session_ids: HashSet<String>,
 }
 
 impl Live {
-    /// Whether a Claude runs in `worktree` (or below it), or runs `session`
-    /// wherever it was started.
+    /// Whether a Claude runs in `worktree`, or runs `session` wherever it
+    /// was started.
     fn covers(&self, worktree: &Path, session: Option<&Session>) -> bool {
-        self.cwds.iter().any(|cwd| cwd.starts_with(worktree))
+        self.worktrees.contains(worktree)
             || session.is_some_and(|s| self.session_ids.contains(&s.session_id))
     }
 }
@@ -418,7 +440,12 @@ fn parse_live(json: &str) -> Result<Live> {
         let Some(cwd) = a.get("cwd").and_then(|c| c.as_str()) else {
             bail!("claude agents --json: an entry has no string cwd: {a}");
         };
-        live.cwds.insert(canonical(Path::new(cwd)));
+        let cwd = canonical(Path::new(cwd));
+        let worktree = match split_worktree_cwd(&cwd.to_string_lossy()) {
+            Some((repo_root, dir)) => worktree_path(&repo_root, &dir),
+            None => cwd,
+        };
+        live.worktrees.insert(worktree);
         if let Some(id) = a.get("sessionId").and_then(|i| i.as_str()) {
             live.session_ids.insert(id.to_string());
         }
@@ -543,8 +570,9 @@ struct Report {
     skipped: Vec<(PathBuf, String)>,
 }
 
-/// Filters the discovered worktrees and launches (or, on a dry run, only
-/// lists) a window for each survivor.
+/// Filters its worktrees (those with transcripts, plus any under
+/// `.claude/worktrees/` git lists without one) and launches (or, on a dry
+/// run, only lists) a window for each survivor.
 fn sweep(
     ext: &dyn External,
     discovery: Discovery,
@@ -609,7 +637,8 @@ fn sweep(
         for (worktree, session) in targets {
             let entry = entries.iter().find(|(p, _)| p == worktree).map(|(_, e)| e);
             // Gone, skipped silently (as is a missing repo root, above). A
-            // missing directory would be recreated by wtclaude.
+            // listed worktree whose directory is missing isn't launched,
+            // because wtclaude would recreate it.
             let Some(entry) = entry.filter(|e| !e.prunable && worktree.is_dir()) else {
                 continue;
             };
@@ -750,8 +779,9 @@ impl Report {
     fn render(&self, projects_dir: &Path) -> String {
         let mut out = String::new();
         if self.scanned == 0 {
-            // Anything skipped is listed: an unreadable directory isn't an
-            // empty machine.
+            // List skipped entries even when nothing was scanned, so
+            // unreadable directories don't look like there are no
+            // transcripts.
             out.push_str(&format!(
                 "No transcripts found under {}/*--claude-worktrees-*/, so no worktrees were checked.\n",
                 projects_dir.display()
@@ -834,17 +864,19 @@ mod tests {
     fn split_worktree_cwd_strips_the_worktree_and_below() {
         assert_eq!(
             split_worktree_cwd("/home/me/repo/.claude/worktrees/feat+x/src/deep"),
-            Some((
-                PathBuf::from("/home/me/repo"),
-                PathBuf::from("/home/me/repo/.claude/worktrees/feat+x")
-            ))
+            Some((PathBuf::from("/home/me/repo"), "feat+x".to_string()))
         );
         assert_eq!(
             split_worktree_cwd("/home/me/repo/.claude/worktrees/feat+x"),
-            Some((
-                PathBuf::from("/home/me/repo"),
-                PathBuf::from("/home/me/repo/.claude/worktrees/feat+x")
-            ))
+            Some((PathBuf::from("/home/me/repo"), "feat+x".to_string()))
+        );
+    }
+
+    #[test]
+    fn split_worktree_cwd_splits_a_nested_worktree_at_the_last_marker() {
+        assert_eq!(
+            split_worktree_cwd("/r/.claude/worktrees/a/.claude/worktrees/b/src"),
+            Some((PathBuf::from("/r/.claude/worktrees/a"), "b".to_string()))
         );
     }
 
@@ -1024,7 +1056,7 @@ mod tests {
             parse_live(r#"[{"cwd":"/nonexistent/a","sessionId":"s1"},{"cwd":"/nonexistent/b"}]"#)
                 .unwrap(),
             Live {
-                cwds: HashSet::from(["/nonexistent/a".into(), "/nonexistent/b".into()]),
+                worktrees: HashSet::from(["/nonexistent/a".into(), "/nonexistent/b".into()]),
                 session_ids: HashSet::from(["s1".into()]),
             }
         );
@@ -1383,6 +1415,22 @@ mod tests {
         );
         assert_eq!(fake.src_calls.borrow().len(), 4);
         assert_eq!(report.exit_code(), 1);
+
+        let rendered = report.render(&s.projects);
+        let headings: Vec<&str> = rendered
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with(' '))
+            .collect();
+        assert_eq!(
+            headings,
+            [
+                "Resumed (1):",
+                "Started fresh (1):",
+                "Failed (2):",
+                "Stale windows, left open (1):",
+                "Transcripts scanned: 1",
+            ]
+        );
     }
 
     #[test]
@@ -1391,6 +1439,9 @@ mod tests {
         let b = Setup::new("two-b", &["b1"]);
         a.transcript("a1", "sid-a1", "a1");
         a.transcript_via(&b.repo, "b1", "sid-b1", "b1");
+        // A repo that no longer exists is skipped silently.
+        let missing = a.base.join("missing");
+        a.transcript_via(&missing, "m1", "sid-m1", "m1");
         let mut fake = Fake {
             agents: Some("[]".into()),
             ..Fake::default()
@@ -1421,6 +1472,31 @@ mod tests {
             ]
         );
         assert_eq!(report.exit_code(), 1);
+        let rendered = report.render(&a.projects);
+        assert!(!rendered.contains(&*missing.to_string_lossy()));
+        assert!(rendered.contains("Transcripts scanned: 3\n"));
+    }
+
+    #[test]
+    fn a_live_nested_worktree_leaves_its_parent_dead() {
+        let s = Setup::new("nested", &["a", "a/.claude/worktrees/b"]);
+        s.transcript("a", "sid-a", "a");
+        let mut fake = Fake {
+            agents: Some(
+                serde_json::json!([{ "cwd": s.worktree("a").join(".claude/worktrees/b") }])
+                    .to_string(),
+            ),
+            ..Fake::default()
+        };
+        fake.worktrees
+            .insert(s.repo.clone(), s.porcelain(&[("a", Some("a"))]));
+        fake.merged.insert("a".into(), String::new());
+
+        let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        let report = sweep(&fake, discovery, Path::new(STARTISH), true).unwrap();
+        assert!(report.live.is_empty());
+        assert_eq!(report.resumed.len(), 1);
+        assert_eq!(report.resumed[0].what, "a");
     }
 
     #[test]

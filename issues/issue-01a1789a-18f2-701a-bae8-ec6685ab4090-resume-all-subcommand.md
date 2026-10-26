@@ -42,23 +42,22 @@ Requested by the skills-secretary session for Early, 2026-10-26.
    from the branch and runs `git worktree add` when that directory is
    missing. A transcript that ended on another branch or on `HEAD` would
    therefore create a stray worktree. Report any mismatch between the two.
+   Worktrees that have no transcript get a fresh session. A repo with no
+   transcripts at all is never discovered.
    Report these worktrees and leave them alone:
    - detached worktrees (no `branch` line)
    - worktrees whose directory name isn't the branch with `/`→`+`. These
      can't be reopened, because `git worktree add` fails with "already
      checked out".
-   - Worktrees that have no transcript get a fresh session. A repo with
-     no transcripts at all is never discovered.
 3. **Filters**, applied in this order:
    - **Gone:** not listed, `prunable`, or the directory is missing. Skip
-     silently. This is the only silent skip.
-   - **Live:** the `.cwd` of an entry in `claude agents --json` is the
-     worktree path or a directory inside it. Skip it. If that call fails, abort: with no
-     live list, every running session looks dead and would get a second
-     Claude. Don't infer liveness from tmux window names, because a
-     window outlives its Claude. A worktree also counts as live when its
-     newest session id is the `sessionId` of an entry in
-     `claude agents --json`.
+     silently, as is a repo root that no longer exists.
+   - **Live:** an entry in `claude agents --json` has a `.cwd` in the
+     worktree, or a `sessionId` equal to the worktree's newest session
+     id. Skip it. If that call fails, abort: with no live list, every
+     running session looks dead and would get a second Claude. Don't
+     infer liveness from tmux window names, because a window outlives
+     its Claude.
    - **Merged:** `gh pr list --head <branch> --state merged`, run in the
      repo. Skip. If `gh` errors, treat the branch as unmerged and say so
      in the report.
@@ -78,11 +77,12 @@ Requested by the skills-secretary session for Early, 2026-10-26.
      prompt**: `wtclaude --no-pull <branch>`. (Decision, grill
      2026-10-26: the skill seeded "Run `pwd && git branch`…", which
      spends a turn per window for nothing the window name doesn't show.)
-   - **Stale windows** (a window already named after the branch): pass
-     on whatever `src window` reports about it. Decided, see below.
-   - If `src window` exits non-zero, record its stderr under "failed"
-     and continue with the next worktree. A wtclaude refusal shows up
-     inside the window, not in the report.
+   - **Stale windows** (a window already named after the branch):
+     report `src window`'s stale-window warning; see "Window launch".
+   - If `src window` exits non-zero, record why under failed: its stderr
+     (or stdout when stderr is empty) and exit status, also when it exits
+     0 with no window id. Continue with the next worktree. A wtclaude
+     refusal shows up inside the window, not in the report.
 5. **Report**, grouped by outcome:
    - resumed
    - started fresh
