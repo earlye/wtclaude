@@ -139,6 +139,26 @@ wtclaude's side:
   kill it or type into it. wtclaude reports the warning. The alternative
   is to drop the stale-window report.
 
+## Testing
+
+Decision (grill 2026-10-26):
+
+- **Unit tests on pure functions, using fixtures:**
+  - transcript tail-parsing (newest usable line, whole-file fallback,
+    `sessionId` falling back to the file stem)
+  - `git worktree list --porcelain` parsing
+  - the directory-name vs branch `/`→`+` check
+  - repo-root extraction from `cwd`
+  - filter order and report grouping
+  - ARGV construction
+- **External calls behind a small trait** (`claude agents --json`, `gh`,
+  `git worktree list`, `src window`). A fake implements it in tests. One
+  `--dry-run` test feeds canned output plus a temp projects dir and
+  checks the report.
+- **No automated tests against real tmux or `src`.** Early does the
+  integration test by hand: reboot, then run `wtclaude resume-all`.
+  `src window` is tested in src.
+
 ## Sandbox: tmux works under Landlock via `path-prepend` (tested 2026-10-26)
 
 The skill says (2026-10-22) that tmux "fails outright" inside a wtclaude
@@ -204,3 +224,4 @@ $ tmux kill-window -t '=wtclaude:rtest-sandbox'     # rc=0
 - Q: When should the `/snap/bin/tmux` resolution check fire (always, or only inside a sandbox)? — A: Never. wtclaude doesn't check tmux; `resume-all` is assumed not to run sandboxed itself.
 - Q: Should the ported window launcher be a public wtclaude subcommand, or an internal module? — A: Neither: delegate session creation and window launch to `src` (new `src window` subcommand, requested of the src session). wtclaude never runs tmux. `src --no-switch` has landed.
 - Q: Should a worktree with no transcript be started with a seeded prompt? — A: No prompt; plain `wtclaude --no-pull <branch>`. Revisit if needed.
+- Q: How should `resume-all` be tested? — A: Unit tests on the pure parts, and a fake behind a trait for the external commands. No real tmux in CI; Early does the integration test by hand (reboot, run it).
