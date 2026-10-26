@@ -64,23 +64,9 @@ windows.
    - The skill's md-issue "resolved" filter (`issues/resolved/` lookup)
      is **dropped**, by Early's decision. It ties wtclaude to one repo's
      issue convention, and the merged-PR check covers most cases.
-4. **One tmux session per repo.**
-   - The name is the basename of the repo root with `.` and `:` → `_`
-     (tmux's `session_check_name`).
-   - Look it up with `has-session -t =name`. The `=` stops `skills` from
-     matching `skills-old`.
-   - If the session is missing, run `src dir <repo> --no-switch`, then
-     re-check with `has-session`, because `src` exits 0 even when
-     `tmux new` failed. If the re-check fails, defer the repo and say so.
-   - Never use plain `src`. It `switch-client`s the user's view, or runs
-     `tmux attach` and hangs.
-   - Preflight with `tmux list-sessions`. "no server running" and
-     "error connecting to … No such file or directory" are fine; any
-     other error aborts. This is the only point where a broken tmux
-     reports its own error, because the `has-session` checks discard
-     stderr.
-5. **Open each window detached**, running
-   `wtclaude --no-pull --resume <sid> <branch>`.
+4. **Launch each window through `src window`**, running
+   `wtclaude --no-pull --resume <sid> <branch>`. wtclaude never runs
+   `tmux` itself; see "Window launch" below.
    - `--no-pull`: wtclaude's pull is a bare `git pull` in the root
      checkout. It moves the root checkout, and aborts when the branch has
      no upstream.
@@ -90,49 +76,65 @@ windows.
      (e.g. "Run `pwd && git branch`…"), not `! pwd && git branch`.
      Claude Code 2.1.310 (2026-10-25) may pass a `!` prompt to the model
      as text; that was never confirmed either way.
-   - **Stale windows** (named after the branch): open the new window
-     anyway, and report the stale one. Don't kill it or type into it.
-   - If a launch fails, record the error and continue with the next
-     worktree. A wtclaude refusal shows up inside the window, not in the
-     report.
-6. **Report**, grouped by outcome:
+   - **Stale windows** (a window already named after the branch): pass
+     on whatever `src window` reports about it. Open question, see below.
+   - If `src window` exits non-zero, record its stderr under "failed"
+     and continue with the next worktree. A wtclaude refusal shows up
+     inside the window, not in the report.
+5. **Report**, grouped by outcome:
    - resumed
    - started fresh
-   - failed
+   - failed (including `src window` failures, e.g. a session that
+     couldn't be created)
    - skipped live
    - skipped merged
    - stale windows
-   - deferred repos
    - detached or mismatched worktrees
    - number of transcripts scanned, and any that were skipped
 
-## Window launch: port `launch-window.sh` to Rust
+## Window launch: delegated to `src window`
 
-Port the script's logic; don't shell out to it. In the skills repo,
-skills-secretary is tracking a move of `/md-issue tmux` onto wtclaude for
-its launch. This launcher should later be something both can call.
+Decision (grill 2026-10-26): the tmux side lives in `src`, not wtclaude.
+`src` already owns the per-repo session layout (naming, `new -A -d`,
+emacs/`$WORKSPACE` setup), and a future `/md-issue tmux` can call the
+same command without wtclaude growing a public launcher subcommand.
+Rejected: porting `launch-window.sh` into wtclaude (the earlier plan),
+which would have duplicated src's session naming and needed a
+`has-session` re-check because `src` exited 0 when `tmux new` failed.
 
-- **Target:** `tmux new-window -d -P -F '#{window_id}' -t =SESSION: -n NAME -c CWD "<cmd>"`.
-- **CWD:** must be the **repo root**. Started inside a worktree, wtclaude
-  would nest `.claude/worktrees/`. Check that CWD exists before
-  launching. If `-c` names a missing directory, tmux silently falls back
-  to `$HOME`.
-- **startish by absolute path:** resolve `startish` before launching. The
-  window gets the tmux server's environment, which may not have
-  `~/.cargo/bin`. `wtclaude` stays a bare word, because it runs in the
-  user's interactive shell after the rc file has set PATH and defined the
-  wtclaude wrapper.
-- **Quoting:** tmux runs the command as one string through its
-  default-shell's `-c`. So `%q`-quote every word of
-  `<startish> --history <h>… -- <command words…>`.
-- **History:** pass `--history "wtclaude --no-pull <branch>"`. The
-  wtclaude wrapper pushes the resume line on exit. In the window,
-  up-arrow then gives the command first, then the `--history` entries
-  from last to first.
-- **Window id:** on 2026-10-23 the skill saw `-P -F '#{window_id}'`
-  print nothing. In that case it used the single window id that wasn't
-  there before the launch. On 2026-10-26 the same call printed `@11`, so
-  that didn't reproduce. Keep the fallback.
+Requested of the `src` session on 2026-10-26 (to be tracked there via
+`/md-issue-track`):
+
+`src window <DIR> -n NAME -- ARGV…` ensures DIR's session exists
+without switching or attaching, checks DIR exists, opens
+`tmux new-window -d -P -F '#{window_id}' -t =SESSION: -n NAME -c DIR "<cmd>"`
+with every ARGV word `%q`-quoted, prints the window id (with the
+before/after diff fallback for an empty `-P` output), and exits
+non-zero with a reason on stderr on any failure.
+
+wtclaude's side:
+
+- **DIR:** the **repo root**. Started inside a worktree, wtclaude would
+  nest `.claude/worktrees/`.
+- **NAME:** the branch.
+- **ARGV:** `<startish> --history "wtclaude --no-pull <branch>" -- wtclaude --no-pull --resume <sid> <branch>`.
+  - Resolve `startish` to an absolute path before launching. The window
+    gets the tmux server's environment, which may not have
+    `~/.cargo/bin`.
+  - `wtclaude` stays a bare word, because it runs in the user's
+    interactive shell after the rc file has set PATH and defined the
+    wtclaude wrapper.
+  - The wtclaude wrapper pushes the resume line on exit. In the window,
+    up-arrow then gives the command first, then the `--history` entries
+    from last to first.
+- **Ordering:** this PR depends on `src window` being released and
+  installed. With an older `src`, every launch fails with clap's
+  "unrecognized subcommand" and lands under "failed".
+- **Open question:** stale-window detection needs the session name,
+  which now lives only in `src`. Proposed to src: warn on stderr when a
+  window named NAME already exists, still open the new one, and don't
+  kill it or type into it. wtclaude reports the warning. The alternative
+  is to drop the stale-window report.
 
 ## Sandbox: tmux works under Landlock via `path-prepend` (tested 2026-10-26)
 
@@ -170,8 +172,9 @@ $ tmux kill-window -t '=wtclaude:rtest-sandbox'     # rc=0
   (the post-reboot terminal), where `/snap/bin/tmux` works. An earlier
   draft suggested failing whenever `tmux` resolved into `/snap/bin`; that
   would refuse on the very machine this is for. Run inside a sandbox
-  whose mode lacks the payload dir in `path-prepend`, the tmux preflight
-  (`list-sessions`) fails and reports the snap-confine error itself.
+  whose mode lacks the payload dir in `path-prepend`, `src window`'s tmux
+  call fails and its stderr carries the snap-confine error into the
+  report. (wtclaude itself no longer runs tmux; see "Window launch".)
 - The tools the launch needed resolved without snap-confine:
   - `startish` and `wtclaude` → `~/.cargo/bin`
   - `claude` → `~/.local/bin`
@@ -187,7 +190,7 @@ $ tmux kill-window -t '=wtclaude:rtest-sandbox'     # rc=0
 - `src/launch.rs:202`, `:261`, `:1073` — `--no-pull` and `git_pull`
 - `src/launch.rs:205`, `:644` — `--resume` and `add_session_args`
 - `src/launch.rs:689`–`:744` — resume-line handoff to the shell wrapper (history)
-- `src/launch.rs:1360` — `TmuxWindowName`, the window renaming the stale-window check relies on
+- `src/launch.rs:1360` — `TmuxWindowName`, the window renaming that keeps windows named after the branch
 - `src/config.rs:81`, `src/launch.rs:119` — `path-prepend` and `apply_path_prepend`
 - `src/hook.rs:166`, `:277` — snap guard / `snap_command` (context only; no tmux resolution check, see Sandbox)
 
@@ -196,3 +199,4 @@ $ tmux kill-window -t '=wtclaude:rtest-sandbox'     # rc=0
 ### 2026-10-26
 
 - Q: When should the `/snap/bin/tmux` resolution check fire (always, or only inside a sandbox)? — A: Never. wtclaude doesn't check tmux; `resume-all` is assumed not to run sandboxed itself.
+- Q: Should the ported window launcher be a public wtclaude subcommand, or an internal module? — A: Neither: delegate session creation and window launch to `src` (new `src window` subcommand, requested of the src session). wtclaude never runs tmux. `src --no-switch` has landed.
