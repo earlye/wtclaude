@@ -707,7 +707,7 @@ fn resume_command(
 
 /// Leaves `word` bare when no shell would split or expand it. A leading `=`
 /// or `%` is quoted: zsh expands `=cmd` to a path, and `%` names a job.
-fn shell_quote(word: &str) -> String {
+pub(crate) fn shell_quote(word: &str) -> String {
     let safe = !word.is_empty()
         && !word.starts_with(['=', '%'])
         && word
@@ -806,7 +806,8 @@ fn write_handoff(
         );
     }
     let file = parent.join(handoff.file_name().context("has no file name")?);
-    let plan = sandbox::plan(sandbox_root, repo_root, Some(mode)).context("computing the session's plan")?;
+    let plan = sandbox::plan(sandbox_root, repo_root, Some(mode))
+        .context("computing the session's plan")?;
     if plan.grants_write(&file) {
         bail!(
             "the session could write {}, so its contents can't be trusted; set \
@@ -896,7 +897,7 @@ fn directory_label(canonical: &Path) -> String {
         .unwrap_or_else(|| canonical.to_string_lossy().to_string())
 }
 
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     // claude replaces '/' with '+' in worktree directory names
     name.replace('/', "+")
 }
@@ -1182,15 +1183,14 @@ fn find_worktree_for_branch(name: &str, repo_root: &Path) -> Result<Option<PathB
     for line in text.lines() {
         if let Some(wt_path) = line.strip_prefix("worktree ") {
             current_path = Some(wt_path);
-        } else if let Some(branch_ref) = line.strip_prefix("branch ") {
-            if branch_ref == target_ref {
-                if let Some(wt_path) = current_path {
-                    let canonical = PathBuf::from(wt_path)
-                        .canonicalize()
-                        .unwrap_or_else(|_| PathBuf::from(wt_path));
-                    return Ok(Some(canonical));
-                }
-            }
+        } else if let Some(branch_ref) = line.strip_prefix("branch ")
+            && branch_ref == target_ref
+            && let Some(wt_path) = current_path
+        {
+            let canonical = PathBuf::from(wt_path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(wt_path));
+            return Ok(Some(canonical));
         }
     }
     Ok(None)
@@ -1273,8 +1273,8 @@ fn post_exit_menu(name: &str, worktree_path: &Path, repo_root: &Path) -> Result<
     draw(&mut stdout, sel)?;
 
     loop {
-        match event::read()? {
-            Event::Key(key) => match (key.code, key.modifiers) {
+        if let Event::Key(key) = event::read()? {
+            match (key.code, key.modifiers) {
                 (KeyCode::Up, _) => {
                     if sel > 0 {
                         sel -= 1;
@@ -1295,8 +1295,7 @@ fn post_exit_menu(name: &str, worktree_path: &Path, repo_root: &Path) -> Result<
                     break;
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 

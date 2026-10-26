@@ -51,12 +51,15 @@ pub fn run_sessions() -> Result<()> {
                 continue;
             }
 
-            let mtime = session_entry.metadata()?.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let mtime = session_entry
+                .metadata()?
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH);
             entries.push((mtime, session_id, worktree.clone()));
         }
     }
 
-    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     for (mtime, session_id, worktree) in entries {
         let epoch = mtime
@@ -149,7 +152,7 @@ pub fn session_exists(session_id: &str) -> Result<bool> {
 
 /// Where Claude keeps per-project transcripts: `$CLAUDE_CONFIG_DIR/projects`
 /// when that is set and non-empty, else `~/.claude/projects`.
-fn projects_dir() -> Result<PathBuf> {
+pub(crate) fn projects_dir() -> Result<PathBuf> {
     let config_dir = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
         Some(dir) => PathBuf::from(dir),
         None => PathBuf::from(std::env::var("HOME").context("HOME not set")?).join(".claude"),

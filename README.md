@@ -262,6 +262,20 @@ wtclaude --mode dangerous refactor-auth
 wtclaude --no-pull my-feature
 ```
 
+### Reopening worktrees after a reboot
+
+`wtclaude resume-all [--dry-run]` reopens every worktree under
+`.claude/worktrees/` whose Claude session isn't running. It finds them
+from Claude's transcripts, takes each branch from
+`git worktree list --porcelain`, and skips worktrees that are gone, live
+(per `claude agents --json`) or whose PR is merged (per `gh`). Each of
+the rest gets a window in its repo's tmux session, opened with
+`src window`, running `wtclaude --no-pull --resume <session> <branch>`
+under `startish` (or `wtclaude --no-pull <branch>` when the worktree
+has no transcript). It prints a report grouped by outcome. `--dry-run`
+prints the same report without opening any windows. Needs `src` with
+the `window` subcommand, and `startish`, on `PATH`.
+
 
 ## Modes
 
