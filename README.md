@@ -265,12 +265,14 @@ wtclaude --no-pull my-feature
 ### Reopening worktrees after a reboot
 
 `wtclaude resume-all [--dry-run]` reopens every worktree under
-`.claude/worktrees/` whose Claude session isn't running. Claude's
-transcripts name the repos, and each transcript the session to resume;
-`git worktree list --porcelain` then lists every worktree in those repos,
-including ones without a transcript, and gives each one's branch. It
-skips worktrees that are gone, live (per `claude agents --json`) or
-whose PR is merged (per `gh`). Each of the rest gets a window in its
+`.claude/worktrees/` whose Claude session isn't running. It finds the
+repos in Claude's transcripts, and takes each worktree's session to
+resume from its newest transcript; `git worktree list --porcelain` then
+lists every worktree in those repos, including ones without a
+transcript, and gives each one's branch. It skips worktrees that are
+gone, live (per `claude agents --json`) or whose PR is merged (per
+`gh`), and leaves alone (and reports) detached worktrees and those whose
+directory name isn't the branch with `/`→`+`. Each of the rest gets a window in its
 repo's tmux session, opened with `src window`, running
 `wtclaude --no-pull --resume <session> <branch>` under `startish` (or
 `wtclaude --no-pull <branch>` when the worktree has no transcript). It

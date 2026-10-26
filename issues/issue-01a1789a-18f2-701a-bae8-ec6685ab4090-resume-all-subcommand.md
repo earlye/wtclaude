@@ -56,7 +56,9 @@ Requested by the skills-secretary session for Early, 2026-10-26.
      worktree path or a directory inside it. Skip it. If that call fails, abort: with no
      live list, every running session looks dead and would get a second
      Claude. Don't infer liveness from tmux window names, because a
-     window outlives its Claude.
+     window outlives its Claude. A worktree also counts as live when its
+     newest session id is the `sessionId` of an entry in
+     `claude agents --json`.
    - **Merged:** `gh pr list --head <branch> --state merged`, run in the
      repo. Skip. If `gh` errors, treat the branch as unmerged and say so
      in the report.
@@ -203,7 +205,7 @@ $ tmux kill-window -t '=wtclaude:rtest-sandbox'     # rc=0
   would refuse on the very machine this is for. Run inside a sandbox
   whose mode lacks the payload dir in `path-prepend`, `src window`'s tmux
   call fails and its stderr carries the snap-confine error into the
-  report. (wtclaude itself no longer runs tmux; see "Window launch".)
+  report. (wtclaude doesn't run tmux; see "Window launch".)
 - The tools the launch needed resolved without snap-confine:
   - `startish` and `wtclaude` → `~/.cargo/bin`
   - `claude` → `~/.local/bin`

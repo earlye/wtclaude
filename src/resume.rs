@@ -1,6 +1,7 @@
 //! `wtclaude resume-all`: after a reboot or power loss, reopen every
 //! worktree whose Claude session isn't running, each in a tmux window
-//! (opened by `src window`) that resumes its newest session.
+//! (opened by `src window`) that resumes its newest session, or starts a
+//! fresh one when it has no transcript.
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -28,37 +29,52 @@ const WORKTREES_MARKER: &str = "/.claude/worktrees/";
 
 pub fn run(args: ResumeAllArgs) -> Result<i32> {
     let path_var = std::env::var("PATH").unwrap_or_default();
-    let (startish, startish_note) = resolve_startish(&path_var, args.dry_run)?;
+    let (startish, startish_note) = resolve_tool("startish", "", &path_var, args.dry_run)?;
+    let (src, src_note) = resolve_tool(
+        "src",
+        "; resume-all opens windows through `src window`",
+        &path_var,
+        args.dry_run,
+    )?;
 
     let projects_dir = projects_dir()?;
     let discovery = discover(&projects_dir, TAIL_BYTES)?;
-    let mut report = sweep(&System, discovery, &startish, args.dry_run)?;
-    report.startish_note = startish_note;
+    let mut report = sweep(&System { src }, discovery, &startish, args.dry_run)?;
+    report.notes = [startish_note, src_note].into_iter().flatten().collect();
     print!("{}", report.render(&projects_dir));
     Ok(report.exit_code())
 }
 
-/// The absolute path of `startish`: the window gets the tmux server's
-/// environment, whose PATH may not include ~/.cargo/bin. A dry run opens
-/// no window, so there a missing `startish` falls back to the bare word,
-/// with a note for the report.
-fn resolve_startish(path_var: &str, dry_run: bool) -> Result<(PathBuf, Option<String>)> {
-    match resolve_on_path("startish", path_var) {
+/// The absolute path of `word` on PATH, resolved up front so a missing
+/// tool stops the run once instead of failing every worktree. `startish`
+/// needs it anyway: the window gets the tmux server's environment, whose
+/// PATH may not include ~/.cargo/bin. A dry run opens no window, so there
+/// a missing tool falls back to the bare word, with a note for the report.
+/// `why` is appended to the error.
+fn resolve_tool(
+    word: &str,
+    why: &str,
+    path_var: &str,
+    dry_run: bool,
+) -> Result<(PathBuf, Option<String>)> {
+    match resolve_on_path(word, path_var) {
         Some(p) => {
-            let p = std::path::absolute(&p).context("resolving startish")?;
+            let p = std::path::absolute(&p).with_context(|| format!("resolving {word}"))?;
             Ok((p, None))
         }
         None if dry_run => Ok((
-            PathBuf::from("startish"),
-            Some("startish not found on PATH; a real run would stop here".to_string()),
+            PathBuf::from(word),
+            Some(format!(
+                "{word} not found on PATH; a real run would stop here"
+            )),
         )),
-        None => bail!("startish not found on PATH"),
+        None => bail!("{word} not found on PATH{why}"),
     }
 }
 
 /// The commands `resume-all` runs, behind a trait so tests can fake them.
 /// Each except `src` returns the command's stdout, or an error carrying its
-/// exit status and stderr.
+/// exit status and its stderr (or stdout if stderr is empty).
 pub(crate) trait External {
     /// `claude agents --json`
     fn claude_agents(&self) -> Result<String>;
@@ -79,10 +95,14 @@ pub(crate) struct SrcOutput {
     pub stderr: String,
 }
 
-struct System;
+struct System {
+    /// `src`, resolved on PATH.
+    src: PathBuf,
+}
 
-/// Why a command failed: its stderr, or its stdout when stderr is empty,
-/// followed by the exit status, which is all there is for a signal.
+/// Why a command failed: its stderr (or stdout when stderr is empty)
+/// followed by the exit status, or just the exit status when both are
+/// empty, as when it was killed by a signal.
 fn failure_reason(status: &str, stdout: &str, stderr: &str) -> String {
     let text = [stderr.trim(), stdout.trim()]
         .into_iter()
@@ -143,7 +163,7 @@ impl External for System {
     }
 
     fn src(&self, args: &[String]) -> Result<SrcOutput> {
-        let output = Command::new("src")
+        let output = Command::new(&self.src)
             .args(args)
             .output()
             .context("running src")?;
@@ -187,7 +207,9 @@ struct Discovery {
 /// Splits a `cwd` inside `<repo>/.claude/worktrees/<dir>` into the repo root
 /// and the worktree path, dropping anything below the worktree. It splits at
 /// the last marker, so for a worktree nested inside another, the outer
-/// worktree is the repo root, deliberately.
+/// worktree is the repo root: wtclaude run inside a worktree nests
+/// `.claude/worktrees/` under it, so the outer worktree is where that
+/// branch's directory lives and where `wtclaude <branch>` would look.
 fn split_worktree_cwd(cwd: &str) -> Option<(PathBuf, PathBuf)> {
     let at = cwd.rfind(WORKTREES_MARKER)?;
     let repo_root = &cwd[..at];
@@ -251,8 +273,8 @@ fn read_transcript(path: &Path, tail: u64) -> Result<Option<LastLine>> {
 
 /// Reads `<projects_dir>/*--claude-worktrees-*/*.jsonl`. Only top-level
 /// files, which leaves out subagent transcripts in subdirectories. Paths
-/// are canonicalized, so two spellings of one repo or worktree (a symlink,
-/// a bind mount) group together.
+/// are canonicalized, so two spellings that differ only by symlinks group
+/// together. Bind mounts are not unified.
 fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
     let mut discovery = Discovery::default();
     if !projects_dir.is_dir() {
@@ -298,9 +320,13 @@ fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
                 continue;
             }
             discovery.scanned += 1;
-            let mtime = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+                Ok(mtime) => mtime,
+                Err(e) => {
+                    discovery.skipped.push((path, e.to_string()));
+                    continue;
+                }
+            };
             match read_transcript(&path, tail) {
                 Ok(Some(line)) => found.push((mtime, line)),
                 Ok(None) => discovery
@@ -365,19 +391,39 @@ fn parse_porcelain(output: &str) -> Vec<WorktreeEntry> {
     entries
 }
 
-/// The `cwd` of every running session in `claude agents --json`. An entry
-/// without a string `cwd` is an error: dropping it would make its session
-/// look dead.
-fn parse_live_cwds(json: &str) -> Result<HashSet<PathBuf>> {
+/// The running sessions, per `claude agents --json`.
+#[derive(Debug, Default, PartialEq)]
+struct Live {
+    cwds: HashSet<PathBuf>,
+    session_ids: HashSet<String>,
+}
+
+impl Live {
+    /// Whether a Claude runs in `worktree` (or below it), or runs `session`
+    /// wherever it was started.
+    fn covers(&self, worktree: &Path, session: Option<&Session>) -> bool {
+        self.cwds.iter().any(|cwd| cwd.starts_with(worktree))
+            || session.is_some_and(|s| self.session_ids.contains(&s.session_id))
+    }
+}
+
+/// Reads `claude agents --json`. An entry without a string `cwd` is an
+/// error: dropping it would make its session look dead. `sessionId` is
+/// optional.
+fn parse_live(json: &str) -> Result<Live> {
     let agents: Vec<serde_json::Value> =
         serde_json::from_str(json).context("parsing claude agents --json")?;
-    agents
-        .iter()
-        .map(|a| match a.get("cwd").and_then(|c| c.as_str()) {
-            Some(cwd) => Ok(canonical(Path::new(cwd))),
-            None => bail!("claude agents --json: an entry has no string cwd: {a}"),
-        })
-        .collect()
+    let mut live = Live::default();
+    for a in &agents {
+        let Some(cwd) = a.get("cwd").and_then(|c| c.as_str()) else {
+            bail!("claude agents --json: an entry has no string cwd: {a}");
+        };
+        live.cwds.insert(canonical(Path::new(cwd)));
+        if let Some(id) = a.get("sessionId").and_then(|i| i.as_str()) {
+            live.session_ids.insert(id.to_string());
+        }
+    }
+    Ok(live)
 }
 
 /// Whether the worktree directory is the one wtclaude would derive from
@@ -446,9 +492,10 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// One line of the report: a worktree (by branch, or by path when it has
-/// no usable branch), or `(whole repo)` when the repo couldn't be listed,
-/// in a repo, plus whatever is worth saying about it.
+/// One line of the report, within a repo: a worktree, named by its branch,
+/// or by its path when it's detached or its directory doesn't match the
+/// branch, or `(whole repo)` when `git worktree list` failed. `detail` says
+/// whatever else is worth saying.
 #[derive(Debug, PartialEq)]
 struct Entry {
     repo: PathBuf,
@@ -480,8 +527,8 @@ impl Entry {
 #[derive(Debug, Default)]
 struct Report {
     dry_run: bool,
-    /// Set when a dry run couldn't find `startish`.
-    startish_note: Option<String>,
+    /// Set when a dry run couldn't find `startish` or `src`.
+    notes: Vec<String>,
     resumed: Vec<Entry>,
     fresh: Vec<Entry>,
     failed: Vec<Entry>,
@@ -492,7 +539,8 @@ struct Report {
     stale_windows: Vec<Entry>,
     left_alone: Vec<Entry>,
     scanned: usize,
-    skipped_transcripts: Vec<(PathBuf, String)>,
+    /// Transcripts and project directories that couldn't be read or used.
+    skipped: Vec<(PathBuf, String)>,
 }
 
 /// Filters the discovered worktrees and launches (or, on a dry run, only
@@ -506,7 +554,7 @@ fn sweep(
     let mut report = Report {
         dry_run,
         scanned: discovery.scanned,
-        skipped_transcripts: discovery.skipped,
+        skipped: discovery.skipped,
         ..Report::default()
     };
     if discovery.sessions.is_empty() {
@@ -517,7 +565,7 @@ fn sweep(
     // second Claude, so a failure here stops everything.
     let live = ext
         .claude_agents()
-        .and_then(|json| parse_live_cwds(&json))
+        .and_then(|json| parse_live(&json))
         .context("cannot tell which worktrees are live")?;
 
     // Discovery canonicalized both paths, so each repo has one bucket.
@@ -576,8 +624,7 @@ fn sweep(
                 _ => None,
             };
             let note = note.as_deref();
-            // A Claude started below the worktree still counts.
-            if live.iter().any(|cwd| cwd.starts_with(worktree)) {
+            if live.covers(worktree, session) {
                 let what = entry.branch.as_deref().unwrap_or(&worktree_label);
                 report
                     .live
@@ -653,6 +700,13 @@ fn launch(
                 &output.stdout,
                 &output.stderr,
             )),
+            Ok(output) if output.stdout.trim().is_empty() => {
+                let mut reason = "src window succeeded but printed no window id".to_string();
+                if !output.stderr.trim().is_empty() {
+                    reason.push_str(&format!(": {}", output.stderr.trim()));
+                }
+                Some(reason)
+            }
             Ok(output) => {
                 let (stale, other) = split_src_stderr(&output.stderr);
                 for warning in stale {
@@ -696,15 +750,18 @@ impl Report {
     fn render(&self, projects_dir: &Path) -> String {
         let mut out = String::new();
         if self.scanned == 0 {
+            // Anything skipped is listed: an unreadable directory isn't an
+            // empty machine.
             out.push_str(&format!(
                 "No transcripts found under {}/*--claude-worktrees-*/, so no worktrees were checked.\n",
                 projects_dir.display()
             ));
+            self.render_skipped(&mut out);
             return out;
         }
         if self.dry_run {
             out.push_str("Dry run: no windows were opened.\n");
-            if let Some(note) = &self.startish_note {
+            for note in &self.notes {
                 out.push_str(&format!("Note: {note}.\n"));
             }
             out.push('\n');
@@ -748,15 +805,22 @@ impl Report {
             out.push_str("Nothing to resume.\n\n");
         }
 
+        out.push_str(&format!("Transcripts scanned: {}\n", self.scanned));
+        self.render_skipped(&mut out);
+        out
+    }
+
+    fn render_skipped(&self, out: &mut String) {
+        if self.skipped.is_empty() {
+            return;
+        }
         out.push_str(&format!(
-            "Transcripts scanned: {}, skipped: {}\n",
-            self.scanned,
-            self.skipped_transcripts.len()
+            "Transcripts and directories skipped ({}):\n",
+            self.skipped.len()
         ));
-        for (path, why) in &self.skipped_transcripts {
+        for (path, why) in &self.skipped {
             out.push_str(&format!("  {}: {why}\n", path.display()));
         }
-        out
     }
 }
 
@@ -955,33 +1019,48 @@ mod tests {
     }
 
     #[test]
-    fn parse_live_cwds_rejects_an_entry_without_a_cwd() {
+    fn parse_live_rejects_an_entry_without_a_cwd() {
         assert_eq!(
-            parse_live_cwds(r#"[{"cwd":"/nonexistent/a"}]"#).unwrap(),
-            HashSet::from([PathBuf::from("/nonexistent/a")])
+            parse_live(r#"[{"cwd":"/nonexistent/a","sessionId":"s1"},{"cwd":"/nonexistent/b"}]"#)
+                .unwrap(),
+            Live {
+                cwds: HashSet::from(["/nonexistent/a".into(), "/nonexistent/b".into()]),
+                session_ids: HashSet::from(["s1".into()]),
+            }
         );
-        assert!(parse_live_cwds(r#"[{"cwd":"/a"},{"directory":"/b"}]"#).is_err());
-        assert!(parse_live_cwds(r#"[{"cwd":null}]"#).is_err());
+        assert!(parse_live(r#"[{"cwd":"/a"},{"directory":"/b"}]"#).is_err());
+        assert!(parse_live(r#"[{"cwd":null}]"#).is_err());
+        assert!(parse_live(r#"[{"sessionId":"s1"}]"#).is_err());
     }
 
     #[test]
-    fn resolve_startish_falls_back_only_on_a_dry_run() {
-        assert!(resolve_startish("", false).is_err());
-        let (path, note) = resolve_startish("", true).unwrap();
-        assert_eq!(path, PathBuf::from("startish"));
-        assert!(note.is_some());
+    fn resolve_tool_falls_back_only_on_a_dry_run() {
+        let err = resolve_tool(
+            "src",
+            "; resume-all opens windows through `src window`",
+            "",
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "src not found on PATH; resume-all opens windows through `src window`"
+        );
+        let (startish, startish_note) = resolve_tool("startish", "", "", true).unwrap();
+        assert_eq!(startish, PathBuf::from("startish"));
+        let (_, src_note) = resolve_tool("src", "", "", true).unwrap();
 
         let report = Report {
             dry_run: true,
-            startish_note: note,
+            notes: [startish_note, src_note].into_iter().flatten().collect(),
             scanned: 1,
             ..Report::default()
         };
-        assert!(
-            report
-                .render(Path::new("/p"))
-                .starts_with("Dry run: no windows were opened.\nNote: startish not found on PATH")
-        );
+        assert!(report.render(Path::new("/p")).starts_with(
+            "Dry run: no windows were opened.\n\
+             Note: startish not found on PATH; a real run would stop here.\n\
+             Note: src not found on PATH; a real run would stop here.\n"
+        ));
     }
 
     /// Canned answers for every external command. A missing entry for a
@@ -1073,6 +1152,21 @@ mod tests {
             .unwrap();
         }
 
+        /// Backdates a transcript by an hour, making it older than the rest.
+        fn age(&self, dir: &str, session_id: &str) {
+            let path = self
+                .projects
+                .join(format!("x--claude-worktrees-{dir}"))
+                .join(format!("{session_id}.jsonl"));
+            let earlier = SystemTime::now() - std::time::Duration::from_secs(3600);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(earlier)
+                .unwrap();
+        }
+
         fn porcelain(&self, worktrees: &[(&str, Option<&str>)]) -> String {
             let mut out = format!(
                 "worktree {}\nHEAD 0\nbranch refs/heads/main\n\n",
@@ -1113,9 +1207,31 @@ mod tests {
                 "detached",
                 "misnamed",
                 "live-detached",
+                "e+byid",
+                "e+prunable",
             ],
         );
+        s.transcript("e+resume", "sid-resume-old", "e/resume");
+        s.age("e+resume", "sid-resume-old");
         s.transcript("e+resume", "sid-resume", "HEAD");
+        // A subagent transcript in a subdirectory isn't read.
+        let subagents = s
+            .projects
+            .join("x--claude-worktrees-e+resume/sid-resume/subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        std::fs::copy(
+            s.projects
+                .join("x--claude-worktrees-e+resume/sid-resume.jsonl"),
+            subagents.join("x.jsonl"),
+        )
+        .unwrap();
+        s.transcript("e+byid", "sid-byid", "e/byid");
+        s.transcript("e+prunable", "sid-prunable", "e/prunable");
+        // Listed by git, but its directory is missing.
+        s.transcript("e+nodir", "sid-nodir", "e/nodir");
+        let unusable = s.projects.join("x--claude-worktrees-junk/junk.jsonl");
+        std::fs::create_dir_all(unusable.parent().unwrap()).unwrap();
+        std::fs::write(&unusable, "{\"cwd\":\"/r\"}\n").unwrap();
         s.transcript("e+live", "sid-live", "old/live");
         s.transcript("e+merged", "sid-merged", "old/merged");
         s.transcript("e+nogh", "sid-nogh", "e/nogh");
@@ -1129,36 +1245,43 @@ mod tests {
                     { "cwd": s.worktree("e+live").join("src") },
                     { "cwd": s.worktree("live-detached") },
                     { "cwd": "/elsewhere" },
+                    // Started at the repo root, so only its session id
+                    // ties it to its worktree.
+                    { "cwd": s.repo, "sessionId": "sid-byid" },
                 ])
                 .to_string(),
             ),
             ..Fake::default()
         };
-        fake.worktrees.insert(
-            s.repo.clone(),
-            s.porcelain(&[
-                ("e+resume", Some("e/resume")),
-                ("e+fresh", Some("e/fresh")),
-                ("e+live", Some("e/live")),
-                ("e+merged", Some("e/merged")),
-                ("e+nogh", Some("e/nogh")),
-                ("detached", None),
-                ("misnamed", Some("other")),
-                ("live-detached", None),
-            ]),
-        );
+        let mut porcelain = s.porcelain(&[
+            ("e+resume", Some("e/resume")),
+            ("e+fresh", Some("e/fresh")),
+            ("e+live", Some("e/live")),
+            ("e+merged", Some("e/merged")),
+            ("e+nogh", Some("e/nogh")),
+            ("detached", None),
+            ("misnamed", Some("other")),
+            ("live-detached", None),
+            ("e+byid", Some("e/byid")),
+            ("e+nodir", Some("e/nodir")),
+            ("e+prunable", Some("e/prunable")),
+        ]);
+        porcelain.push_str("prunable gitdir file points to non-existent location\n");
+        fake.worktrees.insert(s.repo.clone(), porcelain);
         for branch in ["e/resume", "e/fresh", "e/live"] {
             fake.merged.insert(branch.into(), String::new());
         }
         fake.merged.insert("e/merged".into(), "42\n".into());
 
         let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
-        assert_eq!(discovery.scanned, 6);
+        assert_eq!(discovery.scanned, 11);
         let report = sweep(&fake, discovery, Path::new(STARTISH), true).unwrap();
 
         assert!(fake.src_calls.borrow().is_empty());
-        // Live is filtered before the merge check.
-        assert!(!fake.gh_calls.borrow().contains(&"e/live".to_string()));
+        // Gone and live are filtered before the merge check.
+        for branch in ["e/live", "e/byid", "e/nodir", "e/prunable"] {
+            assert!(!fake.gh_calls.borrow().contains(&branch.to_string()));
+        }
 
         let repo = s.repo.to_string_lossy();
         let rendered = report.render(&s.projects);
@@ -1166,10 +1289,11 @@ mod tests {
             "Dry run: no windows were opened.\n\n\
              Would resume (2):\n\
              \x20 {repo}  e/nogh  (session sid-nogh; would run: src window {repo} -n e/nogh -- /bin/startish --history 'wtclaude --no-pull e/nogh' -- wtclaude --no-pull --resume sid-nogh e/nogh)\n\
-             \x20 {repo}  e/resume  (session sid-resume; would run: src window {repo} -n e/resume -- /bin/startish --history 'wtclaude --no-pull e/resume' -- wtclaude --no-pull --resume sid-resume e/resume; transcript was on HEAD)\n\n\
+             \x20 {repo}  e/resume  (session sid-resume; would run: src window {repo} -n e/resume -- /bin/startish --history 'wtclaude --no-pull e/resume' -- wtclaude --no-pull --resume sid-resume e/resume; older sessions ignored: sid-resume-old; transcript was on HEAD)\n\n\
              Would start fresh (1):\n\
              \x20 {repo}  e/fresh  (would run: src window {repo} -n e/fresh -- /bin/startish --history 'wtclaude --no-pull e/fresh' -- wtclaude --no-pull e/fresh)\n\n\
-             Skipped, live (2):\n\
+             Skipped, live (3):\n\
+             \x20 {repo}  e/byid\n\
              \x20 {repo}  e/live  (transcript was on old/live)\n\
              \x20 {repo}  {live_detached}\n\n\
              Skipped, merged (1):\n\
@@ -1179,7 +1303,10 @@ mod tests {
              Detached or mismatched worktrees, left alone (2):\n\
              \x20 {repo}  {detached}  (detached)\n\
              \x20 {repo}  {misnamed}  (directory name doesn't match branch other)\n\n\
-             Transcripts scanned: 6, skipped: 0\n",
+             Transcripts scanned: 11\n\
+             Transcripts and directories skipped (1):\n\
+             \x20 {unusable}: no line with a worktree cwd\n",
+            unusable = unusable.display(),
             detached = s.worktree("detached").display(),
             misnamed = s.worktree("misnamed").display(),
             live_detached = s.worktree("live-detached").display(),
@@ -1190,7 +1317,7 @@ mod tests {
 
     #[test]
     fn launch_files_failures_stale_windows_and_window_ids() {
-        let s = Setup::new("launch", &["ok", "stale", "bad"]);
+        let s = Setup::new("launch", &["ok", "stale", "bad", "noid"]);
         s.transcript("ok", "sid-ok", "ok");
         let mut fake = Fake {
             agents: Some("[]".into()),
@@ -1202,9 +1329,10 @@ mod tests {
                 ("ok", Some("ok")),
                 ("stale", Some("stale")),
                 ("bad", Some("bad")),
+                ("noid", Some("noid")),
             ]),
         );
-        for branch in ["ok", "stale", "bad"] {
+        for branch in ["ok", "stale", "bad", "noid"] {
             fake.merged.insert(branch.into(), String::new());
         }
         fake.src.insert(
@@ -1223,6 +1351,8 @@ mod tests {
             "bad".into(),
             (false, String::new(), "no such session\n".into()),
         );
+        fake.src
+            .insert("noid".into(), (true, "\n".into(), "odd\n".into()));
 
         let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
         let report = sweep(&fake, discovery, Path::new(STARTISH), false).unwrap();
@@ -1239,7 +1369,10 @@ mod tests {
         assert_eq!(report.fresh, [entry("stale", "window @2")]);
         assert_eq!(
             report.failed,
-            [entry("bad", "no such session (exit status: 1)")]
+            [
+                entry("bad", "no such session (exit status: 1)"),
+                entry("noid", "src window succeeded but printed no window id: odd"),
+            ]
         );
         assert_eq!(
             report.stale_windows,
@@ -1248,7 +1381,7 @@ mod tests {
                 "session repo already has a window named stale (@0)"
             )]
         );
-        assert_eq!(fake.src_calls.borrow().len(), 3);
+        assert_eq!(fake.src_calls.borrow().len(), 4);
         assert_eq!(report.exit_code(), 1);
     }
 
@@ -1296,14 +1429,7 @@ mod tests {
         let link = s.base.join("link");
         std::os::unix::fs::symlink(&s.repo, &link).unwrap();
         s.transcript("w", "old", "w");
-        let old = s.projects.join("x--claude-worktrees-w").join("old.jsonl");
-        let earlier = SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_modified(earlier)
-            .unwrap();
+        s.age("w", "old");
         s.transcript_via(&link, "w", "new", "w");
 
         let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
@@ -1324,17 +1450,54 @@ mod tests {
     }
 
     #[test]
+    fn a_live_cwd_through_a_symlink_counts_as_live() {
+        let s = Setup::new("symlink-live", &["w"]);
+        let link = s.base.join("link");
+        std::os::unix::fs::symlink(&s.repo, &link).unwrap();
+        s.transcript("w", "sid", "w");
+        // canonicalize needs the cwd to exist.
+        std::fs::create_dir_all(s.worktree("w").join("src")).unwrap();
+        let mut fake = Fake {
+            agents: Some(
+                serde_json::json!([{ "cwd": link.join(".claude/worktrees/w/src") }]).to_string(),
+            ),
+            ..Fake::default()
+        };
+        fake.worktrees
+            .insert(s.repo.clone(), s.porcelain(&[("w", Some("w"))]));
+        fake.merged.insert("w".into(), String::new());
+
+        let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        let report = sweep(&fake, discovery, Path::new(STARTISH), false).unwrap();
+        assert_eq!(report.live, [Entry::new(&s.repo, "w", "")]);
+        assert!(report.resumed.is_empty());
+        assert!(fake.src_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn all_gone_says_nothing_to_resume() {
+        let s = Setup::new("all-gone", &[]);
+        s.transcript("w", "sid", "w");
+        let mut fake = Fake {
+            agents: Some("[]".into()),
+            ..Fake::default()
+        };
+        fake.worktrees.insert(s.repo.clone(), s.porcelain(&[]));
+        std::fs::create_dir_all(&s.repo).unwrap();
+
+        let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        let report = sweep(&fake, discovery, Path::new(STARTISH), false).unwrap();
+        assert_eq!(
+            report.render(&s.projects),
+            "Nothing to resume.\n\nTranscripts scanned: 1\n"
+        );
+    }
+
+    #[test]
     fn keeps_the_newest_session_per_worktree() {
         let s = Setup::new("newest", &["w"]);
         s.transcript("w", "old", "w");
-        let old = s.projects.join("x--claude-worktrees-w").join("old.jsonl");
-        let earlier = SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_modified(earlier)
-            .unwrap();
+        s.age("w", "old");
         s.transcript("w", "new", "w");
 
         let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
@@ -1362,6 +1525,23 @@ mod tests {
             report
                 .render(&s.projects)
                 .starts_with("No transcripts found under")
+        );
+    }
+
+    #[test]
+    fn no_transcripts_still_lists_unreadable_directories() {
+        let report = Report {
+            skipped: vec![(
+                "/p/x--claude-worktrees-w".into(),
+                "Permission denied".into(),
+            )],
+            ..Report::default()
+        };
+        assert_eq!(
+            report.render(Path::new("/p")),
+            "No transcripts found under /p/*--claude-worktrees-*/, so no worktrees were checked.\n\
+             Transcripts and directories skipped (1):\n\
+             \x20 /p/x--claude-worktrees-w: Permission denied\n"
         );
     }
 }
