@@ -51,7 +51,11 @@ When you run `wtclaude <name>`, it:
    (informing Claude of the sandbox boundary), `--name <name>` (so the
    session is recognizable in `/resume`; omitted when resuming, so a
    resumed session keeps its name), and the working directory set to the
-   worktree.
+   worktree. `claude` is started at niceness +10, which the builds,
+   tests, and subagents it spawns inherit. On Linux, niceness only ranks
+   processes that the kernel schedules in the same group (a cgroup, or an
+   autogroup per terminal session); it doesn't shrink the session's
+   CPU share against apps in other groups.
 
 7. If running inside tmux, renames the current window to `<name>` for
    easy navigation (and restores the original name on exit).

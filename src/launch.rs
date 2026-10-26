@@ -294,7 +294,7 @@ pub fn run(args: Args) -> Result<i32> {
         session.notice()
     );
 
-    let mut cmd = Command::new("claude");
+    let mut cmd = claude_command();
     cmd.current_dir(&canonical);
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
@@ -420,7 +420,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
         session.notice()
     );
 
-    let mut cmd = Command::new("claude");
+    let mut cmd = claude_command();
     cmd.current_dir(&canonical);
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
@@ -591,7 +591,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         session.notice()
     );
 
-    let mut cmd = Command::new("claude");
+    let mut cmd = claude_command();
     cmd.current_dir(&canonical);
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
@@ -637,6 +637,39 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         }
     }
     Ok(status.code().unwrap_or(1))
+}
+
+/// How much `claude` is niced by: `nice(1)`'s default increment.
+const CLAUDE_NICENESS: libc::c_int = 10;
+
+/// A `Command` for `claude`, at lowered priority. Every launch path builds
+/// its `claude` command here, so none can skip `lower_priority`.
+fn claude_command() -> Command {
+    let mut cmd = Command::new("claude");
+    lower_priority(&mut cmd);
+    cmd
+}
+
+/// Lowers the CPU scheduling priority (niceness +`CLAUDE_NICENESS`) of the
+/// process `cmd` spawns. Its children inherit the niceness, so the session's
+/// builds, tests and subagents also yield the CPU to other processes. On
+/// Linux that's only processes the kernel schedules in the same group (cgroup
+/// or autogroup); separate groups are balanced by CPU weight, which niceness
+/// doesn't change. wtclaude keeps its own priority.
+fn lower_priority(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `nice` isn't on POSIX's async-signal-safe list, but glibc, musl
+    // and macOS's libc implement it as getpriority/setpriority syscalls
+    // without taking locks or allocating, and the closure doesn't allocate
+    // either, so it's safe to run between fork and exec.
+    // Its result is ignored: raising niceness can't fail for lack of
+    // privilege, and a failure shouldn't block the launch.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::nice(CLAUDE_NICENESS);
+            Ok(())
+        });
+    }
 }
 
 /// Adds `--resume RESUME`, or `--session-id` (freshly generated) plus
@@ -780,10 +813,11 @@ fn discard_handoff(handoff: &Path) {
     }
 }
 
-/// Writes `command` into the existing regular file `handoff`. `libc` isn't
-/// a dependency, so there's no `O_NOFOLLOW`: instead the file is checked
-/// with `symlink_metadata`, opened without creating or truncating it, and
-/// only written if the opened file is the one that was checked.
+/// Writes `command` into the existing regular file `handoff`. The file is
+/// checked with `symlink_metadata` (so a symlink is refused), opened without
+/// creating or truncating it, and only written if the opened file's device
+/// and inode match the checked one, so a swap between check and open is
+/// caught.
 fn write_handoff(
     handoff: &Path,
     command: &str,
@@ -806,7 +840,8 @@ fn write_handoff(
         );
     }
     let file = parent.join(handoff.file_name().context("has no file name")?);
-    let plan = sandbox::plan(sandbox_root, repo_root, Some(mode)).context("computing the session's plan")?;
+    let plan = sandbox::plan(sandbox_root, repo_root, Some(mode))
+        .context("computing the session's plan")?;
     if plan.grants_write(&file) {
         bail!(
             "the session could write {}, so its contents can't be trusted; set \
@@ -1537,6 +1572,32 @@ fn write_hook_settings(binary_path: &std::path::Path) -> Result<TempFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Field 19 of `/proc/<pid>/stat`: the process's nice value.
+    #[cfg(target_os = "linux")]
+    fn niceness(stat: &str) -> i32 {
+        let after_comm = &stat[stat.rfind(')').unwrap() + 2..];
+        after_comm.split(' ').nth(16).unwrap().parse().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lower_priority_nices_the_child_by_claude_niceness() {
+        let ours = niceness(&std::fs::read_to_string("/proc/self/stat").unwrap());
+        if ours == 19 {
+            // Niceness caps at 19, so the child would match `ours` even if
+            // `lower_priority` did nothing.
+            eprintln!("skipping niceness check: already at the maximum niceness, 19");
+            return;
+        }
+        let mut cmd = Command::new("cat");
+        cmd.arg("/proc/self/stat");
+        lower_priority(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success());
+        let child = niceness(&String::from_utf8(out.stdout).unwrap());
+        assert_eq!(child, (ours + CLAUDE_NICENESS).min(19));
+    }
 
     #[test]
     fn resume_command_for_branch_mode() {
