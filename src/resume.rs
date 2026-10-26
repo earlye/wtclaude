@@ -86,11 +86,16 @@ fn current_repo_root(dir: &Path) -> Result<PathBuf> {
     Ok(canonical(root))
 }
 
-/// Drops every session outside `repo`, a canonical repo root. Compares
-/// roots rather than project dir names, since slugs are lossy: `a.b` and
-/// `a-b` share one.
+/// Drops every session outside `repo`, a canonical repo root. A worktree
+/// nested in another has the outer worktree as its repo root (see
+/// `split_worktree_cwd`), so roots under `repo`'s `.claude/worktrees/` count
+/// too. Compares roots rather than project dir names, since slugs are
+/// lossy: `a.b` and `a-b` share one.
 fn keep_repo(discovery: &mut Discovery, repo: &Path) {
-    discovery.sessions.retain(|s| s.repo_root == repo);
+    let worktrees = repo.join(".claude").join("worktrees");
+    discovery
+        .sessions
+        .retain(|s| s.repo_root == repo || s.repo_root.starts_with(&worktrees));
 }
 
 /// The absolute path of `word` on PATH, resolved up front so a missing
@@ -1663,6 +1668,23 @@ mod tests {
         assert!(report.failed.is_empty(), "{:?}", report.failed);
     }
 
+    #[test]
+    fn keep_repo_keeps_worktrees_nested_in_the_repos_worktrees() {
+        let s = Setup::new("keep-nested", &[]);
+        let outer = s.worktree("w");
+        std::fs::create_dir_all(outer.join(".claude/worktrees/n")).unwrap();
+        let other = s.base.join("repo-other");
+        std::fs::create_dir_all(other.join(".claude/worktrees/o")).unwrap();
+        s.transcript_via(&outer, "n", "nested", "n");
+        s.transcript_via(&other, "o", "other", "o");
+
+        let mut discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        assert_eq!(discovery.sessions.len(), 2);
+        keep_repo(&mut discovery, &s.repo);
+        assert_eq!(discovery.sessions.len(), 1);
+        assert_eq!(discovery.sessions[0].repo_root, outer);
+    }
+
     fn git(dir: &Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")
@@ -1689,6 +1711,8 @@ mod tests {
                 "user.name=t",
                 "-c",
                 "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-q",
                 "--allow-empty",
