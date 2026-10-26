@@ -655,8 +655,7 @@ fn claude_command() -> Command {
 /// builds, tests and subagents also yield the CPU to other processes. On
 /// Linux that's only processes the kernel schedules in the same group (cgroup
 /// or autogroup); separate groups are balanced by CPU weight, which niceness
-/// doesn't change. wtclaude keeps its
-/// own priority.
+/// doesn't change. wtclaude keeps its own priority.
 fn lower_priority(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: `nice` isn't on POSIX's async-signal-safe list, but glibc, musl
