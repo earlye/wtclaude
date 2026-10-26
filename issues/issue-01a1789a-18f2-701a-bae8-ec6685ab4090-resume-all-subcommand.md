@@ -72,10 +72,10 @@ windows.
      no upstream.
    - `--resume` still needs the branch.
    - Don't pass `--mode`.
-   - A worktree with no session gets a fresh session with a plain prompt
-     (e.g. "Run `pwd && git branch`…"), not `! pwd && git branch`.
-     Claude Code 2.1.310 (2026-10-25) may pass a `!` prompt to the model
-     as text; that was never confirmed either way.
+   - A worktree with no transcript gets a fresh session with **no
+     prompt**: `wtclaude --no-pull <branch>`. (Decision, grill
+     2026-10-26: the skill seeded "Run `pwd && git branch`…", which
+     spends a turn per window for nothing the window name doesn't show.)
    - **Stale windows** (a window already named after the branch): pass
      on whatever `src window` reports about it. Open question, see below.
    - If `src window` exits non-zero, record its stderr under "failed"
@@ -203,3 +203,4 @@ $ tmux kill-window -t '=wtclaude:rtest-sandbox'     # rc=0
 
 - Q: When should the `/snap/bin/tmux` resolution check fire (always, or only inside a sandbox)? — A: Never. wtclaude doesn't check tmux; `resume-all` is assumed not to run sandboxed itself.
 - Q: Should the ported window launcher be a public wtclaude subcommand, or an internal module? — A: Neither: delegate session creation and window launch to `src` (new `src window` subcommand, requested of the src session). wtclaude never runs tmux. `src --no-switch` has landed.
+- Q: Should a worktree with no transcript be started with a seeded prompt? — A: No prompt; plain `wtclaude --no-pull <branch>`. Revisit if needed.
