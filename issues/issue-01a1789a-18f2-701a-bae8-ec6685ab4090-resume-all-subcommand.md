@@ -165,12 +165,13 @@ $ tmux kill-window -t '=wtclaude:rtest-sandbox'     # rc=0
 - `/snap/bin/tmux` itself wasn't run. wtclaude's PreToolUse snap guard
   (`src/hook.rs:166`) blocked it, so this test produced no fresh
   snap-confine error text.
-- Consequence: `resume-all` run inside a sandbox works only in a mode
-  whose `path-prepend` includes the tmux payload. Elsewhere, `tmux`
-  resolves to the snap launcher and fails.
-- Suggested handling: resolve `tmux` once, before running anything. If
-  it resolves into `/snap/bin`, fail with the same advice the hook gives
-  (add the payload dir to `path-prepend`).
+- Decision (grill 2026-10-26): wtclaude does **not** check how `tmux`
+  resolves. `resume-all` is assumed to run from an unsandboxed shell
+  (the post-reboot terminal), where `/snap/bin/tmux` works. An earlier
+  draft suggested failing whenever `tmux` resolved into `/snap/bin`; that
+  would refuse on the very machine this is for. Run inside a sandbox
+  whose mode lacks the payload dir in `path-prepend`, the tmux preflight
+  (`list-sessions`) fails and reports the snap-confine error itself.
 - The tools the launch needed resolved without snap-confine:
   - `startish` and `wtclaude` → `~/.cargo/bin`
   - `claude` → `~/.local/bin`
@@ -179,7 +180,7 @@ $ tmux kill-window -t '=wtclaude:rtest-sandbox'     # rc=0
 ## Relevant files
 
 - `src/main.rs:21` — `enum Commands`, where the new subcommand goes; dispatch at `src/main.rs:83`
-- `src/main.rs:72` — hand-kept list of subcommand names that must match the enum; add `resume-all` there too
+- `src/main.rs:72` — subcommand keyword detection, derived from `enum Commands`; adding the variant is enough
 - `src/sessions.rs:152` — `projects_dir()`, to reuse
 - `src/sessions.rs:160` — `path_to_slug()`, the lossy slug; not usable for this
 - `src/sessions.rs:18`, `:95`, `:127` — existing transcript-directory listing. Nothing parses the JSONL contents yet, so tail-reading `cwd`/`gitBranch`/`sessionId` is new code
@@ -188,4 +189,10 @@ $ tmux kill-window -t '=wtclaude:rtest-sandbox'     # rc=0
 - `src/launch.rs:689`–`:744` — resume-line handoff to the shell wrapper (history)
 - `src/launch.rs:1360` — `TmuxWindowName`, the window renaming the stale-window check relies on
 - `src/config.rs:81`, `src/launch.rs:119` — `path-prepend` and `apply_path_prepend`
-- `src/hook.rs:166`, `:277` — snap guard / `snap_command`; reuse it for the tmux resolution check
+- `src/hook.rs:166`, `:277` — snap guard / `snap_command` (context only; no tmux resolution check, see Sandbox)
+
+## Grill Log
+
+### 2026-10-26
+
+- Q: When should the `/snap/bin/tmux` resolution check fire (always, or only inside a sandbox)? — A: Never. wtclaude doesn't check tmux; `resume-all` is assumed not to run sandboxed itself.
