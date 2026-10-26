@@ -29,7 +29,9 @@ Requested by the skills-secretary session for Early, 2026-10-26.
      line (one huge final line), read the whole file.
    - Take `cwd`, `gitBranch` and `sessionId` from that line. If
      `sessionId` is missing, use the file stem.
-   - The repo root is `cwd` with `/.claude/worktrees/<dir>…` stripped.
+   - The repo root is `cwd` with `/.claude/worktrees/<dir>…` stripped at
+     the last `/.claude/worktrees/`, so a worktree nested in another
+     belongs to the outer one.
    - Keep the newest session per worktree, and report the older session
      ids.
    - Don't use the name column of `sessions` / `session-worktree`.
@@ -52,9 +54,10 @@ Requested by the skills-secretary session for Early, 2026-10-26.
 3. **Filters**, applied in this order:
    - **Gone:** not listed, `prunable`, or the directory is missing. Skip
      silently, as is a repo root that no longer exists.
-   - **Live:** an entry in `claude agents --json` has a `.cwd` in the
-     worktree, or a `sessionId` equal to the worktree's newest session
-     id. Skip it. If that call fails, abort: with no live list, every
+   - **Live:** an entry in `claude agents --json` whose `.cwd` falls in
+     this worktree (cwds map to worktrees by the same last-marker rule,
+     so a Claude in a nested worktree doesn't make its parent live), or
+     whose `sessionId` equals the worktree's newest session id. Skip it. If that call fails, abort: with no live list, every
      running session looks dead and would get a second Claude. Don't
      infer liveness from tmux window names, because a window outlives
      its Claude.

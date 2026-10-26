@@ -183,9 +183,8 @@ impl External for System {
 /// Where a transcript's newest usable line says its session was.
 #[derive(Debug, PartialEq)]
 struct LastLine {
-    repo_root: PathBuf,
-    /// The worktree's directory name under `.claude/worktrees/`.
-    dir: String,
+    /// Inside a worktree.
+    cwd: PathBuf,
     /// `gitBranch`, kept only to report a mismatch with git's view.
     branch: Option<String>,
     session_id: String,
@@ -229,6 +228,19 @@ fn worktree_path(repo_root: &Path, dir: &str) -> PathBuf {
     repo_root.join(".claude").join("worktrees").join(dir)
 }
 
+/// The canonical repo root and worktree of a path inside a worktree. Split
+/// before canonicalizing, so a symlinked `.claude/worktrees/<dir>` keeps
+/// its place under the repo; the worktree is derived from the canonical
+/// root, so two spellings of the repo give one key. Transcripts, `claude
+/// agents` and `git worktree list` all go through this, so their paths
+/// compare equal.
+fn worktree_key(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let (repo_root, dir) = split_worktree_cwd(&path.to_string_lossy())?;
+    let repo_root = canonical(&repo_root);
+    let worktree = worktree_path(&repo_root, &dir);
+    Some((repo_root, worktree))
+}
+
 /// The newest line of `data` that is a JSON object with a `cwd` inside a
 /// worktree. A missing `sessionId` falls back to `stem`, the transcript's
 /// file name, which is the session id.
@@ -244,10 +256,10 @@ fn newest_usable_line(data: &[u8], stem: &str) -> Option<LastLine> {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
             };
-            let (repo_root, dir) = split_worktree_cwd(text("cwd")?)?;
+            let cwd = text("cwd")?;
+            split_worktree_cwd(cwd)?;
             Some(LastLine {
-                repo_root,
-                dir,
+                cwd: PathBuf::from(cwd),
                 branch: text("gitBranch").map(String::from),
                 session_id: text("sessionId").unwrap_or(stem).to_string(),
             })
@@ -279,9 +291,10 @@ fn read_transcript(path: &Path, tail: u64) -> Result<Option<LastLine>> {
 }
 
 /// Reads `<projects_dir>/*--claude-worktrees-*/*.jsonl`. Only top-level
-/// files, which leaves out subagent transcripts in subdirectories. Paths
-/// are canonicalized, so two spellings that differ only by symlinks group
-/// together. Bind mounts are not unified.
+/// files, which leaves out subagent transcripts in subdirectories. Repo
+/// roots are canonicalized and each worktree path is derived from its
+/// root, so two spellings that differ only by symlinks group together.
+/// Bind mounts are not unified.
 fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
     let mut discovery = Discovery::default();
     let entries = match std::fs::read_dir(projects_dir) {
@@ -333,11 +346,21 @@ fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
                     continue;
                 }
             };
-            if path.extension().is_none_or(|e| e != "jsonl") || !path.is_file() {
+            if path.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
+            let metadata = match std::fs::metadata(&path) {
+                Ok(m) if m.is_file() => m,
+                Ok(_) => continue,
+                // Deleted since the listing, or a dangling symlink.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    discovery.skipped.push((path, e.to_string()));
+                    continue;
+                }
+            };
             discovery.scanned += 1;
-            let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            let mtime = match metadata.modified() {
                 Ok(mtime) => mtime,
                 Err(e) => {
                     discovery.skipped.push((path, e.to_string()));
@@ -357,10 +380,9 @@ fn discover(projects_dir: &Path, tail: u64) -> Result<Discovery> {
     found.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut by_worktree: BTreeMap<PathBuf, Session> = BTreeMap::new();
     for (_, line) in found {
-        // Derived from the canonical root rather than canonicalized on its
-        // own, so a symlink can't move it out of `repo_root`'s worktrees.
-        let repo_root = canonical(&line.repo_root);
-        let worktree = worktree_path(&repo_root, &line.dir);
+        let Some((repo_root, worktree)) = worktree_key(&line.cwd) else {
+            continue;
+        };
         match by_worktree.get_mut(&worktree) {
             Some(newer) => newer.older.push(line.session_id),
             None => {
@@ -440,11 +462,14 @@ fn parse_live(json: &str) -> Result<Live> {
         let Some(cwd) = a.get("cwd").and_then(|c| c.as_str()) else {
             bail!("claude agents --json: an entry has no string cwd: {a}");
         };
-        let cwd = canonical(Path::new(cwd));
-        let worktree = match split_worktree_cwd(&cwd.to_string_lossy()) {
-            Some((repo_root, dir)) => worktree_path(&repo_root, &dir),
-            None => cwd,
-        };
+        // The cwd as given first, so a symlinked worktree directory keeps
+        // its place; canonical only for a cwd that reaches a worktree
+        // through a symlink outside one.
+        let cwd = Path::new(cwd);
+        let canonical_cwd = canonical(cwd);
+        let worktree = worktree_key(cwd)
+            .or_else(|| worktree_key(&canonical_cwd))
+            .map_or(canonical_cwd, |(_, worktree)| worktree);
         live.worktrees.insert(worktree);
         if let Some(id) = a.get("sessionId").and_then(|i| i.as_str()) {
             live.session_ids.insert(id.to_string());
@@ -596,16 +621,25 @@ fn sweep(
         .and_then(|json| parse_live(&json))
         .context("cannot tell which worktrees are live")?;
 
-    // Discovery canonicalized both paths, so each repo has one bucket.
+    // Discovery canonicalized each repo root, so each repo has one bucket.
     let mut repos: BTreeMap<&Path, Vec<&Session>> = BTreeMap::new();
     for session in &discovery.sessions {
         repos.entry(&session.repo_root).or_default().push(session);
     }
 
     for (repo_root, sessions) in repos {
-        // A missing repo root is skipped silently, like a gone worktree.
-        if !repo_root.is_dir() {
-            continue;
+        // A missing repo root is skipped silently, like a gone worktree; one
+        // that can't be checked (say, an unmounted network mount) fails.
+        match std::fs::metadata(repo_root) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                report
+                    .failed
+                    .push(Entry::new(repo_root, "(whole repo)", e.to_string()));
+                continue;
+            }
         }
         let porcelain = match ext.git_worktree_list(repo_root) {
             Ok(out) => out,
@@ -616,18 +650,22 @@ fn sweep(
                 continue;
             }
         };
-        let entries: Vec<(PathBuf, WorktreeEntry)> = parse_porcelain(&porcelain)
+        // Keyed as discovery keys worktrees; the root checkout has no key
+        // and is never a target.
+        let entries: Vec<(PathBuf, PathBuf, WorktreeEntry)> = parse_porcelain(&porcelain)
             .into_iter()
-            .map(|e| (canonical(&e.path), e))
+            .filter_map(|e| {
+                let (root, worktree) = worktree_key(&e.path)?;
+                Some((root, worktree, e))
+            })
             .collect();
-        let worktrees_dir = repo_root.join(".claude").join("worktrees");
 
-        // Every worktree with a transcript, plus those under .claude/worktrees
-        // without one, which get a fresh session.
+        // Every worktree with a transcript, plus those under this repo's
+        // .claude/worktrees without one, which get a fresh session.
         let mut targets: BTreeMap<&Path, Option<&Session>> = BTreeMap::new();
-        for (path, _) in &entries {
-            if path.parent() == Some(worktrees_dir.as_path()) {
-                targets.insert(path, None);
+        for (root, worktree, _) in &entries {
+            if root == repo_root {
+                targets.insert(worktree, None);
             }
         }
         for session in sessions {
@@ -635,14 +673,29 @@ fn sweep(
         }
 
         for (worktree, session) in targets {
-            let entry = entries.iter().find(|(p, _)| p == worktree).map(|(_, e)| e);
+            let entry = entries
+                .iter()
+                .find(|(_, w, _)| w == worktree)
+                .map(|(_, _, e)| e);
             // Gone, skipped silently (as is a missing repo root, above). A
             // listed worktree whose directory is missing isn't launched,
             // because wtclaude would recreate it.
-            let Some(entry) = entry.filter(|e| !e.prunable && worktree.is_dir()) else {
+            let Some(entry) = entry.filter(|e| !e.prunable) else {
                 continue;
             };
             let worktree_label = worktree.to_string_lossy().into_owned();
+            match std::fs::metadata(worktree) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    let what = entry.branch.as_deref().unwrap_or(&worktree_label);
+                    report
+                        .failed
+                        .push(Entry::new(repo_root, what, e.to_string()));
+                    continue;
+                }
+            }
             let note = match (
                 session.and_then(|s| s.transcript_branch.as_deref()),
                 &entry.branch,
@@ -778,6 +831,13 @@ impl Report {
 
     fn render(&self, projects_dir: &Path) -> String {
         let mut out = String::new();
+        if self.dry_run {
+            out.push_str("Dry run: no windows were opened.\n");
+            for note in &self.notes {
+                out.push_str(&format!("Note: {note}.\n"));
+            }
+            out.push('\n');
+        }
         if self.scanned == 0 {
             // List skipped entries even when nothing was scanned, so
             // unreadable directories don't look like there are no
@@ -788,13 +848,6 @@ impl Report {
             ));
             self.render_skipped(&mut out);
             return out;
-        }
-        if self.dry_run {
-            out.push_str("Dry run: no windows were opened.\n");
-            for note in &self.notes {
-                out.push_str(&format!("Note: {note}.\n"));
-            }
-            out.push('\n');
         }
 
         let (resumed, fresh) = if self.dry_run {
@@ -900,7 +953,7 @@ mod tests {
         let line = newest_usable_line(data.as_bytes(), "stem").unwrap();
         assert_eq!(line.branch.as_deref(), Some("a/b"));
         assert_eq!(line.session_id, "s2");
-        assert_eq!(line.repo_root, PathBuf::from("/r"));
+        assert_eq!(line.cwd, PathBuf::from(CWD));
     }
 
     #[test]
@@ -1596,12 +1649,99 @@ mod tests {
     fn no_transcripts_says_so() {
         let s = Setup::new("empty", &[]);
         let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
-        let report = sweep(&Fake::default(), discovery, Path::new(STARTISH), true).unwrap();
-        assert!(
-            report
-                .render(&s.projects)
-                .starts_with("No transcripts found under")
+        let mut report = sweep(&Fake::default(), discovery, Path::new(STARTISH), true).unwrap();
+        // A dry run's notes still show, since a real run would stop first.
+        report.notes = vec!["src not found on PATH; a real run would stop here".into()];
+        assert!(report.render(&s.projects).starts_with(
+            "Dry run: no windows were opened.\n\
+             Note: src not found on PATH; a real run would stop here.\n\n\
+             No transcripts found under"
+        ));
+    }
+
+    #[test]
+    fn discover_records_unreadable_project_dirs_and_transcripts() {
+        let s = Setup::new("unreadable", &[]);
+        let dangling = s.projects.join("x--claude-worktrees-dangling");
+        std::os::unix::fs::symlink(s.base.join("nowhere"), &dangling).unwrap();
+        let project = s.projects.join("x--claude-worktrees-w");
+        std::fs::create_dir_all(&project).unwrap();
+        // A symlink to itself can't be stat'ed, but isn't missing either.
+        let looping = project.join("loop.jsonl");
+        std::os::unix::fs::symlink(&looping, &looping).unwrap();
+        // A transcript that's gone is skipped silently.
+        std::os::unix::fs::symlink(s.base.join("nowhere"), project.join("gone.jsonl")).unwrap();
+
+        let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        assert_eq!(discovery.scanned, 0);
+        let skipped: Vec<&Path> = discovery.skipped.iter().map(|(p, _)| p.as_path()).collect();
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.contains(&dangling.as_path()));
+        assert!(skipped.contains(&looping.as_path()));
+    }
+
+    #[test]
+    fn an_unstatable_repo_root_or_worktree_fails() {
+        let s = Setup::new("unstatable", &[]);
+        // Symlinks to themselves: stat fails with something other than
+        // "not found", as on an unmounted network mount.
+        let repo_loop = s.base.join("repo-loop");
+        std::os::unix::fs::symlink(&repo_loop, &repo_loop).unwrap();
+        s.transcript_via(&repo_loop, "r", "sid-r", "r");
+        std::fs::create_dir_all(s.repo.join(".claude/worktrees")).unwrap();
+        let worktree_loop = s.worktree("w");
+        std::os::unix::fs::symlink(&worktree_loop, &worktree_loop).unwrap();
+        s.transcript("w", "sid-w", "w");
+        let mut fake = Fake {
+            agents: Some("[]".into()),
+            ..Fake::default()
+        };
+        fake.worktrees
+            .insert(s.repo.clone(), s.porcelain(&[("w", Some("w"))]));
+
+        let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        let report = sweep(&fake, discovery, Path::new(STARTISH), true).unwrap();
+        let failed: Vec<(&Path, &str)> = report
+            .failed
+            .iter()
+            .map(|e| (e.repo.as_path(), e.what.as_str()))
+            .collect();
+        assert_eq!(
+            failed,
+            [
+                (s.repo.as_path(), "w"),
+                (repo_loop.as_path(), "(whole repo)")
+            ]
         );
+        assert!(fake.gh_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_symlinked_worktree_directory_is_found() {
+        let s = Setup::new("symlinked-worktree", &[]);
+        let target = s.base.join("elsewhere/w");
+        std::fs::create_dir_all(target.join("src")).unwrap();
+        std::fs::create_dir_all(s.repo.join(".claude/worktrees")).unwrap();
+        std::os::unix::fs::symlink(&target, s.worktree("w")).unwrap();
+        std::os::unix::fs::symlink(&target, s.worktree("live")).unwrap();
+        s.transcript("w", "sid-w", "w");
+        let mut fake = Fake {
+            agents: Some(
+                serde_json::json!([{ "cwd": s.worktree("live").join("src") }]).to_string(),
+            ),
+            ..Fake::default()
+        };
+        fake.worktrees.insert(
+            s.repo.clone(),
+            s.porcelain(&[("w", Some("w")), ("live", Some("live"))]),
+        );
+        fake.merged.insert("w".into(), String::new());
+
+        let discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        let report = sweep(&fake, discovery, Path::new(STARTISH), true).unwrap();
+        assert_eq!(report.resumed.len(), 1);
+        assert_eq!(report.resumed[0].what, "w");
+        assert_eq!(report.live, [Entry::new(&s.repo, "live", "")]);
     }
 
     #[test]
