@@ -323,3 +323,40 @@ fn bash_wrapper_sweeps_week_old_handoff_files() {
         "a recent handoff file may belong to a live wrapper"
     );
 }
+
+#[test]
+fn resume_is_a_subcommand_not_a_branch_name() {
+    // `resume` routes to the subcommand tree, so `--help` describes it
+    // instead of the bare launch form.
+    let output = run(&["resume", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--dry-run"), "stdout: {stdout}");
+    assert!(!stdout.contains("WORKTREE_NAME"), "stdout: {stdout}");
+}
+
+#[test]
+fn resume_outside_a_git_repo_fails_instead_of_resuming_everything() {
+    let dir = std::env::temp_dir().join(format!(
+        "wtclaude-integration-test-dispatch-{}-resume-no-repo",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let output = Command::new(env!("CARGO_BIN_EXE_wtclaude"))
+        .args(["resume", "--dry-run"])
+        .current_dir(&dir)
+        // Stops git from finding a repo above the temp dir.
+        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap())
+        .output()
+        .expect("failed to spawn wtclaude");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not inside a git repository"),
+        "stderr: {stderr}"
+    );
+    assert!(output.stdout.is_empty(), "no report should be printed");
+}
