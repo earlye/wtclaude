@@ -652,16 +652,16 @@ fn claude_command() -> Command {
 
 /// Lowers the CPU scheduling priority (niceness +`CLAUDE_NICENESS`) of the
 /// process `cmd` spawns. Its children inherit the niceness, so the session's
-/// builds, tests and subagents also yield the CPU to other processes in the
-/// same scheduling group (e.g. the same terminal or tmux session). Processes
-/// in other cgroups are balanced by cgroup CPU weight, which niceness doesn't
-/// change. wtclaude keeps its own priority.
+/// builds, tests and subagents also yield the CPU to processes the kernel
+/// schedules in the same group (cgroup or autogroup). Separate groups are
+/// balanced by CPU weight, which niceness doesn't change. wtclaude keeps its
+/// own priority.
 fn lower_priority(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     // SAFETY: `nice` isn't on POSIX's async-signal-safe list, but glibc, musl
     // and macOS's libc implement it as getpriority/setpriority syscalls
-    // without taking locks or allocating, and the closure doesn't allocate either, so it's
-    // safe to run between fork and exec.
+    // without taking locks or allocating, and the closure doesn't allocate
+    // either, so it's safe to run between fork and exec.
     // Its result is ignored: raising niceness can't fail for lack of
     // privilege, and a failure shouldn't block the launch.
     unsafe {
