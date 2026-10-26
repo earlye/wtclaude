@@ -51,8 +51,9 @@ When you run `wtclaude <name>`, it:
    (informing Claude of the sandbox boundary), `--name <name>` (so the
    session is recognizable in `/resume`; omitted when resuming, so a
    resumed session keeps its name), and the working directory set to the
-   worktree. `claude` runs under `nice` (+10), so the session and the
-   builds, tests, and subagents it spawns can't starve the host.
+   worktree. `claude` is started with its CPU scheduling priority
+   lowered (niceness +10), so the session and the builds, tests, and
+   subagents it spawns yield CPU to the rest of your desktop.
 
 7. If running inside tmux, renames the current window to `<name>` for
    easy navigation (and restores the original name on exit).

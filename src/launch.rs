@@ -294,8 +294,7 @@ pub fn run(args: Args) -> Result<i32> {
         session.notice()
     );
 
-    let mut cmd = Command::new("claude");
-    lower_priority(&mut cmd);
+    let mut cmd = claude_command();
     cmd.current_dir(&canonical);
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
@@ -421,8 +420,7 @@ pub fn run_headless(args: HeadlessArgs) -> Result<i32> {
         session.notice()
     );
 
-    let mut cmd = Command::new("claude");
-    lower_priority(&mut cmd);
+    let mut cmd = claude_command();
     cmd.current_dir(&canonical);
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
@@ -593,8 +591,7 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
         session.notice()
     );
 
-    let mut cmd = Command::new("claude");
-    lower_priority(&mut cmd);
+    let mut cmd = claude_command();
     cmd.current_dir(&canonical);
     for flag in &mode_config.claude_flags {
         cmd.arg(flag);
@@ -645,12 +642,24 @@ pub fn run_path(args: PathArgs) -> Result<i32> {
 /// How much `claude` is niced by: `nice(1)`'s default increment.
 const CLAUDE_NICENESS: libc::c_int = 10;
 
-/// Lowers the scheduling priority of the process `cmd` spawns, so a session
-/// and everything it runs (builds, tests, subagents inherit niceness) can't
-/// starve the host. wtclaude itself keeps its priority.
+/// A `Command` for `claude`, at lowered priority. Every launch path builds
+/// its `claude` command here, so none can skip `lower_priority`.
+fn claude_command() -> Command {
+    let mut cmd = Command::new("claude");
+    lower_priority(&mut cmd);
+    cmd
+}
+
+/// Lowers the CPU scheduling priority (niceness +`CLAUDE_NICENESS`) of the
+/// process `cmd` spawns. Its children inherit the niceness, so the session's
+/// builds, tests and subagents yield the CPU to the rest of the desktop too.
+/// wtclaude keeps its own priority.
 fn lower_priority(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // SAFETY: `nice` is async-signal-safe and the closure doesn't allocate.
+    // SAFETY: `nice` isn't on POSIX's async-signal-safe list, but glibc and
+    // musl implement it as getpriority/setpriority syscalls without taking
+    // locks or allocating, and the closure doesn't allocate either, so it's
+    // safe to run between fork and exec.
     // Its result is ignored: raising niceness can't fail for lack of
     // privilege, and a failure shouldn't block the launch.
     unsafe {
@@ -802,10 +811,11 @@ fn discard_handoff(handoff: &Path) {
     }
 }
 
-/// Writes `command` into the existing regular file `handoff`. Rather than
-/// relying on `O_NOFOLLOW`, the file is checked with `symlink_metadata`,
-/// opened without creating or truncating it, and only written if the opened
-/// file is the one that was checked.
+/// Writes `command` into the existing regular file `handoff`. The file is
+/// checked with `symlink_metadata` (so a symlink is refused), opened without
+/// creating or truncating it, and only written if the opened file's device
+/// and inode match the checked one, so a swap between check and open is
+/// caught.
 fn write_handoff(
     handoff: &Path,
     command: &str,
@@ -1572,13 +1582,21 @@ mod tests {
     #[test]
     fn lower_priority_nices_the_child_by_claude_niceness() {
         let ours = niceness(&std::fs::read_to_string("/proc/self/stat").unwrap());
+        if ours + CLAUDE_NICENESS > 19 {
+            // Niceness caps at 19, so the child would match `ours` even if
+            // `lower_priority` did nothing: nothing to observe.
+            eprintln!(
+                "skipping niceness check: already at {ours}, no headroom for +{CLAUDE_NICENESS}"
+            );
+            return;
+        }
         let mut cmd = Command::new("cat");
         cmd.arg("/proc/self/stat");
         lower_priority(&mut cmd);
         let out = cmd.output().unwrap();
         assert!(out.status.success());
         let child = niceness(&String::from_utf8(out.stdout).unwrap());
-        assert_eq!(child, (ours + CLAUDE_NICENESS).min(19));
+        assert_eq!(child, ours + CLAUDE_NICENESS);
     }
 
     #[test]
