@@ -102,8 +102,11 @@ Rejected: porting `launch-window.sh` into wtclaude (the earlier plan),
 which would have duplicated src's session naming and needed a
 `has-session` re-check because `src` exited 0 when `tmux new` failed.
 
-Requested of the `src` session on 2026-10-26 (to be tracked there via
-`/md-issue-track`):
+Requested of the `src` session on 2026-10-26, and tracked there as
+`~/Documents/github.com/earlye/src/issues/issue-01a178a9-f901-76da-ae75-459dd50d208a-src-window-subcommand.md`
+(src `main` at 8437d6e). That issue also fixes the session target: tmux
+turns `.` and `:` into `_` in session names, but src compared the raw
+basename, so repos with a dot in their name were missed.
 
 `src window <DIR> -n NAME -- ARGV…` ensures DIR's session exists
 without switching or attaching, checks DIR exists, opens
