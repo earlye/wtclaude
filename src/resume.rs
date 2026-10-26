@@ -1,7 +1,8 @@
 //! `wtclaude resume-all`: after a reboot or power loss, reopen every
 //! worktree whose Claude session isn't running, each in a tmux window
 //! (opened by `src window`) that resumes its newest session, or starts a
-//! fresh one when it has no transcript.
+//! fresh one when it has no transcript. `wtclaude resume` does the same for
+//! the worktrees of the repository it runs in.
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -15,8 +16,9 @@ use crate::hook::resolve_on_path;
 use crate::launch::{sanitize_name, shell_quote};
 use crate::sessions::projects_dir;
 
+/// Arguments shared by `resume-all` and `resume`.
 #[derive(Args)]
-pub struct ResumeAllArgs {
+pub struct ResumeArgs {
     /// Print the report without opening any windows
     #[arg(long)]
     pub dry_run: bool,
@@ -27,7 +29,21 @@ const TAIL_BYTES: u64 = 64 * 1024;
 
 const WORKTREES_MARKER: &str = "/.claude/worktrees/";
 
-pub fn run(args: ResumeAllArgs) -> Result<i32> {
+/// `wtclaude resume-all`: every repo with a worktree transcript.
+pub fn run_all(args: ResumeArgs) -> Result<i32> {
+    run(args, "resume-all", None)
+}
+
+/// `wtclaude resume`: only the repo the current directory belongs to.
+pub fn run_current(args: ResumeArgs) -> Result<i32> {
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    let repo = current_repo_root(&cwd)?;
+    run(args, "resume", Some(&repo))
+}
+
+/// Resumes the worktrees of `only`, a canonical repo root, or of every repo
+/// when it's None. `command` names the subcommand in errors.
+fn run(args: ResumeArgs, command: &str, only: Option<&Path>) -> Result<i32> {
     let path_var = match std::env::var("PATH") {
         Ok(path_var) => path_var,
         Err(std::env::VarError::NotPresent) => String::new(),
@@ -36,17 +52,50 @@ pub fn run(args: ResumeAllArgs) -> Result<i32> {
     let (startish, startish_note) = resolve_tool("startish", "", &path_var, args.dry_run)?;
     let (src, src_note) = resolve_tool(
         "src",
-        "; resume-all opens windows through `src window`",
+        &format!("; {command} opens windows through `src window`"),
         &path_var,
         args.dry_run,
     )?;
 
     let projects_dir = projects_dir()?;
-    let discovery = discover(&projects_dir, TAIL_BYTES)?;
+    let mut discovery = discover(&projects_dir, TAIL_BYTES)?;
+    if let Some(repo) = only {
+        keep_repo(&mut discovery, repo);
+    }
     let mut report = sweep(&System { src }, discovery, &startish, args.dry_run)?;
     report.notes = [startish_note, src_note].into_iter().flatten().collect();
     print!("{}", report.render(&projects_dir));
     Ok(report.exit_code())
+}
+
+/// The main repo root of the git repository containing `dir`, canonical as
+/// discovery's repo roots are. Inside a worktree, `--show-toplevel` would
+/// give the worktree, so this takes the parent of the common git dir, which
+/// is the main repo's `.git` from any of its worktrees.
+fn current_repo_root(dir: &Path) -> Result<PathBuf> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    let common_dir = output_of(cmd, "git rev-parse")
+        .with_context(|| format!("{} is not inside a git repository", dir.display()))?;
+    let common_dir = PathBuf::from(common_dir.trim_end_matches('\n'));
+    let root = common_dir
+        .parent()
+        .with_context(|| format!("git dir {} has no parent", common_dir.display()))?;
+    Ok(canonical(root))
+}
+
+/// Drops every session outside `repo`, a canonical repo root. A worktree
+/// nested in another has the outer worktree as its repo root (see
+/// `split_worktree_cwd`), so roots under `repo`'s `.claude/worktrees/` count
+/// too. Compares roots rather than project dir names, since slugs are
+/// lossy: `a.b` and `a-b` share one.
+fn keep_repo(discovery: &mut Discovery, repo: &Path) {
+    let worktrees = repo.join(".claude").join("worktrees");
+    discovery
+        .sessions
+        .retain(|s| s.repo_root == repo || s.repo_root.starts_with(&worktrees));
 }
 
 /// The absolute path of `word` on PATH, resolved up front so a missing
@@ -1576,6 +1625,113 @@ mod tests {
         fake.merged.insert("w".into(), String::new());
         let report = sweep(&fake, discovery, Path::new(STARTISH), true).unwrap();
         assert_eq!(report.resumed.len(), 1);
+    }
+
+    #[test]
+    fn keep_repo_drops_other_repos_even_when_their_slugs_match() {
+        // `a.b` and `a-b` share a project dir slug; only the root tells
+        // them apart.
+        let s = Setup::new("keep-repo", &[]);
+        let here = s.base.join("a.b");
+        let other = s.base.join("a-b");
+        for repo in [&here, &other] {
+            std::fs::create_dir_all(repo.join(".claude/worktrees/w")).unwrap();
+        }
+        let link = s.base.join("link");
+        std::os::unix::fs::symlink(&here, &link).unwrap();
+        s.transcript_via(&link, "w", "here", "w");
+        s.transcript_via(&other, "w", "other", "w");
+
+        let mut discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        assert_eq!(discovery.sessions.len(), 2);
+        keep_repo(&mut discovery, &here);
+        assert_eq!(discovery.sessions.len(), 1);
+        assert_eq!(discovery.sessions[0].repo_root, here);
+        assert_eq!(discovery.sessions[0].session_id, "here");
+
+        // The fake knows only `a.b`, so a sweep that reached `a-b` would
+        // report a failure.
+        let mut fake = Fake {
+            agents: Some("[]".into()),
+            ..Fake::default()
+        };
+        let porcelain = format!(
+            "worktree {}\nHEAD 0\nbranch refs/heads/main\n\n\
+             worktree {}\nHEAD 0\nbranch refs/heads/w\n\n",
+            here.display(),
+            here.join(".claude/worktrees/w").display()
+        );
+        fake.worktrees.insert(here.clone(), porcelain);
+        fake.merged.insert("w".into(), String::new());
+        let report = sweep(&fake, discovery, Path::new(STARTISH), true).unwrap();
+        assert_eq!(report.resumed.len(), 1);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+    }
+
+    #[test]
+    fn keep_repo_keeps_worktrees_nested_in_the_repos_worktrees() {
+        let s = Setup::new("keep-nested", &[]);
+        let outer = s.worktree("w");
+        std::fs::create_dir_all(outer.join(".claude/worktrees/n")).unwrap();
+        let other = s.base.join("repo-other");
+        std::fs::create_dir_all(other.join(".claude/worktrees/o")).unwrap();
+        s.transcript_via(&outer, "n", "nested", "n");
+        s.transcript_via(&other, "o", "other", "o");
+
+        let mut discovery = discover(&s.projects, TAIL_BYTES).unwrap();
+        assert_eq!(discovery.sessions.len(), 2);
+        keep_repo(&mut discovery, &s.repo);
+        assert_eq!(discovery.sessions.len(), 1);
+        assert_eq!(discovery.sessions[0].repo_root, outer);
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn current_repo_root_is_the_main_repo_from_the_root_and_a_worktree() {
+        let s = Setup::new("current-repo", &[]);
+        std::fs::create_dir_all(&s.repo).unwrap();
+        git(&s.repo, &["init", "-q"]);
+        git(
+            &s.repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        git(
+            &s.repo,
+            &["worktree", "add", "-q", "-b", "w", ".claude/worktrees/w"],
+        );
+        std::fs::create_dir_all(s.worktree("w").join("src")).unwrap();
+
+        assert_eq!(current_repo_root(&s.repo).unwrap(), s.repo);
+        assert_eq!(current_repo_root(&s.worktree("w")).unwrap(), s.repo);
+        assert_eq!(
+            current_repo_root(&s.worktree("w").join("src")).unwrap(),
+            s.repo
+        );
     }
 
     #[test]

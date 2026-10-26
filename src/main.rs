@@ -38,7 +38,9 @@ enum Commands {
     #[cfg(target_os = "linux")]
     Sandbox(sandbox::SandboxArgs),
     /// Reopen, in tmux, every worktree whose Claude session isn't running
-    ResumeAll(resume::ResumeAllArgs),
+    ResumeAll(resume::ResumeArgs),
+    /// Reopen, in tmux, this repo's worktrees whose Claude session isn't running
+    Resume(resume::ResumeArgs),
     /// Print the worktree name for a session
     SessionWorktree {
         /// Session ID to resolve to a worktree name
@@ -129,7 +131,14 @@ fn main() {
                     std::process::exit(1);
                 }
             },
-            Commands::ResumeAll(parsed) => match resume::run(parsed) {
+            Commands::ResumeAll(parsed) => match resume::run_all(parsed) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => {
+                    eprintln!("error: {:#}", e);
+                    std::process::exit(1);
+                }
+            },
+            Commands::Resume(parsed) => match resume::run_current(parsed) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {
                     eprintln!("error: {:#}", e);

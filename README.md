@@ -285,6 +285,14 @@ without opening any windows. Needs `claude`, `src` with the `window`
 subcommand, and `startish` on `PATH`; `gh` is optional (without it,
 every branch is treated as unmerged and the report says so).
 
+`wtclaude resume [--dry-run]` does the same, but only for the worktrees
+of the repository you run it in, from its root checkout or from any of
+its worktrees. The repository is the parent of `git rev-parse
+--git-common-dir`, so a worktree counts as its main repo, and worktrees
+nested inside its worktrees are included. Outside a git
+repository it fails rather than resuming every repo. Because `resume` is
+a subcommand, `wtclaude resume` can't open a branch named `resume`.
+
 
 ## Modes
 
