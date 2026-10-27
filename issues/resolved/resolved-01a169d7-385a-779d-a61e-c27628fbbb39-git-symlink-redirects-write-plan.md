@@ -1,5 +1,33 @@
 # Replacing `.git` with a symlink may redirect the sandbox write plan
 
+## Resolution (2026-10-26)
+
+Won't fix. Closed without changes to wtclaude and without reproducing it.
+Every route found here that can reach `$HOME` or another arbitrary
+directory needs a session that sets out on purpose to redirect the plan, by
+swapping `.git` for a symlink or by rewriting a worktree's `gitdir:` file.
+Per `CONTEXT.md`, wtclaude defends against accidental writes first, and
+against injection only on a best-effort basis.
+
+The accidental version, a session deleting `.git` by mistake, can only
+happen when the sandbox root is the repository root: in-place mode, path
+mode on the repository root, and headless mode started from the repository
+root. If the repository isn't nested inside another one, `git rev-parse`
+fails, `git_dirs` falls back to `repo_root/.git`, and
+`resolve_existing_prefix` resolves that to a missing path under the real
+`repo_root`, so nothing widens. If it is nested (for example under a
+dotfiles repository at `$HOME`), git finds the outer repository instead,
+and that repository's git dir becomes writable. A wtclaude worktree is
+nested inside its main checkout, but there the outer git dir is the git
+common dir, which is already writable. The nested case is accepted for now:
+it needs an accidental `.git` deletion inside a repository nested under
+another, and it exposes only the outer repository's git dir, not its working
+tree or `$HOME`. Setting `GIT_CEILING_DIRECTORIES` in `git_dirs` would close
+it; that fix is listed under "Suggested fixes".
+
+If containing injection ever becomes a goal, start from "Suggested fixes"
+below. The rest of this file is the pre-resolution record.
+
 ## Decision (Early, 2026-10-26)
 
 Probably drop this. Early: "wtclaude is about blocking accidental escapes,
@@ -87,6 +115,10 @@ directory (for example `~/.zshrc`, `~/.ssh/authorized_keys`, or
 - **Reject changed targets (reviewer's second suggestion):** refuse a plan
   entry whose resolved target is different from what it was at launch, or
   which resolves outside its expected parent.
+- **Stop git discovery at the repository (added at resolution):** set
+  `GIT_CEILING_DIRECTORIES` to `repo_root`'s parent when `git_dirs` runs
+  `git rev-parse`, so a deleted `.git` always takes the `repo_root/.git`
+  fallback rather than finding an enclosing repository.
 - **Defence in depth:** refuse any git dir that resolves to `$HOME`, `/`, or
   an ancestor of the sandbox root, like `launch::is_sandbox_nullifying_root`
   already does for the sandbox root.
