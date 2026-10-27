@@ -19,9 +19,11 @@ fails, `git_dirs` falls back to `repo_root/.git`, and
 dotfiles repository at `$HOME`), git finds the outer repository instead,
 and that repository's git dir becomes writable. A wtclaude worktree is
 nested inside its main checkout, but there the outer git dir is the git
-common dir, which is already writable. Setting `GIT_CEILING_DIRECTORIES` in
-`git_dirs` would close the nested case; it is listed under "Suggested
-fixes".
+common dir, which is already writable. The nested case is accepted for now:
+it needs an accidental `.git` deletion inside a repository nested under
+another, and it exposes only the outer repository's git dir, not its working
+tree or `$HOME`. Setting `GIT_CEILING_DIRECTORIES` in `git_dirs` would close
+it; that fix is listed under "Suggested fixes".
 
 If containing injection ever becomes a goal, start from "Suggested fixes"
 below. The rest of this file is the pre-resolution record.
