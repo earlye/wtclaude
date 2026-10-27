@@ -14,9 +14,9 @@ the task. It is not a security boundary against a session that sets out
 to escape, such as one driven by prompt injection. Confining writes
 limits what such a session can do, but does not stop it. Reads and
 network access are unrestricted, so credentials elsewhere on the machine
-remain readable and reachable. Some of the cache directories a
-session may write to hold executables on your `PATH`, so a session that
-sets out to can plant code there that later runs outside the sandbox
+remain readable and reachable. Some of the writable cache directories
+contain executables on your `PATH`, so such a session can plant code
+there that later runs outside the sandbox
 (see "Writable directories on `PATH`" under Sandbox enforcement). And no
 sandbox can protect you from malicious code
 *inside* the worktree, since that is exactly what a session writes;
@@ -501,9 +501,12 @@ outside the sandbox the next time something unsandboxed invokes it. The
 and looks up `git` through `PATH` on every Bash command, under both
 backends. If one of these directories comes before the system `git` on
 your `PATH`, a session can plant a `git` there that runs unconfined.
-Where `wtclaude` is installed makes no difference to this. Nothing
-accidental does it, so it falls outside the primary threat model; keep
-these directories after the system ones on `PATH` to remove it.
+Installing `wtclaude` to `~/.local/bin` (see Differences between
+backends) does not help here. Nothing accidental does any of this, so it
+falls outside the primary threat model. Keeping these directories after
+the system ones on `PATH` stops a planted `git` from shadowing the real
+one, but not a session from replacing tools that live only there, such
+as `cargo` or a globally installed npm package.
 
 
 ## Post-exit menu
