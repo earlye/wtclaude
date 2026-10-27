@@ -12,12 +12,13 @@ The primary thing it prevents is *accidental* damage: a session editing
 your main branch, a sibling worktree, or a dotfile because it misread
 the task. It is not a security boundary against a session that sets out
 to escape, such as one driven by prompt injection. Confining writes
-shrinks that blast radius on a best-effort basis, but does not close it:
-reads and network access are unrestricted, so credentials elsewhere on
-the machine remain readable and reachable, and the plan's cache
-directories include places where a deliberate session can plant code
-that later runs outside the sandbox (see "Where you install the binary
-matters on Linux"). And no sandbox can protect you from malicious code
+limits what such a session can do, but does not stop it. Reads and
+network access are unrestricted, so credentials elsewhere on the machine
+remain readable and reachable. Some of the cache directories a
+session may write to hold executables on your `PATH`, so a session that
+sets out to can plant code there that later runs outside the sandbox
+(see "Writable directories on `PATH`" under Sandbox enforcement). And no
+sandbox can protect you from malicious code
 *inside* the worktree, since that is exactly what a session writes;
 review before running or merging is what covers that.
 
@@ -140,9 +141,7 @@ session can write. A session could then replace the very wrapper that
 confines it. Nothing accidental does this, so it is not a concern for the
 primary threat model, but installing to `~/.local/bin` (not in the plan)
 removes the exposure. The same applies to anything else on `PATH` that
-lives under `~/.cargo/bin` — including a planted `git`, which the
-unsandboxed hook resolves through `PATH` on every Bash command, on macOS
-as well as Linux.
+lives under `~/.cargo/bin`.
 
 **Landlock rules need paths that already exist.** A rule is attached to
 an open file descriptor, so an allowlisted cache directory that isn't
@@ -492,6 +491,19 @@ any script redirecting to it.
 `NotebookEdit` tool calls before Claude executes them. Any path
 outside the worktree is denied immediately with an explanation, before
 any filesystem access occurs.
+
+**Writable directories on `PATH`** — Several of the cache directories
+above hold executables that are commonly on `PATH`: `~/.cargo/bin`,
+pnpm's global bin under `~/.local/share/pnpm`, `~/.yarn/bin`, and gem
+executables under `~/.gem`. Anything a session writes there runs
+outside the sandbox the next time something unsandboxed invokes it. The
+`PreToolUse` hook itself is one such thing: it runs outside the sandbox
+and looks up `git` through `PATH` on every Bash command, under both
+backends. If one of these directories comes before the system `git` on
+your `PATH`, a session can plant a `git` there that runs unconfined.
+Where `wtclaude` is installed makes no difference to this. Nothing
+accidental does it, so it falls outside the primary threat model; keep
+these directories after the system ones on `PATH` to remove it.
 
 
 ## Post-exit menu
