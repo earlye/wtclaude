@@ -1,5 +1,15 @@
 # Replacing `.git` with a symlink may redirect the sandbox write plan
 
+## Decision (Early, 2026-10-26)
+
+Probably drop this. Early: "wtclaude is about blocking accidental escapes,
+not being a security tool." This mechanism requires a session that sets out
+on purpose to swap `.git` for a symlink to `~`, which is an injection or
+adversarial case and not an accidental one. `CONTEXT.md` ranks accidental
+writes first and injection second, best-effort. Unless a reason to keep it
+turns up, resolve it as won't-fix, with that reasoning, rather than
+implementing a fix.
+
 ## Context
 
 This is a possible sandbox escape. The
