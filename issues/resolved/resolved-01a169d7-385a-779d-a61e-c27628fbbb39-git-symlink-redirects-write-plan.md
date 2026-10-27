@@ -3,22 +3,25 @@
 ## Resolution (2026-10-26)
 
 Won't fix. Closed without changes to wtclaude and without reproducing it.
-Every route found here needs a session that sets out on purpose to redirect
-the plan, by swapping `.git` for a symlink or by rewriting a worktree's
-`gitdir:` file. Per `CONTEXT.md`, wtclaude defends against accidental writes
-first, and against injection only on a best-effort basis.
+Every route found here that can reach `$HOME` or another arbitrary
+directory needs a session that sets out on purpose to redirect the plan, by
+swapping `.git` for a symlink or by rewriting a worktree's `gitdir:` file.
+Per `CONTEXT.md`, wtclaude defends against accidental writes first, and
+against injection only on a best-effort basis.
 
 The accidental version, a session deleting `.git` by mistake, can only
-happen in in-place and path mode; those are the only modes where
-`repo_root/.git` is inside the sandbox root. If the repository isn't nested
-inside another one, `git rev-parse` fails, `git_dirs` falls back to
-`repo_root/.git`, and `resolve_existing_prefix` resolves that to a missing
-path under the real `repo_root`, so nothing widens. If it is nested (for
-example under a dotfiles repository at `$HOME`), git finds the outer
-repository instead, and that repository's git dir becomes writable.
-wtclaude's own checkout isn't nested that way. Setting
-`GIT_CEILING_DIRECTORIES` in `git_dirs` would close that case; it is listed
-under "Suggested fixes".
+happen when the sandbox root is the repository root: in-place mode, path
+mode on the repository root, and headless mode started from the repository
+root. If the repository isn't nested inside another one, `git rev-parse`
+fails, `git_dirs` falls back to `repo_root/.git`, and
+`resolve_existing_prefix` resolves that to a missing path under the real
+`repo_root`, so nothing widens. If it is nested (for example under a
+dotfiles repository at `$HOME`), git finds the outer repository instead,
+and that repository's git dir becomes writable. A wtclaude worktree is
+nested inside its main checkout, but there the outer git dir is the git
+common dir, which is already writable. Setting `GIT_CEILING_DIRECTORIES` in
+`git_dirs` would close the nested case; it is listed under "Suggested
+fixes".
 
 If containing injection ever becomes a goal, start from "Suggested fixes"
 below. The rest of this file is the pre-resolution record.
