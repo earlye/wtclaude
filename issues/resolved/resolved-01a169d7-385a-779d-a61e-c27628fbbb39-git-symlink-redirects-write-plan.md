@@ -1,5 +1,19 @@
 # Replacing `.git` with a symlink may redirect the sandbox write plan
 
+## Resolution (2026-10-26)
+
+Won't fix. Closed without changes to wtclaude and without reproducing it.
+Every route found here needs a session that sets out on purpose to redirect
+the plan, by swapping `.git` for a symlink or by rewriting a worktree's
+`gitdir:` file. Per `CONTEXT.md`, wtclaude defends against accidental writes
+first, and against injection only on a best-effort basis. The accidental
+version doesn't widen anything: if a session deletes `.git` by mistake,
+`git_dirs` falls back to `repo_root/.git`, and `resolve_existing_prefix`
+resolves that to a missing path under the real `repo_root`, which is already
+inside the sandbox root. If containing
+injection ever becomes a goal, start from "Suggested fixes" below. The rest
+of this file is the pre-resolution record.
+
 ## Decision (Early, 2026-10-26)
 
 Probably drop this. Early: "wtclaude is about blocking accidental escapes,
