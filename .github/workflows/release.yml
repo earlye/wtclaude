@@ -7,6 +7,8 @@ name: release
 on:
   push:
     branches: [main]
+  # Re-run a skipped or failed release by hand: gh workflow run release.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,6 +19,8 @@ concurrency:
 
 jobs:
   release:
+    # A dispatch from another branch would push that branch to main.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +34,9 @@ jobs:
           version="0.1.$n"
           current=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if [ "$current" = "$version" ] || git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+          # A dispatch can land on our own release commit, whose count is one past its stamp.
+          if [ "$current" = "$version" ] || git rev-parse -q --verify "refs/tags/v$version" >/dev/null \
+            || git log -1 --format=%s | grep -q '^chore: release '; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
 
