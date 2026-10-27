@@ -1,5 +1,19 @@
 # Writable directories on PATH let a session run code unconfined
 
+## Decision (Early, 2026-10-27)
+
+Close as won't-fix. Early: "this is an accidental breach tool, not a
+security tool." Both vectors below require a session that sets out to
+write into `~/.cargo/bin` on purpose, which is prompt injection, not an
+accidental escape. The same reasoning closed
+`issues/resolved/resolved-01a169d7-385a-779d-a61e-c27628fbbb39-git-symlink-redirects-write-plan.md`.
+
+**Also in scope:** update `README.md` so it says plainly that wtclaude's
+sandbox guards against *accidental* writes outside the worktree. It is
+not a security boundary against a session that tries to escape, such as
+one driven by prompt injection. Keep the "Status" or intro wording
+consistent with `CONTEXT.md`'s threat model.
+
 ## Context
 
 Found by the clean-context review of
