@@ -7,6 +7,8 @@ name: release
 on:
   push:
     branches: [main]
+  # Re-run a skipped or failed release by hand: gh workflow run release.yml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,6 +19,8 @@ concurrency:
 
 jobs:
   release:
+    # A dispatch from another branch would push that branch to main.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
