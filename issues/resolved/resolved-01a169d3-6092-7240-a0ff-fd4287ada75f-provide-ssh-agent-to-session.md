@@ -1,5 +1,15 @@
 # Provide an ssh-agent to the Claude session
 
+## Resolution (2026-10-26)
+
+Closed without changes to wtclaude. The failing path was sessions opened by
+`/md-issue-tmux`, which inherited the tmux server's environment and its unset
+`SSH_AUTH_SOCK`. That skill now launches `wtclaude` through `startish`, which
+runs it in an interactive login shell where `~/.bashrc` starts an agent.
+Approaches 1–3 and the launch-time warning below were considered and dropped:
+`startish` covers the case they were for. The rest of this file is the
+pre-grill record.
+
 ## Context
 
 The user asked for wtclaude to make sure its Claude session has a working
@@ -90,3 +100,25 @@ leaving the session to find out when it pushes.
   set
 - `~/.claude/skills/md-issue-tmux/SKILL.md`: launches sessions with
   `tmux new-window`, which inherits the tmux server's environment
+
+## Grill Log
+
+### 2026-10-23
+
+- Q: Does the newly installed `startish` resolve this? — A: Partly. `startish`
+  runs its command in an interactive login shell, and `~/.bashrc` starts an
+  agent there, so anything launched as `startish -- …` gets one. But
+  `~/.claude/skills/md-issue-tmux/SKILL.md` still runs `tmux new-window` with
+  `wtclaude` directly, and the tmux server still has `-SSH_AUTH_SOCK`, so
+  sessions opened with `/md-issue-tmux` still have no agent until that skill
+  launches through `startish`. That's a skill change, outside this repository.
+- Q: Does `/md-issue-tmux` launch through `startish` now? — A: Yes. The updated
+  skill runs `tmux new-window … "<abs path to startish> --history … -- wtclaude
+  --no-pull <branch> /md-issue-fix <id>"`, so the window's interactive shell
+  runs `~/.bashrc`, which starts an agent before `wtclaude` runs. The tmux path
+  no longer depends on the tmux server's `SSH_AUTH_SOCK`.
+
+### 2026-10-26
+
+- Q: What, if anything, should wtclaude itself do (warning only, warning plus
+  discovery, or close)? — A: Close. No wtclaude change; `startish` resolves it.
