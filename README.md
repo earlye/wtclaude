@@ -10,10 +10,14 @@ range.
 
 The primary thing it prevents is *accidental* damage: a session editing
 your main branch, a sibling worktree, or a dotfile because it misread
-the task. Confining writes also shrinks the blast radius of prompt
-injection, but it does not close it — reads and network access are
-unrestricted, so credentials elsewhere on the machine remain readable
-and reachable. And no sandbox can protect you from malicious code
+the task. It is not a security boundary against a session that sets out
+to escape, such as one driven by prompt injection. Confining writes
+shrinks that blast radius on a best-effort basis, but does not close it:
+reads and network access are unrestricted, so credentials elsewhere on
+the machine remain readable and reachable, and the plan's cache
+directories include places where a deliberate session can plant code
+that later runs outside the sandbox (see "Where you install the binary
+matters on Linux"). And no sandbox can protect you from malicious code
 *inside* the worktree, since that is exactly what a session writes;
 review before running or merging is what covers that.
 
@@ -136,7 +140,9 @@ session can write. A session could then replace the very wrapper that
 confines it. Nothing accidental does this, so it is not a concern for the
 primary threat model, but installing to `~/.local/bin` (not in the plan)
 removes the exposure. The same applies to anything else on `PATH` that
-lives under `~/.cargo/bin`.
+lives under `~/.cargo/bin` — including a planted `git`, which the
+unsandboxed hook resolves through `PATH` on every Bash command, on macOS
+as well as Linux.
 
 **Landlock rules need paths that already exist.** A rule is attached to
 an open file descriptor, so an allowlisted cache directory that isn't
