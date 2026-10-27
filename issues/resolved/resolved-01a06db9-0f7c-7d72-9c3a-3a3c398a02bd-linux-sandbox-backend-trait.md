@@ -105,3 +105,15 @@ Scope agreed with the user: implement directly from the ADRs, no initiative.
   first.
 - bubblewrap as a second Linux Backend, if `sudo` inside sandboxed Bash ever
   becomes necessary.
+
+## Resolution
+
+Implemented in #35 (commit 40c55a6), which shipped every next step above:
+the `Backend` trait with Seatbelt and Landlock in `src/sandbox/`, the
+`wtclaude sandbox` subcommand and `sandbox-backend` key, the
+`WTCLAUDE_SESSION_DIR`/`WTCLAUDE_BACKEND` and `--test-sandbox-breakage`
+renames, the session scratch dir under `~/.local/state/wtclaude/sessions`
+with an `owner.lock`, the command-position privilege-escalation denial, the
+subprocess enforcement tests in `tests/sandbox_linux.rs`, and the README
+update. This file was left open by mistake; it moved to `resolved/` with no
+code change.
