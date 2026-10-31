@@ -10,10 +10,15 @@ range.
 
 The primary thing it prevents is *accidental* damage: a session editing
 your main branch, a sibling worktree, or a dotfile because it misread
-the task. Confining writes also shrinks the blast radius of prompt
-injection, but it does not close it — reads and network access are
-unrestricted, so credentials elsewhere on the machine remain readable
-and reachable. And no sandbox can protect you from malicious code
+the task. It is not a security boundary against a session that sets out
+to escape, such as one driven by prompt injection. Confining writes
+limits what such a session can do, but does not stop it. Reads and
+network access are unrestricted, so credentials elsewhere on the machine
+remain readable and reachable. Some of the writable cache directories
+contain executables on your `PATH`, so such a session can plant code
+there that later runs outside the sandbox
+(see "Writable directories on `PATH`" under Sandbox enforcement). And no
+sandbox can protect you from malicious code
 *inside* the worktree, since that is exactly what a session writes;
 review before running or merging is what covers that.
 
@@ -486,6 +491,22 @@ any script redirecting to it.
 `NotebookEdit` tool calls before Claude executes them. Any path
 outside the worktree is denied immediately with an explanation, before
 any filesystem access occurs.
+
+**Writable directories on `PATH`** — Several of the cache directories
+above hold executables that are commonly on `PATH`: `~/.cargo/bin`,
+pnpm's global bin under `~/.local/share/pnpm`, `~/.yarn/bin`, and gem
+executables under `~/.gem`. Anything a session writes there runs
+outside the sandbox the next time something unsandboxed invokes it. The
+`PreToolUse` hook itself is one such thing: it runs outside the sandbox
+and looks up `git` through `PATH` on every Bash command, under both
+backends. If one of these directories comes before the system `git` on
+your `PATH`, a session can plant a `git` there that runs unconfined.
+Installing `wtclaude` to `~/.local/bin` (see Differences between
+backends) does not help here. Nothing accidental does any of this, so it
+falls outside the primary threat model. Keeping these directories after
+the system ones on `PATH` stops a planted `git` from shadowing the real
+one, but not a session from replacing tools that live only there, such
+as `cargo` or a globally installed npm package.
 
 
 ## Post-exit menu
